@@ -289,7 +289,7 @@ async fn run_scout(
     }
 
     // 4. Agent, watched for checkpoints while it runs.
-    let watcher = spawn_checkpoint_watcher(workdir.clone(), tx.clone());
+    let watcher = spawn_checkpoint_watcher(workdir.clone(), tx.clone(), checkpoint_interval());
     let agent = run_agent(&workdir, prompt, tx.clone()).await;
     // Stopped before the outcome is reported, so a checkpoint can never arrive
     // after the terminal event that supersedes it.
@@ -415,6 +415,23 @@ const NOTES_FILE: &str = "NOTES.md";
 /// and coarse enough that polling costs nothing.
 const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 30;
 
+/// How often the watcher looks for a `NOTES.md` that has not appeared yet.
+///
+/// Salvage matters *most* for the runs that end badly and early, and those are
+/// exactly the runs inside the first interval: at the production 30s, a Scout
+/// that wrote notes at second 3 and died at second 25 streamed nothing, and
+/// CLAUDE.md's rule is that nothing collected at the end survives because the
+/// VM is destroyed at the deadline (#968).
+///
+/// Shortening the interval is *not* the fix — it trades the window for polling
+/// cost and cannot remove it, since a run can always die inside whatever
+/// interval is chosen. What removes it is reading the file when it first
+/// *appears*, so this cadence applies only until something has been
+/// checkpointed and the ordinary interval takes over. The cost is bounded and
+/// paid once: a `stat` a second over the opening of a run, against an agent
+/// that is thinking rather than writing.
+const FIRST_APPEARANCE_PROBE: Duration = Duration::from_secs(1);
+
 fn checkpoint_interval() -> Duration {
     let secs = std::env::var("SCOUT_CHECKPOINT_INTERVAL_SECS")
         .ok()
@@ -440,16 +457,33 @@ async fn read_notes(workdir: &Path) -> Option<String> {
 /// at 30s granularity the difference is invisible against the thing it
 /// insures against. Emitting only on change keeps an idle scout from
 /// reprinting a quarter-megabyte every interval.
+///
+/// The first read is the exception, and [`FIRST_APPEARANCE_PROBE`] says why:
+/// the interval governs how often notes are *re-read*, and using it for the
+/// first read too meant no copy of `NOTES.md` could leave the VM before 30s
+/// had passed.
 fn spawn_checkpoint_watcher(
     workdir: PathBuf,
     tx: mpsc::Sender<TaskVmEvent>,
+    interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    let interval = checkpoint_interval();
     tokio::spawn(async move {
         let mut last: Option<String> = None;
         loop {
-            // Sleep first: at t=0 the agent has not written anything yet.
-            tokio::time::sleep(interval).await;
+            // Sleep first: at t=0 the agent has not written anything yet, so
+            // the original justification is preserved rather than overridden —
+            // `read_notes` answers `None` on an absent file and the loop
+            // already `continue`s on that. What changes is *how long* the
+            // first sleep is: until something has been checkpointed the
+            // watcher probes, and after that the configured interval governs,
+            // dedupe and all. A run that dies before writing anything is
+            // unaffected; a run that wrote and died inside the first interval
+            // used to lose every word of it.
+            let wait = match last {
+                None => interval.min(FIRST_APPEARANCE_PROBE),
+                Some(_) => interval,
+            };
+            tokio::time::sleep(wait).await;
             let Some(notes) = read_notes(&workdir).await else {
                 continue;
             };
@@ -1110,6 +1144,77 @@ mod tests {
         assert!(out.starts_with("HEAD-MARKER"), "the head is what survives");
         assert!(out.contains("NOTES.md truncated"));
         assert!(out.len() < MAX_NOTES_BYTES + 128);
+    }
+
+    /// #968: at a realistic interval, a Scout that writes notes early and dies
+    /// early used to stream nothing at all. The assertion is deliberately made
+    /// against the *production* 30s rather than the 1s the host test harness
+    /// overrides to, because that override is exactly what hid this.
+    #[tokio::test]
+    async fn notes_are_checkpointed_when_they_first_appear_not_one_interval_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let watcher = spawn_checkpoint_watcher(
+            dir.path().to_path_buf(),
+            tx,
+            Duration::from_secs(DEFAULT_CHECKPOINT_INTERVAL_SECS),
+        );
+
+        // The agent gets to work and writes something down. At the old
+        // behaviour nothing leaves the VM until t=30s.
+        tokio::fs::write(dir.path().join(NOTES_FILE), "found the lock ordering\n")
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("a checkpoint arrives well inside the 30s interval")
+            .expect("the watcher is still running");
+        watcher.abort();
+
+        let notes = match event {
+            VmEvent::App {
+                payload: TaskEvent::Scout(ScoutEvent::Checkpoint { notes_markdown }),
+            } => notes_markdown,
+            other => panic!("expected a checkpoint, got {other:?}"),
+        };
+        assert!(notes.contains("found the lock ordering"));
+    }
+
+    /// The other half, and the reason the probe is not simply a shorter
+    /// interval: once something *has* been checkpointed the configured
+    /// interval governs again, so an agent appending to `NOTES.md` is not
+    /// re-read every second for the rest of the run.
+    #[tokio::test]
+    async fn the_interval_governs_once_something_has_been_checkpointed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let watcher = spawn_checkpoint_watcher(
+            dir.path().to_path_buf(),
+            tx,
+            Duration::from_secs(DEFAULT_CHECKPOINT_INTERVAL_SECS),
+        );
+
+        tokio::fs::write(dir.path().join(NOTES_FILE), "first\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the first appearance is read on the probe")
+            .unwrap();
+
+        // A second write is genuinely new content, so only the cadence can
+        // keep it back — and it must, for the whole 30s.
+        tokio::fs::write(dir.path().join(NOTES_FILE), "first\nsecond\n")
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .is_err(),
+            "the probe cadence must not survive the first checkpoint"
+        );
+        watcher.abort();
     }
 
     #[test]
