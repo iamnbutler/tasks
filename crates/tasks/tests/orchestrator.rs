@@ -1078,6 +1078,267 @@ async fn seed_pending_spec(store: &Store) -> Spec {
     spec
 }
 
+/// A second spec in the same project — [`seed_pending_spec`] seeds the
+/// project itself and cannot run twice against `UNIQUE(repo_owner,
+/// repo_name)`.
+async fn seed_sibling_spec(store: &Store, issue: u64) -> Spec {
+    let project = store
+        .list_projects()
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("seed_pending_spec first");
+    let now = Utc::now();
+    let task = Task {
+        id: TaskId::new(),
+        project_id: project.id.clone(),
+        gh_issue_number: issue,
+        title: format!("task {issue}"),
+        body: "body".into(),
+        labels: vec![],
+        gh_state: GhState::Open,
+        state: TaskState::InReview,
+        priority: 0,
+        manual_rank: None,
+        dispatch_attempts: 0,
+        ingested_at: now,
+        updated_at: now,
+        scout_directions: None,
+    };
+    store.insert_task(&task).await.unwrap();
+    let session = Session {
+        id: SessionId::new(),
+        task_id: task.id.clone(),
+        vm_id: None,
+        branch: format!("scout/{issue}"),
+        status: SessionStatus::ScoutSucceeded,
+        started_at: now,
+        completed_at: Some(now),
+        exit_reason: None,
+        usage: None,
+        directions: None,
+    };
+    store.insert_session(&session).await.unwrap();
+    let spec = Spec {
+        id: SpecId::new(),
+        session_id: Some(session.id),
+        task_id: task.id,
+        content: "## Spec\n\nDo the other thing.".into(),
+        complexity: Complexity::Simple,
+        files_touched: vec![],
+        created_at: now,
+    };
+    store.insert_spec(&spec).await.unwrap();
+    store
+        .upsert_spec_queue_entry(&SpecQueueEntry {
+            spec_id: spec.id.clone(),
+            status: SpecQueueStatus::PendingReview,
+            rank: None,
+            approved_at: None,
+            feedback: None,
+            blocking_dependencies: vec![],
+        })
+        .await
+        .unwrap();
+    spec
+}
+
+/// The lane-free turn is the batching moment (#1055): when a build concludes,
+/// the nudge lists every pooled approved spec and says to dispatch them
+/// batched — the one turn that sees the whole pool at once. The trigger is
+/// the completion *event*, not pool state: a cancel frees the lane too but
+/// never nudges (the echo rule), so its pool must wait for the obligation's
+/// grace rather than rendering here.
+#[tokio::test]
+async fn the_lane_free_turn_lists_the_pool_and_says_to_batch() {
+    let store = Store::open_in_memory().await.unwrap();
+    let brief = tasks::brief::Brief::new(&store, None, "main");
+    let spec = seed_pending_spec(&store).await;
+    store
+        .review_spec(
+            &spec.id,
+            SpecQueueStatus::Approved,
+            None,
+            tasks::models::DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    let build = store
+        .create_build(
+            std::slice::from_ref(&spec.id),
+            "main",
+            tasks::models::DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    store
+        .finalize_build_failed(&build.id, "linker OOM")
+        .await
+        .unwrap();
+
+    let completed = |status: tasks::models::BuildStatus| tasks::events::Event {
+        seq: 1,
+        timestamp: Utc::now(),
+        payload: EventPayload::BuildCompleted {
+            build_id: build.id.clone(),
+            status,
+        },
+    };
+
+    let turn = tasks::orchestrator::format_nudge(
+        &store,
+        &brief,
+        &[completed(tasks::models::BuildStatus::Failed)],
+    )
+    .await;
+    assert!(turn.contains("1 approved spec(s) are pooled"), "{turn}");
+    assert!(turn.contains("POST /builds"), "{turn}");
+    assert!(turn.contains("touch the same files"), "{turn}");
+    assert!(
+        turn.contains(&spec.id.to_string()),
+        "the pool names its specs: {turn}"
+    );
+
+    let cancelled = tasks::orchestrator::format_nudge(
+        &store,
+        &brief,
+        &[completed(tasks::models::BuildStatus::Cancelled)],
+    )
+    .await;
+    assert!(
+        !cancelled.contains("pooled"),
+        "a cancel never rendered a nudge, so pool state alone must not: {cancelled}"
+    );
+}
+
+/// A completion with another build already queued is not a free lane — a pool
+/// dispatched into it would freeze its composition early, which is the exact
+/// mistake lane-free dispatch exists to end. The pooled spec here is real and
+/// uncarried, so only the lane gate can be what keeps it out of the turn.
+#[tokio::test]
+async fn a_still_busy_lane_keeps_the_pool_out_of_the_lane_free_turn() {
+    let store = Store::open_in_memory().await.unwrap();
+    let brief = tasks::brief::Brief::new(&store, None, "main");
+    let pooled = seed_pending_spec(&store).await;
+    let carried = seed_sibling_spec(&store, 2).await;
+    for spec in [&pooled, &carried] {
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                tasks::models::DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+    }
+    let first = store
+        .create_build(
+            std::slice::from_ref(&carried.id),
+            "main",
+            tasks::models::DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    store
+        .finalize_build_failed(&first.id, "boom")
+        .await
+        .unwrap();
+    // A second build takes the lane before the first one's nudge renders.
+    store
+        .create_build(
+            std::slice::from_ref(&carried.id),
+            "main",
+            tasks::models::DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+
+    let turn = tasks::orchestrator::format_nudge(
+        &store,
+        &brief,
+        &[tasks::events::Event {
+            seq: 1,
+            timestamp: Utc::now(),
+            payload: EventPayload::BuildCompleted {
+                build_id: first.id.clone(),
+                status: tasks::models::BuildStatus::Failed,
+            },
+        }],
+    )
+    .await;
+    assert!(
+        !turn.contains("pooled"),
+        "a queued build holds the lane, and the next completion asks again: {turn}"
+    );
+}
+
+/// The pool paragraph claims an authority, so it renders only when the
+/// charter grants it — claiming one the server will refuse is worse than
+/// silence, the same rule the landing text follows.
+#[tokio::test]
+async fn the_pool_speaks_only_when_dispatching_is_the_orchestrators() {
+    use tasks::models::{Capability, CharterLevel};
+
+    let store = Store::open_in_memory().await.unwrap();
+    let brief = tasks::brief::Brief::new(&store, None, "main");
+    let spec = seed_pending_spec(&store).await;
+    store
+        .review_spec(
+            &spec.id,
+            SpecQueueStatus::Approved,
+            None,
+            tasks::models::DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    let build = store
+        .create_build(
+            std::slice::from_ref(&spec.id),
+            "main",
+            tasks::models::DecisionInput::human(),
+        )
+        .await
+        .unwrap();
+    store
+        .finalize_build_failed(&build.id, "boom")
+        .await
+        .unwrap();
+    let event = tasks::events::Event {
+        seq: 1,
+        timestamp: Utc::now(),
+        payload: EventPayload::BuildCompleted {
+            build_id: build.id.clone(),
+            status: tasks::models::BuildStatus::Failed,
+        },
+    };
+
+    for level in [CharterLevel::Shadow, CharterLevel::Off] {
+        store
+            .set_charter(Capability::DispatchBuilds, level, None)
+            .await
+            .unwrap();
+        let turn =
+            tasks::orchestrator::format_nudge(&store, &brief, std::slice::from_ref(&event)).await;
+        assert!(
+            !turn.contains("pooled"),
+            "{level:?} must not claim an authority the server will refuse: {turn}"
+        );
+    }
+
+    // Live is the shipped default the migration inserts — restored, the pool
+    // speaks again, which is what pins the gate to the charter rather than
+    // to anything the loop above changed as a side effect.
+    store
+        .set_charter(Capability::DispatchBuilds, CharterLevel::Live, None)
+        .await
+        .unwrap();
+    let turn =
+        tasks::orchestrator::format_nudge(&store, &brief, std::slice::from_ref(&event)).await;
+    assert!(turn.contains("pooled"), "{turn}");
+}
+
 /// The watermark contract: input appended while the agent is mid-turn (its
 /// seq below the eventual reply's) must stay unanswered, because the prompt
 /// that turn was built from never included it.
