@@ -423,14 +423,41 @@ pub fn decide(
     }
 
     let attempt = resumes_used + 1;
-    let mut resumed = argv.to_vec();
-    resumed.push("--resume".to_string());
-    resumed.push(session_id.to_string());
     ResumeDecision::Resume {
-        argv: resumed,
+        argv: resume_argv(argv, session_id),
         delay: resume_delay(attempt),
         attempt,
     }
+}
+
+/// The configured command, aimed at an existing conversation.
+///
+/// Factored out of [`decide`] so the *other* caller — a supervisor re-invoking
+/// the agent to repair a red test suite — builds the same argv rather than a
+/// second hand-written one beside it. It is only the argv: the guard that says
+/// whether appending a selector is safe at all
+/// ([`NoResume::CommandSelectsSession`]) stays where the decision is made, and
+/// a caller reaching for this outside [`decide`] has to ask
+/// [`command_selects_session`] itself.
+///
+/// `--session-id` is never what this appends. That flag would *impose* an id
+/// on a new conversation; `--resume` picks up the one the agent announced,
+/// which is the whole point — the worktree and the conversation both survive.
+pub fn resume_argv(argv: &[String], session_id: &str) -> Vec<String> {
+    let mut resumed = argv.to_vec();
+    resumed.push("--resume".to_string());
+    resumed.push(session_id.to_string());
+    resumed
+}
+
+/// Whether the operator's command already chose the conversation, in which
+/// case nothing may append a selector alongside it.
+///
+/// Public so a caller that resumes *outside* [`decide`] shares this guard
+/// rather than restating it — restating it is how the two would come to
+/// disagree about `--resume=<id>`.
+pub fn command_selects_session(argv: &[String]) -> Option<String> {
+    session_selecting_flag(argv)
 }
 
 /// A whole agent run — every attempt of it — and how it ended.
@@ -452,6 +479,14 @@ pub struct AgentRun {
     /// transport failure — on a healthy run it is just
     /// [`NoResume::Concluded`].
     pub no_resume: Option<NoResume>,
+    /// The conversation the agent announced, if it announced one.
+    ///
+    /// Carried on the run rather than left in the [`ResultWatcher`] because a
+    /// caller that wants to re-invoke the agent *after* the run concluded —
+    /// the repair round for a red test suite — has the run and not the
+    /// watcher. `None` is an agent that never streamed a session id, and the
+    /// only honest response to it is not to resume.
+    pub session_id: Option<String>,
 }
 
 impl AgentRun {
@@ -463,6 +498,7 @@ impl AgentRun {
             ending,
             resumes: 0,
             no_resume: None,
+            session_id: None,
         }
     }
 
@@ -775,6 +811,7 @@ mod tests {
             },
             resumes: 2,
             no_resume: Some(NoResume::BudgetExhausted { used: 2, max: 2 }),
+            session_id: None,
         };
         let context = run.failure_context();
         assert!(
@@ -801,6 +838,7 @@ mod tests {
             no_resume: Some(NoResume::Concluded {
                 terminal_reason: "completed".into(),
             }),
+            session_id: None,
         };
         assert_eq!(run.failure_context(), "");
         assert_eq!(AgentRun::default().failure_context(), "");
@@ -859,6 +897,7 @@ mod tests {
             },
             resumes: 2,
             no_resume: None,
+            session_id: None,
         };
         assert_eq!(
             resumed_then_concluded.failure_class(),

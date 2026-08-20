@@ -20,6 +20,7 @@ use vm_pool_protocol::{AppProtocol, ServiceErrorKind};
 
 pub mod agent_run;
 pub mod redact;
+pub mod verify;
 pub mod vm_memory;
 
 /// Whether a terminal failure is a verdict on the *work*, or something that
@@ -348,6 +349,28 @@ pub enum BuildCommand {
         /// The prompt the agent sees: concatenated approved spec markdown and
         /// issue titles, rendered host-side. Nothing Scout-code-derived.
         prompt: String,
+        /// Seconds of this run's budget still unspent when the command was
+        /// sent, so the VM can size its test suite's budget to expire *first*
+        /// (see [`crate::verify::suite_budget_secs`]). Not the configured
+        /// budget: a resumed build is bounded by the remainder, and a suite
+        /// sized against the wrong number is a suite the outer deadline kills
+        /// mid-run — which is a `Verdict` against work that may be fine.
+        ///
+        /// `#[serde(default)]` in the direction that actually happens: a
+        /// supervisor image rebuilt ahead of the server it talks to sees no
+        /// field, and reports `Unavailable` rather than guessing.
+        #[serde(default)]
+        budget_secs: Option<u64>,
+        /// The project's trunk (`SCOUT_BASE_BRANCH`), so the VM can say which
+        /// gate ruled when this build is stacked on another build's branch.
+        ///
+        /// `base_branch` is not it and cannot be made into it: this pipeline
+        /// stacks builds routinely, so a stacked build's base *is* another
+        /// build's branch, and a `.tasks/verify` weakened by that earlier build
+        /// is already in this one's base commit. Comparing against the trunk is
+        /// what notices; comparing against the base is what missed it.
+        #[serde(default)]
+        trunk_branch: Option<String>,
     },
 }
 
@@ -381,6 +404,19 @@ pub enum BuildEvent {
         /// prose is not a failure; the code is the deliverable.
         summary: Option<String>,
         files_touched: Vec<String>,
+        /// What the project's own test suite said about the tree this bundle
+        /// carries, run by the **supervisor** rather than claimed by the agent.
+        ///
+        /// `None` means the image predates the check entirely, which reads as
+        /// "no run on record" everywhere and is never green — so an image
+        /// nobody has rebuilt degrades to the behaviour that shipped before
+        /// this existed rather than breaking. See [`crate::verify`].
+        ///
+        /// There is no way for this field to say the suite *failed*: a red
+        /// suite fails the build inside the VM and no bundle is packaged at
+        /// all.
+        #[serde(default)]
+        verification: Option<crate::verify::Verification>,
     },
     /// Terminal failure. An empty branch (`head == base`) lands here — the
     /// Builder analogue of a Scout's missing SPEC.md.
@@ -437,6 +473,8 @@ mod tests {
             base_branch: "main".into(),
             branch: "build/build_abc".into(),
             prompt: "## Spec 1 of 1".into(),
+            budget_secs: Some(3600),
+            trunk_branch: Some("main".into()),
         });
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"role\":\"build\""));
@@ -452,6 +490,10 @@ mod tests {
             bundle_base64: "AAAA".into(),
             summary: Some("Did the thing.".into()),
             files_touched: vec!["src/lib.rs".into()],
+            verification: Some(crate::verify::Verification::new(
+                crate::verify::VerificationStatus::Passed,
+                ".tasks/verify passed (gate abc1234, same as main)",
+            )),
         });
         let json = serde_json::to_string(&evt).unwrap();
         let back: TaskEvent = serde_json::from_str(&json).unwrap();

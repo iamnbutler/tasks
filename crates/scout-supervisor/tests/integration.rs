@@ -449,6 +449,8 @@ async fn a_build_command_is_refused_not_acted_on() {
             base_branch: "main".into(),
             branch: "build/build_x".into(),
             prompt: "n/a".into(),
+            budget_secs: None,
+            trunk_branch: None,
         }),
     })
     .await;

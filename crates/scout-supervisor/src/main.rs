@@ -845,6 +845,11 @@ async fn run_agent(
                     ending,
                     resumes,
                     no_resume: Some(no_resume),
+                    // A Scout has no second use for the conversation — its
+                    // deliverable is text and there is no suite to hand back —
+                    // but the field is on the run, so it is filled in honestly
+                    // rather than left as a lie about what the agent announced.
+                    session_id: watcher.session_id().map(str::to_string),
                 });
             }
         }
