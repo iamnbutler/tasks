@@ -1115,6 +1115,12 @@ fn render_prompt(batch: &[BatchItem], directions: Option<&Directions>) -> String
          GitHub closing keywords (`Closes #N`, `Fixes #N`) — the server \
          links the issues itself.\n\
          5. Do NOT push and do NOT open a PR — the server does both.\n\n\
+         **You get one turn, and it ends abruptly.** There is no later: when \
+         you end your turn, the run is over. A backgrounded command buys you \
+         nothing — its child is killed with the turn — so anything whose \
+         result you need must be awaited inline, however long it takes. A poll \
+         loop over a file another process will write can only report to a turn \
+         that has already ended.\n\n\
          On step 2: when this project declares a test suite at \
          `.tasks/verify`, the supervisor runs it itself after you finish, \
          against the committed tree your branch carries. If it fails you get \
@@ -1457,6 +1463,23 @@ mod tests {
                 scout_directions: None,
             },
         )
+    }
+
+    /// #962's sibling: the Builder prompt has the same shape and the same
+    /// hazard — an agent that starts an expensive compile in the background
+    /// and concludes before it returns has produced an implementation and no
+    /// evidence. The supervisor's own suite run is what actually decides now,
+    /// but an agent that thinks it will see the result later is one that ends
+    /// its turn believing it is not done.
+    #[test]
+    fn the_build_prompt_says_a_backgrounded_command_dies_with_the_turn() {
+        let batch = vec![item(7, "First thing", "do it")];
+        let prompt = render_prompt(&batch, None);
+        assert!(
+            prompt.contains("backgrounded command buys you nothing"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("awaited inline"), "{prompt}");
     }
 
     #[test]

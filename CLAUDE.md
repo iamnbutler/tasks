@@ -19,6 +19,21 @@ implementation.
   quoted as explicitly unverified leads. Reporting a partial spec *as* a spec
   would be worse than losing the run, because a half-explored spec in the
   review queue looks finished. Promoting notes into a spec stays a human act.
+  Which is also why the Scout prompt asks for the spec to be **drafted into
+  `NOTES.md`** rather than into an early `SPEC.md`: a Scout that finished the
+  work and was killed six minutes later lost all of it, because `SPEC.md` is
+  written last and nothing reads it until the run ends (#1046), while
+  `NOTES.md` is already streaming. Drafting under the `SPEC.md` name instead is
+  the fix that looks equivalent and is not — an agent that ends its turn early
+  would then hand a draft to `report_outcome`, which reads a clean exit as a
+  spec, and the half-explored spec would reach the review queue looking
+  finished. The draft is salvage until the run concludes; promotion stays where
+  it was. The prompt also says, in both agents' words, that **a backgrounded
+  command dies with the turn** — an agent parked on a poll loop over a cold
+  build returned its turn expecting to be woken (#962), which the orchestrator's
+  own prompt has warned about for a while and the agents that most need it were
+  never told — and asks for verification **in proportion to what was changed**,
+  which is where the incentive to background came from.
   A human may also skip the Scout outright — `POST /tasks/{id}/build-now`
   writes a spec by hand for a task whose issue body already is one, and its
   `specs.session_id IS NULL` is the tell. It changes nothing below: the spec is

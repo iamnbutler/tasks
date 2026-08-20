@@ -1479,13 +1479,37 @@ fn render_prompt(
          It is read back every 30 seconds and is the only thing that survives \
          if this run is cut short, so write it as you learn rather than at the \
          end.\n\
-         3. Run the project's tests / lint / typecheck — get them green.\n\
+         3. Verify your conclusion, in proportion to what you changed — the \
+         tests that cover it, not the whole suite by reflex. A cold build here \
+         can eat most of your budget, and it buys nothing for a change the \
+         suite does not exercise.\n\
          4. Write `SPEC.md` in the repo root with the structure below, and \
          only once you have actually concluded. **`SPEC.md` is not a \
          checkpoint.** A half-written spec is worse than no spec, because it \
          reaches a reviewer looking finished. If you want to record progress, \
          that is what `NOTES.md` is for.\n\
          5. Do NOT create a PR or push anywhere.\n\n\
+         ## Two things about this run that are not true of an ordinary session\n\n\
+         **You get one turn, and it ends abruptly.** There is no later: when \
+         you end your turn, the run is over, and if the budget runs out the \
+         machine is destroyed where it stands. Nothing you have not already \
+         sent out survives that. So a backgrounded command buys you nothing — \
+         its child is killed with the turn — and anything whose result you \
+         need must be awaited inline, however long it takes. If you find \
+         yourself writing a poll loop over a file another process will write, \
+         stop: it can only report to a turn that has already ended.\n\n\
+         **Draft the spec early, in `NOTES.md`.** Once you have a shape in \
+         mind and before you finish implementing, write a complete first draft \
+         of the spec — the whole structure below, filled in as best you can — \
+         into `NOTES.md`, and revise it there as you learn. It costs a few \
+         minutes and it is the difference between a run that is cut short \
+         having produced nothing and one whose successor starts from your \
+         design. `NOTES.md` is streamed out while you work; `SPEC.md` is not \
+         read until you finish, so a spec written only at the end is a spec \
+         that a timeout takes with it. Keep it in `NOTES.md` until you have \
+         actually concluded, then write it to `SPEC.md` — the draft is your \
+         working copy, and the file name is what tells a reviewer which one \
+         they are looking at.\n\n\
          ## SPEC.md structure\n\n\
          ```\n\
          ## Spec: <short title>\n\n\
@@ -1892,6 +1916,52 @@ mod tests {
         assert_eq!(
             Strike::for_class(ScoutError::Timeout { secs: 3600 }.failure_class()),
             Strike::Charge,
+        );
+    }
+
+    /// #1046: a Scout finished the work, verified it, and was killed six
+    /// minutes later with `SPEC.md` never created — because `SPEC.md` is
+    /// written last and is not read until the run ends. `NOTES.md` is streamed
+    /// out while the run is alive, so the draft goes there.
+    ///
+    /// The draft goes to `NOTES.md` and **not** to an early `SPEC.md`, which
+    /// is the fix that looks equivalent and is not: `SPEC.md` means "I
+    /// concluded", and a draft sitting under that name when an agent ends its
+    /// turn early would reach the review queue looking finished — the exact
+    /// thing the rule beside it exists to prevent. Salvage is never a spec,
+    /// and promoting one stays a human act.
+    #[test]
+    fn the_prompt_asks_for_the_spec_to_be_drafted_where_it_will_survive() {
+        let prompt = render_prompt(&task_fixture(), None, None, None);
+        assert!(
+            prompt.contains("Draft the spec early, in `NOTES.md`"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("`SPEC.md` is not a checkpoint"),
+            "and the rule that makes the draft go to NOTES.md is still there: {prompt}"
+        );
+    }
+
+    /// #962: an agent backgrounded three `until … sleep 20` waiters over a
+    /// cold build and returned its turn, saying it would pick the result up
+    /// later. There is no later in a `--print` run: the turn ending is the run
+    /// ending, and the children die with it. The orchestrator's own prompt has
+    /// carried this sentence for a while; the agents that most need it were
+    /// never told.
+    #[test]
+    fn the_prompt_says_a_backgrounded_command_dies_with_the_turn() {
+        let prompt = render_prompt(&task_fixture(), None, None, None);
+        assert!(
+            prompt.contains("backgrounded command buys you nothing"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("awaited inline"), "{prompt}");
+        // And the incentive that produced the backgrounding in the first
+        // place: a whole-suite build for a change the suite does not exercise.
+        assert!(
+            prompt.contains("in proportion to what you changed"),
+            "{prompt}"
         );
     }
 
