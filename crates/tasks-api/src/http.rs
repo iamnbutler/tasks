@@ -411,6 +411,47 @@ pub struct SendMessage {
     pub content: String,
 }
 
+/// Body of `POST /agents` — mint an enrollment code for an external agent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnrollAgentRequest {
+    /// The name the agent's messages will carry, chosen by whoever mints —
+    /// never by the agent, because the name is what the orchestrator (and the
+    /// human reading the transcript) attributes the words to.
+    pub name: String,
+    /// How long the code lives. Bounded, and an out-of-range value is a 400
+    /// rather than a clamp — a credential silently granted a different
+    /// lifetime than the one asked for is a different grant.
+    #[serde(default)]
+    pub ttl_secs: Option<i64>,
+    /// Why this agent, now. Required of the orchestrator; lands on the
+    /// decision row.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
+/// Response of `POST /agents`. The one and only time the code is visible —
+/// the server keeps a hash.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnrollAgentResponse {
+    #[serde(flatten)]
+    pub enrollment: crate::models::AgentEnrollment,
+    /// The bearer code, shown once. Hand it to the agent; it goes in the
+    /// `X-Tasks-Agent` header of `POST /orchestrator/messages`.
+    pub code: String,
+}
+
+/// Body of `POST /agents/{id}/revoke`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RevokeAgentRequest {
+    /// Required of the orchestrator; lands on the decision row.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
 /// Body of `POST /mode`. `mode` is a string for the same reason as
 /// [`ReviewRequest::status`].
 ///
