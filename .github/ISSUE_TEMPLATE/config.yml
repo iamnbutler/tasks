@@ -1,0 +1,12 @@
+# Blank issues stay enabled deliberately. Most issues in this repository are
+# design notes, and a design note does not fit a bug form — the template is
+# there for the reports where version skew is the first question, not to make
+# everyone fill in a form.
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/iamnbutler/tasks/security/advisories/new
+    about: Report privately. This repository's own pipeline reads its issue tracker.
+  - name: How the system actually works
+    url: https://github.com/iamnbutler/tasks/blob/main/CLAUDE.md
+    about: CLAUDE.md is the specification — every design rule, with the failure behind it.

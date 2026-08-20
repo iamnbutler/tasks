@@ -1,0 +1,66 @@
+name: Bug report
+description: Something in Tasks did not do what it says it does.
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two notes before you start.
+
+        **Do not report a security issue here.** Use
+        [Report a vulnerability](https://github.com/iamnbutler/tasks/security/advisories/new)
+        instead — this repository's own pipeline reads its issue tracker.
+        See `SECURITY.md`.
+
+        **Never paste a credential**, not even a redacted-looking one. Name the
+        variable, the field or the call site.
+
+  - type: textarea
+    id: status
+    attributes:
+      label: "`tasks status` output"
+      description: |
+        Paste it whole, including the version line and the image identities.
+        This is the first question for most reports: the server, the app and
+        the VM images are upgraded by three separate acts, so they are
+        routinely different builds, and a supervisor fix reaches nothing until
+        `make images` has run. `unstamped` / `PREDATES STAMPING` is a real
+        answer, not a missing one.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: |
+        What you did, what you expected, and what you got. If a run is
+        involved, its id and the state you found it in.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: |
+        `<data dir>/serve.log` (default `~/.local/state/tasks-v2/`), and
+        `vm-pool.log` beside it if dispatch is involved. Credentials are
+        redacted by name in the server's own logging, but read what you paste.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`tasks doctor` output"
+      description: |
+        Optional, but it answers most dispatch and setup questions outright —
+        every precondition for a scout as one checklist, each failure naming
+        its fix. Read it top-down: the first failure usually explains the ones
+        under it.
+      render: text
+    validations:
+      required: false

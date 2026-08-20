@@ -56,10 +56,11 @@ reach Anthropic and read the one repository it was dispatched for. Agents
 cannot push.</li>
 <li><strong>The server can.</strong> On an agent's say-so, under its own GitHub credential,
 while you are not watching, it pushes branches, opens pull requests, merges
-them, comments on issues and closes them. All nine capabilities in the
-orchestrator's charter ship <code>live</code> and uncapped
-(<code>crates/tasks/migrations/0016_charter_live.sql</code>) — no daily limit, no
-pre-approval gate, nothing that stops at the tenth merge of the day. The
+them, comments on issues and closes them. All ten capabilities in the
+orchestrator's charter ship <code>live</code> and uncapped — each set so by the
+migration that adds it (<code>crates/tasks/migrations/0016_charter_live.sql</code> and
+after) — no daily limit, no pre-approval gate, nothing that stops at the
+tenth merge of the day. The
 charter is a kill switch, not a promotion ladder, and the append-only
 decisions ledger is something you read afterwards. Any one capability can be
 switched off on its own, which is how you keep the pipeline and merge by

@@ -22,10 +22,11 @@ does.
   cannot push.
 - **The server can.** On an agent's say-so, under its own GitHub credential,
   while you are not watching, it pushes branches, opens pull requests, merges
-  them, comments on issues and closes them. All nine capabilities in the
-  orchestrator's charter ship `live` and uncapped
-  (`crates/tasks/migrations/0016_charter_live.sql`) — no daily limit, no
-  pre-approval gate, nothing that stops at the tenth merge of the day. The
+  them, comments on issues and closes them. All ten capabilities in the
+  orchestrator's charter ship `live` and uncapped — each set so by the
+  migration that adds it (`crates/tasks/migrations/0016_charter_live.sql` and
+  after) — no daily limit, no pre-approval gate, nothing that stops at the
+  tenth merge of the day. The
   charter is a kill switch, not a promotion ladder, and the append-only
   decisions ledger is something you read afterwards. Any one capability can be
   switched off on its own, which is how you keep the pipeline and merge by
@@ -271,6 +272,8 @@ make resume       # ...then give dispatch back
 - `docs/plans/` — implementation plans, including the v2 architecture and
   the v3 UI spec
 - `crates/vm-pool/CLAUDE.md` — vm-pool's own conventions
+- `CONTRIBUTING.md` — the handful of things this tree does unusually
+- `SECURITY.md` — where to report, and why a merged fix is not a deployed one
 
 ## License
 
