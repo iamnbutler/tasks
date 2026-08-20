@@ -265,8 +265,12 @@ impl<'a> Brief<'a> {
             )]);
         };
         let world = self.world().await?;
+        // What the build was *cloned against*, stated as the build fact it is.
+        // Whether that is still the pull request's base is GitHub's to say, so
+        // the stacked verdict is not derived here — it comes from `base_ref` in
+        // [`Self::live_landing_facts`], where the pull request is in hand.
         let mut lines = vec![format!(
-            "branch {} merges into {}, and PR #{} carries it",
+            "branch {} was built against {}, and PR #{} carries it",
             build.branch,
             build.base_branch,
             build
@@ -274,24 +278,6 @@ impl<'a> Brief<'a> {
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "(none)".into()),
         )];
-        if build.base_branch == self.base_branch {
-            lines.push(format!(
-                "its base IS the trunk ({}), so merging the PR ships the work",
-                self.base_branch
-            ));
-        } else {
-            lines.push(format!(
-                "its base is NOT the trunk ({}): merging this PR only moves the work onto {}, \
-                 and the tasks stay parked until {} itself reaches the trunk. Merge the base \
-                 first, or merge this one and then land {} — either order works, but neither \
-                 is done until the commit is on {}",
-                self.base_branch,
-                build.base_branch,
-                build.base_branch,
-                build.base_branch,
-                self.base_branch,
-            ));
-        }
         let waiting: Vec<String> = world
             .build_specs
             .get(build_key(&build))
@@ -500,16 +486,22 @@ impl<'a> Brief<'a> {
             ];
         };
         let Some(github) = self.github else {
-            return vec![format!(
-                "GitHub was not consulted (the server has no token): whether PR #{number} \
-                 can be merged is unchecked rather than fine"
-            )];
+            return vec![
+                format!(
+                    "GitHub was not consulted (the server has no token): whether PR #{number} \
+                     can be merged is unchecked rather than fine"
+                ),
+                recorded_base_verdict(&build.base_branch, self.base_branch),
+            ];
         };
         let Some(project) = world.projects.get(&build.project_id) else {
-            return vec![format!(
-                "the project row for this build is gone, so PR #{number} could not be \
-                 looked up"
-            )];
+            return vec![
+                format!(
+                    "the project row for this build is gone, so PR #{number} could not be \
+                     looked up"
+                ),
+                recorded_base_verdict(&build.base_branch, self.base_branch),
+            ];
         };
         match self
             .within_github_budget(self.live_landing_facts(github, project, build, number))
@@ -518,11 +510,14 @@ impl<'a> Brief<'a> {
             Some(lines) => lines,
             None => {
                 warn!(build = %build.id, number, "landing facts timed out; briefing without them");
-                vec![format!(
-                    "GitHub did not answer within the brief's {}s budget: whether PR \
-                     #{number} can be merged is unchecked rather than fine",
-                    GITHUB_BUDGET.as_secs()
-                )]
+                vec![
+                    format!(
+                        "GitHub did not answer within the brief's {}s budget: whether PR \
+                         #{number} can be merged is unchecked rather than fine",
+                        GITHUB_BUDGET.as_secs()
+                    ),
+                    recorded_base_verdict(&build.base_branch, self.base_branch),
+                ]
             }
         }
     }
@@ -540,10 +535,13 @@ impl<'a> Brief<'a> {
             Ok(pr) => pr,
             Err(e) => {
                 debug!(error = %e, number, "pr state unavailable");
-                return vec![format!(
-                    "PR #{number} could not be read ({e}): its mergeability is unknown \
-                     rather than fine"
-                )];
+                return vec![
+                    format!(
+                        "PR #{number} could not be read ({e}): its mergeability is unknown \
+                         rather than fine"
+                    ),
+                    recorded_base_verdict(&build.base_branch, self.base_branch),
+                ];
             }
         };
         let mut lines = vec![format!(
@@ -552,9 +550,41 @@ impl<'a> Brief<'a> {
             pr.landing().describe()
         )];
 
-        // The stacked question, and only for a stacked build: an unstacked one
-        // has its answer in `base_ref` already and must cost no extra call.
-        if build.base_branch == self.base_branch {
+        // The stacked question, answered from `base_ref` — GitHub's own field,
+        // never `builds.base_branch`.
+        //
+        // The column is the honest record of what the build was *cloned
+        // against*, and that is a different question: a human or `gh pr edit`
+        // can retarget a pull request at any moment and nothing updates the
+        // column when they do, so a retargeted PR read from the column stays
+        // "stacked" forever. That is #1035, and its failure direction is the
+        // bad one — the stacked paragraph is a reason *not* to merge, so a
+        // stale base makes the brief argue for parking a pull request that is
+        // ready, and tell its reader to redo a retarget that already happened.
+        // `run::shipped` has always read `base_ref`; one question gets one
+        // source, or the poller and the brief disagree about the same PR.
+        //
+        // Absent is never "unstacked": GitHub not reporting a base is unknown,
+        // and the standing rule is that absence of evidence never clears.
+        let Some(pr_base) = pr.base_ref.clone() else {
+            lines.push(
+                "GitHub did not report this PR's base branch, so whether it is stacked is \
+                 unknown rather than fine — treat it as unchecked"
+                    .into(),
+            );
+            return lines;
+        };
+        if pr_base != build.base_branch {
+            lines.push(format!(
+                "this PR has been retargeted since the build was made: it was built against \
+                 {}, and its base is now {} — everything below reads GitHub's base, not the \
+                 build's",
+                build.base_branch, pr_base
+            ));
+        }
+        // An unstacked PR has its answer here and must cost no extra call.
+        lines.push(base_verdict(&pr_base, self.base_branch));
+        if pr_base == self.base_branch {
             return lines;
         }
         // Once merged, GitHub deletes head branches, so `compare/{trunk}...
@@ -563,7 +593,7 @@ impl<'a> Brief<'a> {
         // commit is only a speculative test merge.
         let (git_ref, about_the_merge) = match (pr.merged, pr.merge_commit_sha.as_deref()) {
             (true, Some(sha)) => (sha.to_string(), true),
-            _ => (build.base_branch.clone(), false),
+            _ => (pr_base.clone(), false),
         };
         // `trunk...ref`: reachable reads as `identical` or `behind`, and
         // reversing the operands inverts the verdict.
@@ -580,18 +610,18 @@ impl<'a> Brief<'a> {
                 (true, false) => format!(
                     "the merge commit {git_ref} is NOT on {} yet: this PR reached its \
                      base and nothing more, so the batch stays parked until {} lands",
-                    self.base_branch, build.base_branch
+                    self.base_branch, pr_base
                 ),
                 (false, false) => format!(
                     "its base {} has not reached {} yet, so merging this PR now ships \
                      nothing until {} itself lands",
-                    build.base_branch, self.base_branch, build.base_branch
+                    pr_base, self.base_branch, pr_base
                 ),
                 (false, true) => format!(
                     "its base {} has ALREADY reached {}, so merging this PR now only \
                      adds a commit to a branch nothing will pick up — it wants \
                      retargeting at {} first",
-                    build.base_branch, self.base_branch, self.base_branch
+                    pr_base, self.base_branch, self.base_branch
                 ),
             }),
             Err(e) => {
@@ -867,6 +897,44 @@ impl<'a> Brief<'a> {
 /// a run of the merged result answers that, and nothing in the pipeline makes
 /// one — which is what the landing section sends the reader to do.
 ///
+/// What a base branch means for landing, in the words a reader needs: the
+/// stacked case spells out that merging ships nothing, and the unstacked one
+/// says merging ships the work — which is what makes the stacked warning worth
+/// reading at all.
+///
+/// One function, because the sentence is reached from two places with different
+/// *sources* for `base`: GitHub's live `base_ref` wherever a pull request could
+/// be read, and `builds.base_branch` only where it could not. Two hand-written
+/// copies of one question is how the poller and the brief came to disagree
+/// about the same pull request (#1035).
+fn base_verdict(base: &str, trunk: &str) -> String {
+    if base == trunk {
+        format!("its base IS the trunk ({trunk}), so merging the PR ships the work")
+    } else {
+        format!(
+            "its base is NOT the trunk ({trunk}): merging this PR only moves the work onto \
+             {base}, and the tasks stay parked until {base} itself reaches the trunk. Merge \
+             the base first, or merge this one and then land {base} — either order works, \
+             but neither is done until the commit is on {trunk}"
+        )
+    }
+}
+
+/// [`base_verdict`] for a base nobody could confirm, hedged in front.
+///
+/// `builds.base_branch` is what the build was **cloned against**, and nothing
+/// updates it when a pull request is retargeted — so it is offered here only
+/// because GitHub could not be asked, and it is labelled as the build's record
+/// rather than as the pull request's base. Reading the column as the live
+/// answer is precisely #1035; saying which one this is costs a clause.
+fn recorded_base_verdict(base: &str, trunk: &str) -> String {
+    format!(
+        "as recorded, {} — that is the build's own base, not GitHub's, so a retarget since \
+         would not show here",
+        base_verdict(base, trunk)
+    )
+}
+
 /// It says "no automated check" rather than "nothing downstream", and the
 /// narrowing is necessary: on a host where the orchestrator has a warm build
 /// directory, the *reader* of this brief can go and make a run, even though the
