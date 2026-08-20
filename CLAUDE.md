@@ -1691,12 +1691,18 @@ binaries and export `TASKS_TEST_BIN_DIR` so no test shells out to cargo.
 
 Two gotchas worth knowing. **nextest does not run doctests** — silently, with
 no skip count in its summary — so both targets end with `cargo test --doc
---workspace`; anything else that runs the suite must too. And the scout
-timeout tests (three of them) leave a stray child holding the output pipe, so
-they report as LEAK; that is expected (`leak-timeout` is `result = "pass"`), and the profile
-deliberately keeps the period short rather than waiting the leak out, which
-would cost seconds and hide a real leak. Tuning lives in
-`.config/nextest.toml`.
+--workspace`; anything else that runs the suite must too. And a handful of tests
+leave a stray child holding the output pipe, so they report as LEAK; that is
+expected (`leak-timeout` is `result = "pass"`), and the profile deliberately
+keeps the period short rather than waiting the leak out, which would cost
+seconds and hide a real leak. **The known set is listed in
+`.config/nextest.toml`, beside the setting it justifies, and is not restated
+here** — this sentence used to say "the scout timeout tests (three of them)"
+while that file said two and the suite reported seven, and at that spread a new
+leak is indistinguishable from the undocumented ones (#969). One list, in one
+place, naming the tests rather than counting them, and saying why they leak so
+that a test leaking for a different reason reads as new. Tuning lives in the
+same file.
 
 **`app-gpui` is not a workspace member, so none of the above touches it — and
 it *can* be compiled and tested from a Linux agent VM**, which was long
@@ -1790,6 +1796,7 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `TASKS_INTAKE_LABEL` | — | when set (e.g. `tasks`), only open issues carrying that label are ingested; matched case-insensitively. Applied after the fetch, so closure tracking still sees the complete open set. Un-labelling an issue keeps its existing task, it just stops refreshing it |
 | `SCOUT_MAX_CONCURRENT` | 2 | scouts running at once. Each holds a vm-pool slot and the serial build lane holds one more, so the pool must fit `SCOUT_MAX_CONCURRENT + 1` — 3 is the recommended ceiling against the default pool of 6, and the server `warn!`s on every connect if the pool it found is short or an exact fit. See *Pool capacity* |
 | `SCOUT_IMAGE` | `agent:v1` | vm-pool image scouts run in |
+| `BUILDER_IMAGE` | `builder:v1` | vm-pool image builds run in. Paired with `SCOUT_IMAGE` rather than appended at the end: they are the same knob for the two halves of the pipeline, and `make images` rebuilds both, so a reader who finds one should find the other |
 | `SCOUT_TIMEOUT_SECS` | 3600 | budget per scout, measured on both clocks (see *Budgets and a host that sleeps*); past it the VM is deallocated and the attempt counts as a dispatch failure — unless the host was asleep for enough of it (a quarter of the budget left unspent), which is `Suspended` and costs nothing. Keep below vm-pool's `vm_timeout` (7200) |
 | `SCOUT_CHECKPOINT_INTERVAL_SECS` | 30 | how often a Scout's `NOTES.md` is streamed back as a checkpoint. Read *inside* the VM, so it is set in `images/scout/Dockerfile`, not here |
 | `SCOUT_MAX_RESUMES` / `BUILDER_MAX_RESUMES` | 2 | times a supervisor re-invokes an agent with `--resume <session_id>` after its API connection dropped mid-response (#845). Only a transport death is retried, and the backoff rises 2s / 15s / 30s. `0` disables it. Read *inside* the VM, so both live in `images/{scout,builder}/Dockerfile` |
