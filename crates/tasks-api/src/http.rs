@@ -189,8 +189,15 @@ pub struct CommentRequest {
 pub struct MergePullRequest {
     #[serde(default)]
     pub project_id: Option<ProjectId>,
-    /// `merge`, `squash`, or `rebase`. Defaults to `squash`, which is what
-    /// every Builder PR in this repo has been merged with.
+    /// `merge`, `squash`, or `rebase`. Defaults to **`merge`** (#1044).
+    ///
+    /// Not a style preference: a merge commit leaves the head branch an
+    /// ancestor of the trunk forever, and a squash does not — it writes one
+    /// new commit and the branch it came from is an ancestor of nothing. This
+    /// pipeline stacks builds routinely, and a dependent build's only cheap
+    /// diagnosis is branch ancestry, so a squashed base leaves its dependents
+    /// undiagnosable *and* unretargetable. The method is therefore a choice
+    /// about whether a stranded dependent is recoverable at all.
     #[serde(default)]
     pub method: Option<String>,
     /// The commit subject. Defaults to GitHub's own, which is the PR title.

@@ -1166,7 +1166,14 @@ async fn merge_pull_request(
 ) -> ApiResult<Response> {
     let github = github
         .ok_or_else(|| ApiError::Unavailable("no GITHUB_TOKEN: the server cannot merge".into()))?;
-    let method = body.method.as_deref().unwrap_or("squash");
+    // **`merge`, not `squash`** (#1044). A merge commit leaves the head branch
+    // an ancestor of the trunk forever; a squash writes one new commit and
+    // leaves the branch it came from an ancestor of nothing. Both are fine for
+    // the pull request itself — `run::shipped` reads `merge_commit_sha`, which
+    // for a squash is the squashed commit and is on the trunk — which is why
+    // this was invisible. It stops being invisible the moment something is
+    // stacked on the branch, and this pipeline stacks routinely.
+    let method = body.method.as_deref().unwrap_or("merge");
     if !matches!(method, "merge" | "squash" | "rebase") {
         return Err(ApiError::BadRequest(format!(
             "unknown merge method: {method} (merge, squash, or rebase)"
@@ -1189,15 +1196,48 @@ async fn merge_pull_request(
         rationale: body.rationale,
         evidence: body.evidence,
     };
-    if authorize(
+    let authority = authorize(
         &store,
         &decision,
         Capability::LandBuilds,
         DecisionAction::MergeBuild,
     )
-    .await?
-        == Authority::Shadow
-    {
+    .await?;
+
+    // A squash that would strand a dependent is refused, and the check runs
+    // only for a squash — the default costs nothing (#1044).
+    //
+    // After `authorize`, deliberately: `Off` answers 403 first, on the same
+    // rule that puts it ahead of the rationale 400, because telling a caller to
+    // change its merge method when the capability was never going to act sends
+    // it to fix the wrong thing.
+    //
+    // **An unreadable answer refuses**, which is the opposite of the standing
+    // "unknown is never a block" rule and is deliberate, because the mistakes
+    // here are not symmetric. Refusing a safe squash costs one retry with a
+    // method that is always allowed and always correct. Allowing an unsafe one
+    // permanently strands every pull request stacked on this branch: not
+    // mergeable (it would add a commit to a branch nothing picks up), not
+    // retargetable (replaying it at the trunk would replay the base's own
+    // commits), recoverable only by a rebase or a rebuild, and nothing in this
+    // pipeline can perform either.
+    if method == "squash" {
+        let stranded = squash_would_strand(&github, &project, number).await?;
+        if !stranded.is_empty() {
+            let list: Vec<String> = stranded.iter().map(|n| format!("#{n}")).collect();
+            return Err(ApiError::BadRequest(format!(
+                "PR #{number} is the base of {} still-open pull request(s) ({}), and a \
+                 squash would leave its branch an ancestor of nothing — stranding them \
+                 with no cheap recovery: not mergeable, not retargetable, only a rebase \
+                 or a rebuild. Merge it with \"method\": \"merge\" instead, which keeps \
+                 the branch reachable, or land the dependents first",
+                stranded.len(),
+                list.join(", "),
+            )));
+        }
+    }
+
+    if authority == Authority::Shadow {
         let seq = store
             .record_decision(
                 "gh",
@@ -1234,6 +1274,42 @@ async fn merge_pull_request(
     )
     .await?;
     Ok(Json(serde_json::json!({ "merged_sha": sha, "decision_seq": seq })).into_response())
+}
+
+/// The still-open pull requests a squash of `number` would strand, or an error
+/// if that could not be established (#1044).
+///
+/// Two reads, and both only ever happen for an explicit `squash`: the pull
+/// request itself, for its head branch, and the open pull requests based on
+/// that branch. A merge is the default and never pays either.
+///
+/// Every failure to *establish* the answer is returned as a refusal rather than
+/// as an empty list. "GitHub did not say" is not "nothing is stacked", and the
+/// two are not equally costly to get wrong.
+async fn squash_would_strand(
+    github: &GitHubClient,
+    project: &Project,
+    number: u64,
+) -> Result<Vec<u64>, ApiError> {
+    let unreadable = |what: &str, e: &dyn std::fmt::Display| {
+        ApiError::BadRequest(format!(
+            "PR #{number} cannot be squashed safely because {what} could not be read \
+             ({e}): whether anything is stacked on it is unknown, and a squash would \
+             strand whatever is. Merge it with \"method\": \"merge\" instead"
+        ))
+    };
+    let pr = github
+        .pull_request_state(&project.repo_owner, &project.repo_name, number)
+        .await
+        .map_err(|e| unreadable("the pull request", &e))?;
+    let head = pr
+        .head_ref
+        .as_deref()
+        .ok_or_else(|| unreadable("its head branch", &"GitHub reported none"))?;
+    github
+        .open_pull_requests_based_on(&project.repo_owner, &project.repo_name, head)
+        .await
+        .map_err(|e| unreadable("the pull requests based on it", &e))
 }
 
 /// Close a pull request without merging it.

@@ -232,6 +232,9 @@ pub struct PrState {
     /// The branch this PR merges *into* — `base.ref`. The cheap half of the
     /// shipped question: a PR based on the trunk needs no further reads.
     pub base_ref: Option<String>,
+    /// The branch this PR merges *from* — `head.ref`. What another build
+    /// stacks **on**, and therefore what a squash would make unreachable.
+    pub head_ref: Option<String>,
 }
 
 impl PrState {
@@ -1257,7 +1260,60 @@ impl GitHubClient {
                 .and_then(|base| base.get("ref"))
                 .and_then(|s| s.as_str())
                 .map(str::to_owned),
+            head_ref: body
+                .get("head")
+                .and_then(|head| head.get("ref"))
+                .and_then(|s| s.as_str())
+                .map(str::to_owned),
         })
+    }
+
+    /// The open pull requests whose **base** is `branch` — everything stacked
+    /// directly on it right now.
+    ///
+    /// Asked before a squash, and only before a squash (#1044). A merge commit
+    /// leaves `branch` an ancestor of the trunk forever; a squash writes one
+    /// new commit and leaves it an ancestor of nothing, so every pull request
+    /// in this list would be left both undiagnosable by ancestry ("has my base
+    /// landed?" answers no, and always will) and unretargetable at the trunk
+    /// (replaying it there would replay the base's own commits). Neither a
+    /// merge nor a retarget recovers them — only a rebase or a rebuild, and
+    /// nothing in this pipeline can perform either.
+    ///
+    /// Numbers only: the caller names them in a refusal, and nothing here
+    /// needs the bodies.
+    pub async fn open_pull_requests_based_on(
+        &self,
+        owner: &str,
+        name: &str,
+        branch: &str,
+    ) -> Result<Vec<u64>, GhError> {
+        let url = format!("{}/repos/{owner}/{name}/pulls", self.rest_base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(self.token().expose())
+            .header("Accept", "application/vnd.github+json")
+            .query(&[("state", "open"), ("base", branch), ("per_page", "100")])
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await?;
+        if !status.is_success() {
+            return Err(rest_error(
+                format!("open pull requests based on {branch}"),
+                status,
+                &body,
+            ));
+        }
+        Ok(body
+            .as_array()
+            .map(|prs| {
+                prs.iter()
+                    .filter_map(|pr| pr.get("number").and_then(|n| n.as_u64()))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Is `sha` an ancestor of `trunk` — i.e. did that commit actually reach
@@ -2174,6 +2230,7 @@ mod tests {
             mergeable_state: ms.map(str::to_owned),
             merge_commit_sha: None,
             base_ref: Some("main".into()),
+            head_ref: Some("build/example".into()),
         }
     }
 

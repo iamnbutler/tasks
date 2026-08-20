@@ -68,6 +68,28 @@ implementation.
   something it concluded had landed. Nothing auto-unwinds a stranded batch;
   `ObligationKind::LandBatch` makes it loud instead, and it is the first
   obligation whose subject is a **build** id rather than a spec id.
+- **The merge *method* decides whether a landed base stays addressable, and the
+  default is a merge commit.** The rule above rests on reachability, and a
+  squash is the one merge that destroys it: it writes a new commit with no
+  parent link to the head branch, so the branch becomes an ancestor of nothing
+  and every build stacked on it is stranded — not mergeable (its diff is
+  already in the trunk under different SHAs, so GitHub reports a conflict or an
+  empty change), not retargetable (replaying at the trunk replays the base's own
+  commits), recoverable only by a rebase or a rebuild, neither of which anything
+  in this pipeline can perform. This pipeline **stacks builds routinely**, so
+  `POST /pull-requests/{n}/merge` defaults to `merge` rather than `squash` and
+  refuses a `squash` whose head branch still has open pull requests based on
+  it — naming them, and naming `merge` as the way through, so the refusal is a
+  redirection and not a dead end. A squash with nothing stacked on it is
+  untouched: the guard is about stranding dependents, not about squashing. The
+  asymmetry is deliberate and **inverts the standing "unknown never blocks"
+  rule**: a GitHub that will not say what is based on the branch refuses the
+  squash, because refusing a safe one costs one retry with a method that is
+  always correct, while allowing an unsafe one strands work with no cheap
+  recovery at all. The check runs **after `authorize`** — a capability that is
+  `off` answers 403 before any complaint about the method, on the same ordering
+  argument that put the rationale check there — and before any effect, so a
+  refusal is a no-op.
 - **A build owns its batch's state only until a later build carries the same
   specs.** Both readers of "which build is still waiting on a pull request"
   found one by joining `builds → build_specs → specs → tasks` and filtering

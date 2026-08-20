@@ -36,6 +36,9 @@ struct Seen {
     labels_set: Vec<(u64, Value)>,
     merged: Vec<(u64, Value)>,
     prs_patched: Vec<(u64, Value)>,
+    /// Open pull requests the fake reports as based on the branch under test —
+    /// what a squash of it would strand (#1044). Empty is the ordinary case.
+    stacked_on_head: Vec<u64>,
 }
 
 impl Seen {
@@ -144,7 +147,11 @@ async fn spawn_fake_github(issue_number: u64) -> (String, Arc<Mutex<Seen>>) {
             "/repos/{owner}/{repo}/pulls/{number}",
             axum::routing::get(
                 move |AxumPath((_owner, _repo, number)): AxumPath<(String, String, u64)>| async move {
-                    AxumJson(json!({ "number": number, "head": { "sha": "abc123" } }))
+                    AxumJson(json!({
+                        "number": number,
+                        "head": { "sha": "abc123", "ref": "build/under_test" },
+                        "base": { "ref": "main" },
+                    }))
                 },
             )
             .patch(
@@ -155,6 +162,15 @@ async fn spawn_fake_github(issue_number: u64) -> (String, Arc<Mutex<Seen>>) {
                     AxumJson(json!({ "number": number, "state": "closed" }))
                 },
             ),
+        )
+        .route(
+            "/repos/{owner}/{repo}/pulls",
+            axum::routing::get(move |State(s): State<Arc<Mutex<Seen>>>| async move {
+                let stacked = s.lock().unwrap().stacked_on_head.clone();
+                AxumJson(Value::Array(
+                    stacked.into_iter().map(|n| json!({ "number": n })).collect(),
+                ))
+            }),
         )
         .with_state(seen.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -543,6 +559,129 @@ async fn a_human_comment_is_not_signed() {
     let decisions = h.store.decisions(None, 10).await.unwrap();
     assert_eq!(decisions.len(), 1);
     assert_eq!(decisions[0].actor, Actor::Human);
+}
+
+/// #1044: the merge *method* decides whether a landed base stays addressable.
+/// A merge commit leaves the head branch an ancestor of the trunk forever; a
+/// squash leaves it an ancestor of nothing. The default therefore has to be the
+/// one that keeps a dependent recoverable — the old default was `squash`, and
+/// the arm that stayed diagnosable was the one a human produced by hand.
+#[tokio::test]
+async fn the_default_merge_method_keeps_the_branch_reachable() {
+    let h = harness(true).await;
+
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/pull-requests/837/merge", h.base)))
+        .json(&json!({ "rationale": "approved spec, green run, nothing stacked" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let merged = h.seen.lock().unwrap().merged.clone();
+    assert_eq!(merged.len(), 1);
+    assert_eq!(
+        merged[0].1["merge_method"], "merge",
+        "a squash default strands anything stacked on this branch"
+    );
+}
+
+/// The guard: a squash of a branch something is still stacked on is refused,
+/// because it leaves the dependents with no cheap recovery at all — not a
+/// merge (it would add a commit to a branch nothing picks up), not a retarget
+/// (replaying at the trunk would replay the base's own commits), only a rebase
+/// or a rebuild, neither of which this pipeline can perform.
+#[tokio::test]
+async fn a_squash_that_would_strand_a_dependent_is_refused_before_the_merge() {
+    let h = harness(true).await;
+    h.seen.lock().unwrap().stacked_on_head = vec![1024];
+
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/pull-requests/837/merge", h.base)))
+        .json(&json!({
+            "method": "squash",
+            "rationale": "approved spec, green run",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let message = resp.text().await.unwrap();
+    assert!(
+        message.contains("#1024"),
+        "names what it would strand: {message}"
+    );
+    assert!(
+        message.contains("merge"),
+        "names the way through: {message}"
+    );
+    assert!(
+        h.seen.lock().unwrap().merged.is_empty(),
+        "refused before the write"
+    );
+
+    // And the way through actually works, so the refusal is a redirection
+    // rather than a dead end.
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/pull-requests/837/merge", h.base)))
+        .json(&json!({
+            "method": "merge",
+            "rationale": "approved spec, green run",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(h.seen.lock().unwrap().merged[0].1["merge_method"], "merge");
+}
+
+/// A squash with nothing stacked on it is still allowed — the guard is about
+/// stranding dependents, not about squashing.
+#[tokio::test]
+async fn a_squash_with_nothing_stacked_on_it_is_allowed() {
+    let h = harness(true).await;
+
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/pull-requests/837/merge", h.base)))
+        .json(&json!({
+            "method": "squash",
+            "rationale": "approved spec, green run, nothing stacked",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(h.seen.lock().unwrap().merged[0].1["merge_method"], "squash");
+}
+
+/// The asymmetry, stated as a test: a GitHub that will not say what is stacked
+/// **refuses** the squash, which inverts the standing "unknown is never a
+/// block" rule on purpose. Refusing a safe squash costs one retry with a method
+/// that is always correct; allowing an unsafe one strands work permanently.
+#[tokio::test]
+async fn a_squash_refuses_when_what_is_stacked_cannot_be_read() {
+    // A GitHub that answers nothing at all.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let h = harness_against(url).await;
+
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/pull-requests/837/merge", h.base)))
+        .json(&json!({
+            "method": "squash",
+            "rationale": "approved spec, green run",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let message = resp.text().await.unwrap();
+    assert!(message.contains("unknown"), "{message}");
+    assert!(
+        h.seen.lock().unwrap().merged.is_empty(),
+        "nothing was merged on an unreadable answer"
+    );
 }
 
 /// Merging is the one write whose recourse is a revert rather than an edit, so
