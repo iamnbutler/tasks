@@ -642,9 +642,29 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Set the pipeline mode — the title bar's play/pause buttons and the
-    /// Server menu's radio group, on one path.
+    /// Set the pipeline mode — the title bar's play/pause buttons, the Server
+    /// menu's radio group, the palette command and the empty state's CTA, on
+    /// one path.
+    ///
+    /// The before-first-`play` gate is **here** and not at those four call
+    /// sites, so one nobody has written yet inherits it — the same argument
+    /// that put the rationale check in `server::authorize`. `Pause` and `Stop`
+    /// are never gated.
+    ///
+    /// A first `play` **raises the Server window with the sheet up** rather
+    /// than raising a sheet here, and that is a decision rather than an
+    /// omission. The Server window is where the caution, the off switches and
+    /// now the charter already live, so the sheet's own last paragraph —
+    /// "Pause or Stop in this same row, any capability to off in the charter
+    /// below" — is true where it is shown and would be a set of directions to
+    /// somewhere else if it were shown here. The alternative, growing this
+    /// window its first `ModalLayer`, buys a second copy of one sheet whose
+    /// acknowledgement is process-wide anyway.
     pub(crate) fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        if mode == Mode::Play && crate::server::first_play_should_ask(cx) {
+            crate::server_window::open_asking_first_play(cx);
+            return;
+        }
         self.app_state
             .update(cx, |state, cx| state.set_mode(mode, cx));
     }

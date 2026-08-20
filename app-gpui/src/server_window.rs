@@ -56,6 +56,21 @@ pub struct ServerWindow {
     modals: ModalLayer,
 }
 
+/// Open the window with the before-first-`play` sheet already up (#993).
+///
+/// What the Workspace's own `play` reaches: the sheet belongs where the
+/// caution, the off switches and the charter are, so its last paragraph is
+/// true where it is shown. A `ModalConflict` here means the Stop confirmation
+/// is already parked, which the window surfaces on its own; the pipeline is
+/// not started either way.
+pub fn open_asking_first_play(cx: &mut App) {
+    open(cx);
+    let Some(handle) = cx.try_global::<ServerWindowHandle>().map(|global| global.0) else {
+        return;
+    };
+    let _ = handle.update(cx, |this, window, cx| this.ask_first_play(window, cx));
+}
+
 /// Open the window, or raise it if it is already open.
 pub fn open(cx: &mut App) {
     let control = ServerControl::global(cx);
