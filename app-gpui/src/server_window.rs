@@ -467,6 +467,15 @@ impl ServerWindow {
                 move |el| el.bg(hover_bg)
             })
             .on_click(cx.listener(move |this, _event, _window, cx| {
+                // The fourth path that sets the mode, and the one a guard
+                // living on the workspace would have missed: this window is
+                // reachable with no workspace at all, which is most of what
+                // it is for.
+                if let Some(app_state) = crate::state::global(cx) {
+                    if crate::autonomy::intercepts(mode, &app_state, cx) {
+                        return;
+                    }
+                }
                 this.control
                     .update(cx, |control, cx| control.set_mode(mode, cx));
             }))

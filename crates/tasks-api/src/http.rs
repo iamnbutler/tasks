@@ -1025,6 +1025,25 @@ pub struct LabelInfo {
     pub description: String,
 }
 
+/// `GET /autonomy-notice` — whether this install's owner has ever been shown
+/// what unattended operation means.
+///
+/// **Nothing reads this to decide whether an action may happen.** It is not a
+/// consent gate and it is not a term of service: the server never consults it,
+/// no endpoint refuses because of it, and the pipeline behaves identically
+/// whether it is set or not. It exists so a client can tell "explain this
+/// once" from "do not explain it again", and one row is the only durable place
+/// that answer can live — `TASKS_DEFAULT_MODE` overwrites the stored mode on
+/// every boot, so "the mode changed to play" fires on every restart and is
+/// useless as a trigger.
+///
+/// `None` means nobody ever has. It is one-way: there is no un-acknowledge
+/// route, and the first acknowledgement is the one that stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutonomyNotice {
+    pub acknowledged_at: Option<DateTime<Utc>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AppliedMigration, Viewer};

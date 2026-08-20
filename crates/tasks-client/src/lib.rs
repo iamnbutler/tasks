@@ -23,10 +23,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tasks_api::events::Event;
 use tasks_api::http::{
-    BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelAllResponse, CancelRunRequest,
-    CaptureIssue, CloseTaskRequest, CreateProject, ErrorResponse, ModeResponse, RejectedBundle,
-    ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewRequest, ScoutRequest, SendMessage,
-    ServerStatus, SetCharter, SetMode, SetProjectStatus, Viewer,
+    AutonomyNotice, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelAllResponse,
+    CancelRunRequest, CaptureIssue, CloseTaskRequest, CreateProject, ErrorResponse, ModeResponse,
+    RejectedBundle, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewRequest, ScoutRequest,
+    SendMessage, ServerStatus, SetCharter, SetMode, SetProjectStatus, Viewer,
 };
 use tasks_api::models::{
     Build, BuildId, Capability, CharterEntry, CharterLevel, CloseReason, Mode, OrchestratorMessage,
@@ -368,6 +368,24 @@ impl Client {
                 daily_limit,
             },
         )
+    }
+
+    // --- what unattended operation means (#993) ---
+
+    /// Whether anyone has ever been shown what unattended operation means.
+    ///
+    /// `acknowledged_at: None` means nobody ever has. **Nothing is gated on
+    /// it** — a client asks so it can decide whether to explain, and a server
+    /// too old to answer leaves the question unknown, which must not be read
+    /// as "never told".
+    pub fn autonomy_notice(&self) -> Result<AutonomyNotice> {
+        self.get_json("/autonomy-notice", &[])
+    }
+
+    /// Record that a person was shown it. Human-only at the server, and
+    /// idempotent — the first acknowledgement is the one that stands.
+    pub fn acknowledge_autonomy_notice(&self) -> Result<AutonomyNotice> {
+        self.post_empty("/autonomy-notice/ack")
     }
 
     /// `task_ids` is the complete queue order, front to back. Returns the

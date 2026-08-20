@@ -10,14 +10,14 @@
 use chrono::{DateTime, Utc};
 use futures::channel::mpsc;
 use futures::StreamExt;
-use gpui::Context;
+use gpui::{App, AppContext, Context, Entity, Global};
 use tasks_client::api::events::Event;
 use tasks_client::api::http::{RejectedBundle, Viewer};
 use tasks_client::api::models::{
-    Build, BuildId, BuildStatus, ChatRole, CloseReason, Mode, OrchestratorFeedEvent,
-    OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, Session, Spec,
-    SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState, TranscriptLine,
-    TranscriptOwner,
+    Build, BuildId, BuildStatus, Capability, CharterEntry, CharterLevel, ChatRole, CloseReason,
+    Mode, OrchestratorFeedEvent, OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId,
+    ProjectStatus, Session, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TaskState,
+    TranscriptLine, TranscriptOwner,
 };
 use tasks_client::{Client, ClientError, EventStreamItem};
 
@@ -119,6 +119,23 @@ pub struct AppState {
     /// be re-measured — this is what the view compares against.
     pub tick_revision: u64,
     pub mode: Option<Mode>,
+    /// What the orchestrator may currently do, as the server enforces it.
+    ///
+    /// Refetched with every other list rather than cached once: it is
+    /// human-writable from more than one place (this app, the API, another
+    /// client), and a stale copy would misreport an authority since
+    /// *narrowed* — the one direction this must not be wrong in.
+    pub charter: Vec<CharterEntry>,
+    /// Has anyone ever been shown what unattended operation means?
+    ///
+    /// Three-valued on purpose. `None` is **unknown** — nothing has answered
+    /// yet, or the server is unreachable, or it is too old to have the route.
+    /// `Some(None)` is a positive "nobody ever has", and it is the only value
+    /// that fires the notice; `Some(Some(when))` is settled forever.
+    ///
+    /// See [`owes_autonomy_notice`] for why unknown must not be read as
+    /// never.
+    pub autonomy_acknowledged: Option<Option<DateTime<Utc>>>,
 
     /// The event stream is up. `false` after a drop, until reconnect.
     pub connected: bool,
@@ -180,6 +197,9 @@ struct Snapshot {
     orchestrator_messages: Option<Vec<OrchestratorMessage>>,
     orchestrator_session: Option<OrchestratorSessionInfo>,
     mode: Option<Mode>,
+    charter: Option<Vec<CharterEntry>>,
+    /// The outer `Option` is "did this read answer", the inner is the row.
+    autonomy_acknowledged: Option<Option<DateTime<Utc>>>,
     /// The first failure, if any read failed.
     error: Option<String>,
 }
@@ -247,9 +267,79 @@ impl Snapshot {
             client.orchestrator_session(),
         );
         take(&mut snapshot.mode, &mut error, client.mode());
+        take(&mut snapshot.charter, &mut error, client.charter());
+        // `.ok()`, like `/bundles` and `/viewer`: a server too old to have the
+        // route answers 404, and an app that raised the red banner every
+        // refresh over it would report its own version skew as "something
+        // broke just now". An unanswered read leaves the question unknown,
+        // which `owes_autonomy_notice` declines to act on.
+        snapshot.autonomy_acknowledged = client
+            .autonomy_notice()
+            .ok()
+            .map(|notice| notice.acknowledged_at);
         snapshot.error = error;
         snapshot
     }
+}
+
+/// Does this install still owe somebody the explanation? (#993)
+///
+/// **Only a positive "nobody ever has" fires it.** The tempting reading of
+/// unknown — nothing answered yet, an unreachable server, a version too old
+/// to have the route — is "probably never told, so show it", and that turns a
+/// down endpoint into a modal on every press, which is exactly how a notice
+/// stops being read. So unknown declines, and the standing answer stays
+/// reachable from `Server ▸ What Play Does…` forever.
+///
+/// A free function rather than a method so the rule is testable without a
+/// gpui `App`. Stub it to `true` and
+/// `an_unknown_answer_does_not_owe_a_notice` fails.
+pub fn owes_autonomy_notice(acknowledged: Option<Option<DateTime<Utc>>>) -> bool {
+    matches!(acknowledged, Some(None))
+}
+
+/// The one [`AppState`] for the process, as a global.
+///
+/// **The ordinary way to reach it is still the explicit argument** —
+/// [`crate::workspace::Workspace::new`] takes it, so the dependency stays in
+/// the signature. This exists for the callers that cannot be handed one: the
+/// Server window, which is constructed on its own path with no workspace in
+/// reach, and `main`'s `open_workspace`, which is a bare `fn` because
+/// `Application::on_reopen` is registered before `run` and so can capture
+/// nothing built inside it.
+///
+/// It holds the entity **strongly**, and that is what fixes the bug this
+/// replaced: [`AppState`] used to be constructed *inside* `Workspace::new`,
+/// so cmd-W dropped it and reopening built a fresh one — every close of the
+/// main window was a full state reset with a full refetch behind it. A weak
+/// handle here would keep exactly that behaviour, because after the window
+/// closes there is nothing else left holding a strong one: the workspace was
+/// the only owner, and no closure outside `run` can be given the entity to
+/// hold. One process-lifetime singleton is the honest description; there is
+/// no leak for a strong global to hide, because nothing is ever meant to drop
+/// this.
+struct GlobalAppState(Entity<AppState>);
+
+impl Global for GlobalAppState {}
+
+/// Build the process's [`AppState`] and publish it. Call once, from `main`,
+/// before the first window opens — the sync loop starts here, so the first
+/// snapshot is already in flight while the window is being built.
+pub fn init(cx: &mut App) -> Entity<AppState> {
+    let state = cx.new(AppState::new);
+    cx.set_global(GlobalAppState(state.clone()));
+    state
+}
+
+/// The process's [`AppState`], or `None` before [`init`].
+///
+/// `try_global` rather than `global`: a caller reaching for this off the
+/// workspace's path has no business panicking, and returning `None` is what
+/// lets [`crate::autonomy::intercepts`] fall through to "carry on" rather
+/// than swallow a press.
+pub fn global(cx: &App) -> Option<Entity<AppState>> {
+    cx.try_global::<GlobalAppState>()
+        .map(|global| global.0.clone())
 }
 
 impl AppState {
@@ -345,6 +435,8 @@ impl AppState {
             owed_replies: 0,
             tick_revision: 0,
             mode: None,
+            charter: Vec::new(),
+            autonomy_acknowledged: None,
             connected: false,
             loaded: false,
             error: None,
@@ -749,6 +841,15 @@ impl AppState {
         if let Some(mode) = snapshot.mode {
             self.mode = Some(mode);
         }
+        if let Some(charter) = snapshot.charter {
+            self.charter = charter;
+        }
+        // Only on an answer, and it is a one-way fact: once the server has
+        // said "acknowledged at T" nothing un-says it, and a refresh that did
+        // not reach the route must not blank a settled answer back to unknown.
+        if let Some(acknowledged) = snapshot.autonomy_acknowledged {
+            self.autonomy_acknowledged = Some(acknowledged);
+        }
         self.loaded = true;
         self.error = snapshot.error;
         self.refreshing = false;
@@ -1001,6 +1102,58 @@ impl AppState {
 
     pub fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         self.run(cx, move |client| client.set_mode(mode));
+    }
+
+    /// Set one capability's standing.
+    ///
+    /// **Settled in place**, unlike every other mutation here: `set_charter`
+    /// appends nothing to the event log, so the app's "refresh on every SSE
+    /// event" contract does not cover it and nothing would arrive to refetch
+    /// on. Without this the row sits at its old level until something
+    /// unrelated moves.
+    pub fn set_charter(
+        &mut self,
+        capability: Capability,
+        level: CharterLevel,
+        cx: &mut Context<Self>,
+    ) {
+        // The server's own answer, not the level we asked for: if it
+        // normalises or refuses part of the request, what lands here is what
+        // it recorded.
+        self.run_settling(
+            cx,
+            move |client| client.set_charter(capability, level, None),
+            |state, entry, cx| {
+                match state
+                    .charter
+                    .iter_mut()
+                    .find(|held| held.capability == entry.capability)
+                {
+                    Some(held) => *held = entry,
+                    None => state.charter.push(entry),
+                }
+                cx.notify();
+            },
+            |_, _| {},
+        );
+    }
+
+    /// Record that a person was shown what unattended operation means.
+    ///
+    /// Idempotent at the server, which keeps the first acknowledgement — so
+    /// this can be fired without reading first. **Nothing is gated on it**:
+    /// a failure banners and the notice shows again on the next press, which
+    /// is the direction this has to fail in.
+    pub fn acknowledge_autonomy_notice(&mut self, cx: &mut Context<Self>) {
+        self.run_settling(
+            cx,
+            |client| client.acknowledge_autonomy_notice(),
+            |state, notice, cx| {
+                state.autonomy_acknowledged = Some(notice.acknowledged_at);
+                cx.notify();
+            },
+            |_, _| {},
+        );
     }
 
     /// Start tracking a repository. Nothing is dispatched by it: ingested
@@ -1477,5 +1630,25 @@ mod tests {
         for state in [TaskState::Backlog, TaskState::Done, TaskState::Rejected] {
             assert!(!is_picked_up(state), "{state:?}");
         }
+    }
+
+    #[test]
+    fn only_a_positive_nobody_ever_has_owes_a_notice() {
+        assert!(owes_autonomy_notice(Some(None)));
+    }
+
+    /// Absence of evidence must not fire it: an unreachable server, or one
+    /// too old to have the route, would otherwise be a modal on every press.
+    #[test]
+    fn an_unknown_answer_does_not_owe_a_notice() {
+        assert!(!owes_autonomy_notice(None));
+    }
+
+    /// One-way. There is no un-acknowledge route, and asking again after the
+    /// answer is settled is what "asked once per refresh until answered" is
+    /// the whole of.
+    #[test]
+    fn a_settled_acknowledgement_never_owes_it_again() {
+        assert!(!owes_autonomy_notice(Some(Some(Utc::now()))));
     }
 }
