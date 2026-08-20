@@ -4,6 +4,7 @@ mod commands;
 mod components;
 mod context_gauge;
 mod disclaimer;
+mod empty_state;
 mod feed;
 mod issue_composer;
 mod menus;

@@ -42,6 +42,7 @@ use crate::components::{
     markdown_block, pane_header, sidebar, MarkdownCache, SidebarSide, SidebarState,
 };
 use crate::context_gauge::{self, Band, Gauge};
+use crate::empty_state::{self, Action as EmptyStateAction, Explanation, Reachability};
 use crate::feed::{self, FeedKey, FeedRowKind};
 use crate::issue_composer::{self, IssueComposer};
 use crate::menus::{self, MenuState};
@@ -53,6 +54,7 @@ use crate::projects::ProjectFilter;
 use crate::repo_composer::{self, RepoComposer};
 use crate::row_menu::{self, RowAction, RowContext, RowEntry};
 use crate::server::ServerControl;
+use crate::server_window;
 use crate::state::AppState;
 use crate::time;
 
@@ -326,6 +328,16 @@ impl Workspace {
                             || this.server_control.read(cx).busy();
                         if live || ticks.is_multiple_of(30) {
                             cx.notify();
+                        }
+                        // The three dispatch holds live on `GET /status`, and
+                        // until #992 only the Server window ever read it — so
+                        // the main window could not say why the pipeline was
+                        // idle. Same cadence as that window, and `refresh`
+                        // coalesces on its own `probing` flag, so two pollers
+                        // are one request.
+                        if ticks.is_multiple_of(server_window::POLL.as_secs()) {
+                            this.server_control
+                                .update(cx, |control, cx| control.refresh(cx));
                         }
                     })
                     .is_ok();
@@ -2287,8 +2299,25 @@ impl Workspace {
     }
 
     /// What an empty conversation says about itself.
-    fn render_chat_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    ///
+    /// With nothing reachable the invitation below is a lie — there is
+    /// nothing to talk to — so the diagnosis takes the pane instead. Only the
+    /// three connection states can appear here, which is why this asks
+    /// `explain_reachability` rather than walking the lists.
+    fn render_chat_empty_state(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
+        let reachability = self.reachability(cx);
+        if reachability != Reachability::Up {
+            let explanation = empty_state::explain_reachability(reachability);
+            return div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .child(self.render_explanation(&explanation, "empty-chat", false, cx))
+                .into_any_element();
+        }
         div()
             .flex_1()
             .flex()
@@ -2314,6 +2343,7 @@ impl Workspace {
                          tasks and specs, and file issues. Press ⌘↩ to send.",
                     ),
             )
+            .into_any_element()
     }
 
     // --- the Agent Feed ---
@@ -2628,6 +2658,178 @@ impl Workspace {
         }
     }
 
+    // --- why a pane is empty (#992) ---
+    //
+    // The join: the lists, the mode and the connection come from `AppState`,
+    // the three dispatch holds from `ServerControl`'s `/status`. Everything
+    // decidable lives in `crate::empty_state`, which is gpui-free and unit
+    // tested; what is left here is where the sentence hangs and what it looks
+    // like, which is `make app` on a Mac.
+
+    /// How much of the server this window can currently see.
+    pub(crate) fn reachability(&self, cx: &App) -> Reachability {
+        let state = self.app_state.read(cx);
+        Reachability::read(
+            state.build_warning.is_some(),
+            state.connected,
+            state.error.is_some(),
+        )
+    }
+
+    /// This window's pipeline, counted once.
+    ///
+    /// Scoped by [`Self::project_filter`] for the tasks and deliberately not
+    /// for the projects — see [`empty_state::Pipeline::count`]. The scoping is
+    /// also what keeps the rail's two placements mutually exclusive: within a
+    /// filter, an empty tree means nothing queued, and every standing
+    /// situation needs something queued.
+    pub(crate) fn pipeline(&self, cx: &App) -> empty_state::Pipeline {
+        let reachability = self.reachability(cx);
+        let holds = empty_state::observe(self.server_control.read(cx).status.as_ref());
+        let state = self.app_state.read(cx);
+        empty_state::Pipeline::count(
+            reachability,
+            &state.projects,
+            &state.tasks,
+            &state.spec_queue,
+            &self.project_filter,
+            state.mode,
+            holds,
+        )
+    }
+
+    /// The one thing this window has to say about an empty pane.
+    pub(crate) fn explanation(&self, cx: &App) -> Explanation {
+        empty_state::explain(&self.pipeline(cx))
+    }
+
+    /// Render one diagnosis.
+    ///
+    /// `id` is per **placement** and required rather than derived: a server
+    /// that is not answering empties the rail, the catalog and the chat at
+    /// once, and gpui keys interactive elements by id — one constant here
+    /// would put three identically-keyed buttons in one window.
+    ///
+    /// `compact` is the standing line above a rail that has rows: a chip
+    /// under the section header rather than a block where a list would have
+    /// been.
+    pub(crate) fn render_explanation(
+        &self,
+        explanation: &Explanation,
+        id: &'static str,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let block = div()
+            .flex()
+            .flex_col()
+            .gap(px(if compact { 4. } else { 8. }))
+            .when(compact, |el| {
+                el.mx(px(6.))
+                    .mb(px(4.))
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(5.))
+                    .bg(theme.surface_secondary())
+            })
+            .when(!compact, |el| el.items_center().p(px(16.)))
+            .child(
+                div()
+                    .when(!compact, |el| el.max_w(px(420.)).text_center().text_sm())
+                    .when(compact, |el| el.text_xs())
+                    .text_color(theme.fg())
+                    .child(explanation.headline),
+            )
+            .child(
+                div()
+                    .when(!compact, |el| el.max_w(px(420.)).text_center())
+                    .text_xs()
+                    .text_color(theme.fg_muted())
+                    .child(explanation.detail.clone()),
+            );
+
+        let block = match explanation.action {
+            None => block,
+            Some(action) => block
+                .child(
+                    div()
+                        .id(id)
+                        .flex_none()
+                        .mt(px(2.))
+                        .px(px(8.))
+                        .py(px(3.))
+                        .rounded(px(5.))
+                        .border_1()
+                        .border_color(theme.border_secondary())
+                        .text_xs()
+                        .text_color(theme.fg())
+                        .cursor_pointer()
+                        .hover({
+                            let hover_bg = theme.surface_tertiary();
+                            move |el| el.bg(hover_bg)
+                        })
+                        // The caution is the disclaimer module's words, never
+                        // a second wording of our own: this is a fourth
+                        // surface for a control the About window, the Server
+                        // window and the title bar already caution, and it is
+                        // the one a new reader meets first (#984).
+                        .when(action.starts_the_pipeline(), |el| {
+                            el.tooltip(tooltip(crate::disclaimer::PLAY_TOOLTIP))
+                        })
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            this.run_empty_state_action(action, window, cx);
+                        }))
+                        .child(action.label()),
+                )
+                // Said in full and not only on hover, for the same reason the
+                // Server window says it in full: the reader with the least
+                // context must not be the one who has to find the tooltip.
+                .when(action.starts_the_pipeline(), |el| {
+                    el.child(
+                        div()
+                            .when(!compact, |el| el.max_w(px(420.)).text_center())
+                            .text_xs()
+                            .text_color(theme.fg_muted())
+                            .child(crate::disclaimer::PIPELINE_CAUTION),
+                    )
+                }),
+        };
+
+        // Holds that are true but are not the headline. Said, never pressed.
+        block
+            .children(explanation.notes.iter().map(|note| {
+                div()
+                    .when(!compact, |el| el.max_w(px(420.)).text_center())
+                    .text_xs()
+                    .text_color(theme.fg_muted())
+                    .child(note.clone())
+            }))
+            .into_any_element()
+    }
+
+    /// Every empty-state button goes through the action the menus already
+    /// dispatch, so there is no second path to starting the server and the
+    /// Server window's confirmation stays the only confirmation.
+    fn run_empty_state_action(
+        &mut self,
+        action: EmptyStateAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            // One action for both: `tasks reload` with no live pid already
+            // *is* a start, which is why the command palette renames the one
+            // item rather than offering two.
+            EmptyStateAction::StartServer | EmptyStateAction::RestartServer => {
+                window.dispatch_action(Box::new(menus::RestartServer), cx);
+            }
+            EmptyStateAction::AddRepo => self.open_repo_window(cx),
+            EmptyStateAction::OpenAllTasks => self.navigate(MiddleView::AllTasks, cx),
+            EmptyStateAction::Play => self.set_mode(Mode::Play, cx),
+        }
+    }
+
     fn render_center(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
         let loaded = self.app_state.read(cx).loaded;
@@ -2650,13 +2852,11 @@ impl Workspace {
             );
 
         if !loaded {
-            return pane.child(
-                div()
-                    .p(px(16.))
-                    .text_sm()
-                    .text_color(theme.fg_muted())
-                    .child("Connecting to the tasks server…"),
-            );
+            // No snapshot yet, so the lists behind the full walk have never
+            // been filled — only the connection is knowable, and
+            // `explain_reachability` is what refuses to guess past it.
+            let explanation = empty_state::explain_reachability(self.reachability(cx));
+            return pane.child(self.render_explanation(&explanation, "empty-center", false, cx));
         }
 
         // The body must be a shrinkable flex child (`flex_1` + `min_h(0)`),
