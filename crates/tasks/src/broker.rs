@@ -604,6 +604,25 @@ impl BrokerState {
     /// Failures are terse on the wire (a lease is the only audience) and
     /// quiet in the log at `debug` — an expired lease knocking is the
     /// ordinary end of every run, not an incident.
+    ///
+    /// The `Err` is an `axum` `Response` rather than a boxed or shrunk error
+    /// type, and that is measured rather than assumed: `Lease` is 136 bytes,
+    /// `Response` is 128, so `Result<Lease, Response>` and
+    /// `Result<Lease, Box<Response>>` are **both** 136 bytes. The `Ok` variant
+    /// already dominates the enum, so boxing the error — or replacing it with a
+    /// small `(StatusCode, &str)` denial — would move zero bytes of the thing
+    /// `clippy::result_large_err` exists to bound, while adding a heap
+    /// allocation to every denial. A reviewer reaching for the lint's suggested
+    /// fix should read that sentence first.
+    // `#[allow]` and deliberately not `#[expect]`: the lint fires on 1.98.0
+    // (what CI installs) and not on 1.97.1 (what the VM images currently
+    // ship), where an `#[expect]` would be unfulfilled and turn the in-VM
+    // check red to silence one CI is complaining about. `#[allow]` is silent
+    // on both.
+    #[allow(
+        clippy::result_large_err,
+        reason = "boxing saves 0 bytes here: Ok(Lease) is 136 and already dominates the 128-byte Err"
+    )]
     async fn authorize(
         &self,
         token: Option<&str>,
