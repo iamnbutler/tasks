@@ -238,7 +238,11 @@ const BACKGROUND_GRACE: Duration = Duration::from_secs(10);
 pub(crate) const DISPATCHER: &str = "dispatcher";
 
 /// `source` on breadcrumbs about the orchestrator's own lifecycle.
-const ORCHESTRATOR: &str = "orchestrator";
+///
+/// One constant rather than a second spelling: `maintain_verify_dir` here and
+/// the interrupt's own Note in [`crate::orchestrator`] write under the same
+/// source, and this became the third reader.
+use crate::orchestrator::NOTE_SOURCE as ORCHESTRATOR;
 
 /// `source` on the breadcrumbs the poller writes about GitHub's reachability.
 const POLLER: &str = "poller";
@@ -1011,10 +1015,15 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         runtime_health.clone(),
         shutdown_rx.clone(),
     ));
+    // Created here and handed to both the loop that arms it and the router
+    // that signals it — one slot, so the route and the turn are talking about
+    // the same turn rather than about two notions of one.
+    let turn_control = Arc::new(crate::orchestrator::TurnControl::new());
     let orchestrate = tokio::spawn(orchestrator_loop(
         store.clone(),
         config.clone(),
         verify_dir.clone(),
+        turn_control.clone(),
         shutdown_rx.clone(),
     ));
     let workers = tokio::spawn(worker_loop(
@@ -1078,6 +1087,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
             broker_health: Some(broker_health.clone()),
             runtime_health: Some(runtime_health.clone()),
             verify_dir: verify_dir.clone(),
+            turn_control: Some(turn_control.clone()),
             viewer: Default::default(),
         },
         async move {
@@ -3296,6 +3306,7 @@ pub async fn orchestrator_loop(
     store: Arc<Store>,
     config: Config,
     verify_dir: Option<Arc<crate::verify_dir::VerifyDir>>,
+    control: Arc<crate::orchestrator::TurnControl>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let workdir = config.agent_workdir();
@@ -3326,27 +3337,32 @@ pub async fn orchestrator_loop(
         if *shutdown.borrow() {
             return;
         }
-        // While a human has the session checked out interactively, do not
-        // touch it — CC sessions have no file locking, and a headless turn
-        // would interleave with theirs. Input keeps accumulating as
-        // unanswered turns and is answered once the checkout lapses.
-        match store.orchestrator_checked_out().await {
-            // Measured and reported, never reclaimed: a human with the session
-            // checked out may be building in this directory right now, and this
-            // is the one case the "nothing else starts a process in here"
-            // argument below does not cover.
-            Ok(true) => maintain_verify_dir(&store, verify_dir.as_deref(), false).await,
-            Ok(false) => {
+        // Both reasons a turn may not start, through **one** predicate
+        // (#1064): a human holding the lane, and a human holding the CC
+        // session checked out interactively. CC sessions have no file locking,
+        // so a headless turn would interleave writes with theirs; a hold is a
+        // standing decision that turns should not run at all. Input keeps
+        // accumulating as unanswered turns either way and is answered once the
+        // lane opens.
+        match store.orchestrator_lane().await {
+            Ok(lane) if lane.may_tick() => {
                 // **Before** the tick, deliberately. This loop is the only
                 // thing that starts a process in that directory, so a deletion
                 // cannot race a compile — by construction rather than by a
                 // lock.
                 maintain_verify_dir(&store, verify_dir.as_deref(), true).await;
-                if let Err(e) = orchestrator.tick().await {
+                if let Err(e) = orchestrator.tick(&control).await {
                     warn!(error = %e, "orchestrator tick failed");
                 }
             }
-            Err(e) => warn!(error = %e, "orchestrator checkout state unreadable; skipping tick"),
+            // The reclaim keys on the **checkout alone, not on the lane**.
+            // Held means this loop is precisely what is *not* running, so a
+            // hold must not stop bounding a directory that reached 51 GB
+            // unattended (#1010); checked out is the one case the "nothing
+            // else starts a process in here" argument does not cover, because
+            // a human may be building in it right now.
+            Ok(lane) => maintain_verify_dir(&store, verify_dir.as_deref(), !lane.checked_out).await,
+            Err(e) => warn!(error = %e, "orchestrator lane state unreadable; skipping tick"),
         }
         tokio::select! {
             _ = tokio::time::sleep(ORCHESTRATOR_TICK) => {}

@@ -224,6 +224,15 @@ pub struct Services {
     /// builds there — reported as no reading, which is the honest answer and
     /// not a zero.
     pub verify_dir: Option<Arc<crate::verify_dir::VerifyDir>>,
+    /// The live handle on the orchestrator turn in flight (#1064). Absent on
+    /// the health-record terms: this router has no orchestrator loop behind
+    /// it.
+    ///
+    /// Absent is reported as "no turn in flight" and **not** as a 503 — the
+    /// caller's question is whether the lane is quiet, and it is. It is also
+    /// what keeps every router-only test working untouched, since
+    /// [`router`] builds a `Services::default()`.
+    pub turn_control: Option<Arc<crate::orchestrator::TurnControl>>,
     /// Who the server's own GitHub credential is, remembered for a while.
     ///
     /// **The only non-`Option` field here**, and deliberately: every other
@@ -432,6 +441,12 @@ fn routes(store: Arc<Store>, services: Services) -> Router {
             "/orchestrator/session/release",
             post(release_orchestrator_session),
         )
+        // The two live controls the orchestrator's turn is the only run in the
+        // system to have lacked (#1064). Inside this private `fn routes`, so
+        // the loopback layer covers them by construction.
+        .route("/orchestrator/interrupt", post(interrupt_orchestrator_turn))
+        .route("/orchestrator/hold", post(hold_orchestrator_lane))
+        .route("/orchestrator/release", post(release_orchestrator_lane))
         .route("/viewer", get(get_viewer))
         .route("/status", get(get_status))
         .route("/mode", get(get_mode).post(set_mode))
@@ -3838,6 +3853,161 @@ async fn release_orchestrator_session(
     Ok(Json(store.orchestrator_session_info().await?))
 }
 
+/// The 403 the three lane controls answer any actor but the human with.
+///
+/// **Human-only and not charter-gated**, on the `build-now` precedent: these
+/// decide whether the judge convenes at all, rather than doing a unit of work
+/// inside the pipeline. There is no charter row that could be set to `off`
+/// here, and if lane control is ever wanted as autonomy it wants its own named
+/// capability and its own issue — an orchestrator that can stop and restart
+/// its own turns is a different thing from one that can act within them.
+///
+/// Called **first**, before the service lookup and the body, so a refusal is a
+/// no-op by construction rather than by reading down the function.
+async fn require_human_for_lane(store: &Store, headers: &axum::http::HeaderMap) -> ApiResult<()> {
+    if actor_of(store, headers)? != Actor::Human {
+        return Err(ApiError::Forbidden(
+            "the orchestrator's turn lane is the human's alone: interrupting a turn and \
+             holding the lane decide whether the orchestrator convenes at all, which no \
+             charter capability covers."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `POST /orchestrator/interrupt` — end the turn in flight.
+///
+/// A request that finds nothing running is a **200 saying so**, not a 4xx: the
+/// caller's question is whether the lane is quiet, and it is. Nothing is
+/// stored either, which is what makes "a request cannot leak forward into a
+/// turn nobody asked to stop" structural rather than careful.
+///
+/// The session survives — this kills one invocation, not the conversation —
+/// and no input is lost, because the watermark moves only in
+/// `append_orchestrator_reply` and the interrupted path never reaches it. So
+/// an interrupt **alone** re-answers the same input on the next tick. That is
+/// correct, and it is *why* quieting the lane is two acts; the detail below
+/// and the returned lane both say so.
+async fn interrupt_orchestrator_turn(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<tasks_api::http::LaneControlRequest>>,
+) -> ApiResult<Json<tasks_api::http::InterruptResponse>> {
+    require_human_for_lane(&state.store, &headers).await?;
+    let rationale = body.and_then(|Json(body)| body.rationale);
+    let interrupted = match &state.services.turn_control {
+        Some(control) => control.interrupt(crate::orchestrator::Interruption {
+            actor: "the human".into(),
+            rationale,
+        }),
+        // Not a 503: a router with no orchestrator loop behind it has no turn
+        // in flight, which is exactly what the caller asked.
+        None => false,
+    };
+    let lane = state.store.orchestrator_lane().await?;
+    let detail = if interrupted {
+        let tail = if lane.held {
+            "The lane is held, so no new turn will start."
+        } else {
+            "The input it was answering is unchanged, so the next tick takes it up again — \
+             POST /orchestrator/hold to stop turns starting."
+        };
+        format!("The turn was interrupted; its Claude Code session is intact. {tail}")
+    } else {
+        "There was no turn in flight, so nothing was interrupted — and nothing was recorded, \
+         so this cannot stop a later turn."
+            .to_string()
+    };
+    Ok(Json(tasks_api::http::InterruptResponse {
+        interrupted,
+        detail,
+        lane,
+    }))
+}
+
+/// `POST /orchestrator/hold` — stop new turns starting.
+///
+/// Durable (a column on the singleton row) and idempotent, and re-holding does
+/// **not** move "held since" — that is when the lane went quiet, not when
+/// somebody last said so. It leaves a turn already in flight alone: that is
+/// `interrupt`'s job, and the two being separate acts is the design rather
+/// than an omission.
+///
+/// The Note is written on the **edge only**, the `POST /mode` shape, with the
+/// rationale appended to a statement of what happened — one event rather than
+/// a bare rationale, which would be unreadable a week later.
+async fn hold_orchestrator_lane(
+    State(store): State<Arc<Store>>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<tasks_api::http::LaneControlRequest>>,
+) -> ApiResult<Json<tasks_api::http::LaneResponse>> {
+    require_human_for_lane(&store, &headers).await?;
+    let rationale = body.and_then(|Json(body)| body.rationale);
+    let was_held = store.orchestrator_lane().await?.held;
+    store.orchestrator_hold().await?;
+    if !was_held {
+        store
+            .append_event(lane_note(
+                "The orchestrator's turn lane is held: no new turn will start until it is \
+                 released.",
+                rationale.as_deref(),
+            ))
+            .await?;
+    }
+    let lane = store.orchestrator_lane().await?;
+    Ok(Json(tasks_api::http::LaneResponse {
+        detail: "The turn lane is held. A turn already in flight is unaffected — \
+                 POST /orchestrator/interrupt ends that one."
+            .into(),
+        lane,
+    }))
+}
+
+/// `POST /orchestrator/release` — let turns start again. Unconditional and
+/// idempotent: releasing a lane nobody held is a no-op, which is the only
+/// honest answer to "make sure turns can start".
+async fn release_orchestrator_lane(
+    State(store): State<Arc<Store>>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<tasks_api::http::LaneControlRequest>>,
+) -> ApiResult<Json<tasks_api::http::LaneResponse>> {
+    require_human_for_lane(&store, &headers).await?;
+    let rationale = body.and_then(|Json(body)| body.rationale);
+    let was_held = store.orchestrator_lane().await?.held;
+    store.orchestrator_release_hold().await?;
+    if was_held {
+        store
+            .append_event(lane_note(
+                "The orchestrator's turn lane is released: turns start again on the next tick.",
+                rationale.as_deref(),
+            ))
+            .await?;
+    }
+    let lane = store.orchestrator_lane().await?;
+    let detail = if lane.checked_out {
+        "The hold is released, but the session is still checked out interactively, so no \
+         turn starts yet."
+            .to_string()
+    } else {
+        "The turn lane is open; the next tick answers whatever is waiting.".to_string()
+    };
+    Ok(Json(tasks_api::http::LaneResponse { detail, lane }))
+}
+
+/// One event, statement first and rationale appended — never a bare rationale,
+/// which is unreadable a week later.
+fn lane_note(statement: &str, rationale: Option<&str>) -> EventPayload {
+    let message = match rationale.map(str::trim) {
+        Some(reason) if !reason.is_empty() => format!("{statement} {reason}"),
+        _ => statement.to_string(),
+    };
+    EventPayload::Note {
+        source: crate::orchestrator::NOTE_SOURCE.into(),
+        message,
+    }
+}
+
 /// SSE feed of the in-flight orchestrator tick: `delta` chunks as the reply
 /// is generated, `tool` labels as the agent works, `done` when the durable
 /// message has landed in `/orchestrator/messages`. Ephemeral — there is no
@@ -3916,6 +4086,9 @@ async fn get_status(
         Some(watch) => watch.pending(&store).await,
         None => None,
     };
+    // One read behind this and the tick's own gate, so a reader is never
+    // told the lane is open while the loop is declining to start a turn.
+    let lane = store.orchestrator_lane().await?;
     Ok(Json(ServerStatus {
         pid: std::process::id(),
         started_at: serving_since(),
@@ -3974,6 +4147,12 @@ async fn get_status(
         // thousands of files and happens on the orchestrator loop's cadence;
         // `measured_at` is what keeps that honest.
         verify_dir: verify_dir.and_then(|dir| dir.usage()),
+        // **Only when the lane is not open** — the hold shape and not the
+        // `verify_dir` shape one line up: a held lane is an exception a reader
+        // must not miss, and a standing "lane open" row is one a reader learns
+        // to skip.
+        orchestrator_lane: Some(lane)
+            .filter(|lane: &tasks_api::models::OrchestratorLane| !lane.may_tick()),
     }))
 }
 

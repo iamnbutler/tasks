@@ -23,7 +23,7 @@ use gpui::{
 };
 use gpuikit::theme::{ActiveTheme, Themeable};
 use tasks_client::api::http::{InFlight, ServerStatus, VerifyDirTier};
-use tasks_client::api::models::Mode;
+use tasks_client::api::models::{CharterLevel, Mode};
 
 use crate::about;
 use crate::modal::{self, modal, Dismissal, ModalLayer, Placement, Scrim};
@@ -54,6 +54,21 @@ pub struct ServerWindow {
     /// hands focus back to when nothing else held it.
     focus_handle: FocusHandle,
     modals: ModalLayer,
+}
+
+/// Open the window with the before-first-`play` sheet already up (#993).
+///
+/// What the Workspace's own `play` reaches: the sheet belongs where the
+/// caution, the off switches and the charter are, so its last paragraph is
+/// true where it is shown. A `ModalConflict` here means the Stop confirmation
+/// is already parked, which the window surfaces on its own; the pipeline is
+/// not started either way.
+pub fn open_asking_first_play(cx: &mut App) {
+    open(cx);
+    let Some(handle) = cx.try_global::<ServerWindowHandle>().map(|global| global.0) else {
+        return;
+    };
+    let _ = handle.update(cx, |this, window, cx| this.ask_first_play(window, cx));
 }
 
 /// Open the window, or raise it if it is already open.
@@ -502,12 +517,201 @@ impl ServerWindow {
                 let hover_bg = theme.surface_secondary();
                 move |el| el.bg(hover_bg)
             })
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                this.control
-                    .update(cx, |control, cx| control.set_mode(mode, cx));
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                let set = this
+                    .control
+                    .update(cx, |control, cx| control.set_mode_gated(mode, cx));
+                // Refused: this is the first user-initiated `play` on this
+                // install. Raise the sheet and change nothing — the confirm
+                // button is what writes the acknowledgement and then plays.
+                if !set {
+                    this.ask_first_play(window, cx);
+                }
             }))
             .child(label)
             .into_any_element()
+    }
+
+    /// Raise the before-first-`play` sheet (#993).
+    ///
+    /// A request for it while the Stop confirmation is up is the
+    /// [`crate::modal::ModalConflict`] the layer surfaces rather than
+    /// resolves; this window reports it into `mode_error`, where the pipeline
+    /// row's own errors already land.
+    fn ask_first_play(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(conflict) = self
+            .modals
+            .open(crate::first_play::SHEET_MODAL, None, window, cx)
+        {
+            self.control.update(cx, |control, cx| {
+                control.mode_error = Some(conflict.to_string());
+                cx.notify();
+            });
+        }
+        cx.notify();
+    }
+
+    /// The sheet: what `play` will do, once per install.
+    ///
+    /// [`Dismissal::Dismissible`] — escape and the scrim mean "not now" and
+    /// start nothing, which is a real answer, and a modal whose safe exit
+    /// needs a specific button is one whose other button is the easier target.
+    ///
+    /// **No `on_submit`**: ⌘-Enter deliberately does nothing here, because a
+    /// hand that reflexively hits it has not read the sheet, and this is the
+    /// one surface whose whole purpose is that the words get read.
+    fn render_first_play(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.modals.is_open(crate::first_play::SHEET_MODAL) {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let charter = self.control.read(cx).charter.clone();
+        Some(
+            modal(&self.modals)?
+                .scrim(Scrim::Dim)
+                .placement(Placement::Center)
+                .dismissal(Dismissal::Dismissible)
+                .on_dismiss(cx, |this, window, cx| {
+                    this.modals.dismiss(window, cx);
+                    cx.notify();
+                })
+                .child(
+                    modal::panel(cx)
+                        .id("first-play")
+                        .w(px(520.))
+                        .gap(px(10.))
+                        .p(px(14.))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.fg())
+                                .child(crate::first_play::TITLE),
+                        )
+                        .child(crate::first_play::sheet_body(charter.as_deref(), cx))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(px(6.))
+                                .child(self.button(
+                                    "first-play-start",
+                                    "Start the pipeline",
+                                    true,
+                                    None,
+                                    cx.listener(|this, _event: &ClickEvent, window, cx| {
+                                        // The acknowledgement is written
+                                        // first, and *then* the mode is set:
+                                        // an acknowledgement that lands only
+                                        // on a successful play would re-ask on
+                                        // every failed one.
+                                        crate::first_play::FirstPlay::acknowledge(cx);
+                                        this.modals.dismiss(window, cx);
+                                        this.control.update(cx, |control, cx| {
+                                            control.set_mode(Mode::Play, cx)
+                                        });
+                                    }),
+                                    cx,
+                                ))
+                                .child(self.button(
+                                    "first-play-not-now",
+                                    "Not now  esc",
+                                    true,
+                                    None,
+                                    cx.listener(|this, _event: &ClickEvent, window, cx| {
+                                        this.modals.dismiss(window, cx);
+                                        cx.notify();
+                                    }),
+                                    cx,
+                                )),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The charter, read-only, under the pipeline row and the caution (#993).
+    ///
+    /// This window is already where the off switches and the caution live, so
+    /// it is where the thing they switch belongs. The list is most of the
+    /// value; per-row level controls are the whole of it, and are the half cut
+    /// for time here — the spec says to ship the list rather than a partial
+    /// set of toggles.
+    ///
+    /// `None` is its own state: "the charter could not be read", never eleven
+    /// `off` rows.
+    fn render_charter(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let charter = self.control.read(cx).charter.clone();
+        let sheet = tasks_api::first_play::Sheet::from_charter(charter.as_deref());
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap(px(3.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(96.))
+                            .text_xs()
+                            .text_color(theme.fg_muted())
+                            .child("Charter"),
+                    )
+                    .child(div().text_xs().text_color(theme.fg_muted()).child(
+                        "What the orchestrator may do without being asked.                          POST /charter/{capability} sets a level.",
+                    )),
+            );
+        if sheet.unreadable {
+            return column.child(
+                div()
+                    .pl(px(102.))
+                    .max_w(px(460.))
+                    .text_xs()
+                    .text_color(theme.warning())
+                    .child(tasks_api::first_play::UNREADABLE_CHARTER),
+            );
+        }
+        for (level, lines) in [
+            (CharterLevel::Live, &sheet.live),
+            (CharterLevel::Shadow, &sheet.shadow),
+            (CharterLevel::Off, &sheet.off),
+        ] {
+            for line in lines.iter() {
+                let color = match level {
+                    CharterLevel::Live => theme.success(),
+                    CharterLevel::Shadow => theme.warning(),
+                    CharterLevel::Off => theme.fg_muted(),
+                };
+                column = column.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.))
+                        .pl(px(102.))
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(48.))
+                                .text_xs()
+                                .text_color(color)
+                                .child(level.as_str().to_uppercase()),
+                        )
+                        .child(
+                            div()
+                                .max_w(px(400.))
+                                .text_xs()
+                                .text_color(theme.fg_muted())
+                                .child(gpui::SharedString::from(line.permits)),
+                        ),
+                );
+            }
+        }
+        column
     }
 
     fn button(
@@ -794,7 +998,9 @@ impl Render for ServerWindow {
         let facts = self.render_facts(cx);
         let actions = self.render_actions(cx);
         let pipeline = self.render_pipeline(cx);
+        let charter = self.render_charter(cx);
         let confirm = self.render_confirm(cx);
+        let first_play = self.render_first_play(cx);
         let run = self.render_run(cx);
 
         div()
@@ -816,6 +1022,7 @@ impl Render for ServerWindow {
             .child(facts)
             .child(actions)
             .child(pipeline)
+            .child(charter)
             .child(
                 div()
                     .flex_none()
@@ -827,6 +1034,7 @@ impl Render for ServerWindow {
             // Last, over everything: the question is not one of the rows of
             // this window any more.
             .children(confirm)
+            .children(first_play)
     }
 }
 
@@ -1118,6 +1326,7 @@ mod tests {
             broker: None,
             runtime: None,
             verify_dir: None,
+            orchestrator_lane: None,
         }
     }
 

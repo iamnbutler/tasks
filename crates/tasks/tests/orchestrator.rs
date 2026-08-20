@@ -12,7 +12,9 @@ use tasks::models::{
     SessionEndReason, SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus,
     Task, TaskId, TaskState,
 };
-use tasks::orchestrator::{Orchestrator, OrchestratorConfig, VERIFICATION_ENV};
+use tasks::orchestrator::{
+    Interruption, Orchestrator, OrchestratorConfig, TurnControl, VERIFICATION_ENV,
+};
 use tasks::run::orchestrator_nudge_loop;
 use tasks::store::Store;
 use tokio::sync::watch;
@@ -74,13 +76,13 @@ async fn a_tick_answers_pending_turns_and_resumes_the_same_session() {
     let orch = orchestrator(store.clone(), &stub, tmp.path());
 
     // Nothing pending: no tick.
-    assert!(!orch.tick().await.unwrap());
+    assert!(!orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
 
     store
         .append_orchestrator_message(ChatRole::User, "what's the status?")
         .await
         .unwrap();
-    assert!(orch.tick().await.unwrap());
+    assert!(orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
 
     let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
     assert_eq!(messages.len(), 2);
@@ -92,14 +94,14 @@ async fn a_tick_answers_pending_turns_and_resumes_the_same_session() {
     );
 
     // Settled: no re-tick.
-    assert!(!orch.tick().await.unwrap());
+    assert!(!orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
 
     // A second turn resumes the SAME session Claude Code session.
     store
         .append_orchestrator_message(ChatRole::User, "queue #7")
         .await
         .unwrap();
-    assert!(orch.tick().await.unwrap());
+    assert!(orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
 
     let log = tokio::fs::read_to_string(&args_log).await.unwrap();
     let calls: Vec<&str> = log.lines().collect();
@@ -180,7 +182,7 @@ async fn a_stream_json_agent_feeds_deltas_and_tools_and_lands_the_result() {
         .append_orchestrator_message(ChatRole::User, "status?")
         .await
         .unwrap();
-    assert!(orch.tick().await.unwrap());
+    assert!(orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
 
     let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
     assert_eq!(
@@ -228,7 +230,7 @@ async fn a_proactive_tick_announces_itself_before_generating_anything() {
     let orch = orchestrator(store.clone(), &stub, tmp.path());
 
     // Nothing pending: the tick is a no-op and says so by saying nothing.
-    assert!(!orch.tick().await.unwrap());
+    assert!(!orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
     assert!(
         feed.try_recv().is_err(),
         "a no-op tick must not announce itself"
@@ -239,7 +241,7 @@ async fn a_proactive_tick_announces_itself_before_generating_anything() {
         .append_orchestrator_message(ChatRole::Event, "spec pending review for #7")
         .await
         .unwrap();
-    assert!(orch.tick().await.unwrap());
+    assert!(orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
 
     let mut got = Vec::new();
     while let Ok(event) = feed.try_recv() {
@@ -308,13 +310,13 @@ async fn an_agent_failure_lands_in_the_chat_and_settles_the_tick() {
         .append_orchestrator_message(ChatRole::User, "hello?")
         .await
         .unwrap();
-    assert!(orch.tick().await.unwrap());
+    assert!(orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
 
     let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
     assert_eq!(messages.len(), 2);
     assert!(messages[1].content.contains("orchestrator error"));
     // Settled — a second tick does nothing.
-    assert!(!orch.tick().await.unwrap());
+    assert!(!orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
     // Two invocations: the resume-failure heal path retried once with a
     // fresh session before giving up.
     let log = tokio::fs::read_to_string(&args_log).await.unwrap();
@@ -338,7 +340,7 @@ async fn a_lost_session_leaves_a_visible_seam_and_a_ledger_row() {
         .append_orchestrator_message(ChatRole::User, "hello")
         .await
         .unwrap();
-    assert!(orch.tick().await.unwrap());
+    assert!(orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
     let first_session = store.orchestrator_cc_session().await.unwrap().unwrap();
 
     // Second tick: an agent that refuses to resume but is happy to start
@@ -364,7 +366,7 @@ async fn a_lost_session_leaves_a_visible_seam_and_a_ledger_row() {
         .append_orchestrator_message(ChatRole::User, "still there?")
         .await
         .unwrap();
-    assert!(orch.tick().await.unwrap());
+    assert!(orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
 
     // The chat carries the seam, between the question and the fresh reply.
     let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
@@ -392,7 +394,7 @@ async fn a_lost_session_leaves_a_visible_seam_and_a_ledger_row() {
             .unwrap()
             .is_empty()
     );
-    assert!(!orch.tick().await.unwrap());
+    assert!(!orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
 
     // The ledger records both regimes, and which one died how.
     let second_session = store.orchestrator_cc_session().await.unwrap().unwrap();
@@ -501,7 +503,7 @@ async fn usage_separates_context_size_from_what_the_tick_spent() {
         .append_orchestrator_message(ChatRole::User, "status?")
         .await
         .unwrap();
-    assert!(orch.tick().await.unwrap());
+    assert!(orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
 
     let info = store.orchestrator_session_info().await.unwrap();
     assert_eq!(
@@ -543,7 +545,7 @@ async fn usage_separates_context_size_from_what_the_tick_spent() {
         .append_orchestrator_message(ChatRole::User, "and now?")
         .await
         .unwrap();
-    assert!(orch.tick().await.unwrap());
+    assert!(orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
 
     let info = store.orchestrator_session_info().await.unwrap();
     assert_eq!(info.context_tokens, Some(182_000));
@@ -637,7 +639,7 @@ async fn the_agent_identifies_its_writes_with_the_curl_config_and_no_shell_expan
         .append_orchestrator_message(ChatRole::User, "review the spec")
         .await
         .unwrap();
-    assert!(orch.tick().await.unwrap());
+    assert!(orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
 
     // The write landed, and it landed as the orchestrator's.
     let decisions = store
@@ -825,7 +827,7 @@ async fn standing_obligations_reach_the_conversation_and_persist() {
     let pending = store.unanswered_orchestrator_messages().await.unwrap();
     assert!(pending.iter().any(|m| m.seq == turn.seq));
     let orch = orchestrator(store.clone(), &stub, tmp.path());
-    assert!(orch.tick().await.unwrap());
+    assert!(orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
 
     // Answering is not deciding: the obligation is still open.
     assert!(
@@ -1496,7 +1498,7 @@ async fn pipeline_events_become_one_event_turn_the_tick_answers() {
     assert!(!turn.content.contains("reorder"), "{}", turn.content);
 
     // The tick answers the nudge like any other input.
-    assert!(orch.tick().await.unwrap());
+    assert!(orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
     let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
     let last = messages.last().unwrap();
     assert_eq!(last.role, ChatRole::Assistant);
@@ -1505,7 +1507,10 @@ async fn pipeline_events_become_one_event_turn_the_tick_answers() {
         "{}",
         last.content
     );
-    assert!(!orch.tick().await.unwrap(), "settled after the reply");
+    assert!(
+        !orch.tick(&Arc::new(TurnControl::new())).await.unwrap(),
+        "settled after the reply"
+    );
 
     nudge_loop.abort();
 }
@@ -1731,7 +1736,7 @@ async fn the_agent_gets_a_warm_build_directory_and_a_command_ceiling_below_its_t
         .await
         .unwrap();
     Orchestrator::new(store.clone(), base.clone())
-        .tick()
+        .tick(&Arc::new(TurnControl::new()))
         .await
         .unwrap();
 
@@ -1766,7 +1771,7 @@ async fn the_agent_gets_a_warm_build_directory_and_a_command_ceiling_below_its_t
             ..base
         },
     )
-    .tick()
+    .tick(&Arc::new(TurnControl::new()))
     .await
     .unwrap();
 
@@ -1822,4 +1827,199 @@ fn verification_env_matches_the_makefile() {
              and a mismatch rebuilds the workspace on every alternation:\n{recipe}"
         );
     }
+}
+
+// --- the turn lane's two live controls (#1064) ---
+
+/// A stub that hangs: it reports its own pid, then sleeps well past the test.
+/// What an interrupt has to be able to end.
+async fn write_hanging_stub(dir: &Path, started: &Path) -> std::path::PathBuf {
+    let stub = dir.join("stub-hangs.sh");
+    let body = format!(
+        "#!/bin/sh\ncat > /dev/null\necho $$ > {started}\nsleep 120\n",
+        started = common::shell_escape(&started.display().to_string()),
+    );
+    tokio::fs::write(&stub, body).await.unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = tokio::fs::metadata(&stub).await.unwrap().permissions();
+        p.set_mode(0o755);
+        tokio::fs::set_permissions(&stub, p).await.unwrap();
+    }
+    stub
+}
+
+/// The pitfall that would silently undo the whole change: the error path in
+/// `tick` becomes an assistant turn and calls `append_orchestrator_reply`,
+/// which is the **only** thing that advances the watermark. One `return`
+/// added on the interrupted path "to record what happened" through that
+/// function would eat the input the interrupt exists to preserve.
+#[tokio::test]
+async fn an_interrupted_turn_loses_no_input_and_keeps_its_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let started = tmp.path().join("stub.pid");
+    let stub = write_hanging_stub(tmp.path(), &started).await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let orch = orchestrator(store.clone(), &stub, tmp.path());
+    store
+        .append_orchestrator_message(ChatRole::User, "what's the status?")
+        .await
+        .unwrap();
+
+    let control = Arc::new(TurnControl::new());
+    let ticker = {
+        let control = control.clone();
+        tokio::spawn(async move { orch.tick(&control).await })
+    };
+    // Wait for the agent to actually be running before interrupting it —
+    // otherwise the test is about a race rather than about the control.
+    for _ in 0..200 {
+        if control.in_flight() && started.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(control.in_flight(), "the turn armed the slot");
+    assert!(control.interrupt(Interruption {
+        actor: "the human".into(),
+        rationale: Some("it is stuck on a cold build".into()),
+    }));
+
+    // `Ok(false)`: no reply was produced, and the tick did not fail either.
+    assert!(!ticker.await.unwrap().unwrap());
+
+    // The input is still unanswered, so the next tick takes it up again. This
+    // is the assertion the whole design rests on.
+    let pending = store.unanswered_orchestrator_messages().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].content, "what's the status?");
+    // No assistant turn was written: the interrupt is the one error that does
+    // not settle the tick condition.
+    let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
+    assert_eq!(messages.len(), 1, "{messages:?}");
+
+    // The accounting landed on the feed instead, with the actor and reason.
+    let events = store.events_since(0, 1000).await.unwrap();
+    let note = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::Note { message, .. } => Some(message.as_str()),
+            _ => None,
+        })
+        .find(|message| message.contains("interrupted"))
+        .expect("an interrupt writes a Note");
+    assert!(note.contains("the human"), "{note}");
+    assert!(note.contains("cold build"), "{note}");
+
+    // And the slot is free again, on every exit path.
+    assert!(!control.in_flight());
+}
+
+/// A request that arrives with nothing running is a **no-op that is never
+/// stored** — which is what makes "it cannot leak into the next turn"
+/// structural rather than careful.
+#[tokio::test]
+async fn an_interrupt_with_no_turn_in_flight_is_a_no_op_and_never_leaks_forward() {
+    let tmp = tempfile::tempdir().unwrap();
+    let args_log = tmp.path().join("args.log");
+    let stub = write_stub(tmp.path(), &args_log, false).await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let orch = orchestrator(store.clone(), &stub, tmp.path());
+
+    let control = Arc::new(TurnControl::new());
+    assert!(!control.in_flight());
+    assert!(!control.interrupt(Interruption {
+        actor: "the human".into(),
+        rationale: None,
+    }));
+
+    // The next turn runs to completion: nothing was remembered.
+    store
+        .append_orchestrator_message(ChatRole::User, "what's the status?")
+        .await
+        .unwrap();
+    assert!(orch.tick(&control).await.unwrap());
+    let messages = store.orchestrator_messages_since(0, 1000).await.unwrap();
+    assert_eq!(messages.len(), 2);
+    assert!(messages[1].content.contains("reply to:"));
+}
+
+/// The two acts are separate on purpose, and this is the half that says so:
+/// holding stops the *next* turn and says nothing about the one running.
+#[tokio::test]
+async fn holding_the_lane_leaves_the_turn_in_flight_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let args_log = tmp.path().join("args.log");
+    let stub = write_stub(tmp.path(), &args_log, false).await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let orch = orchestrator(store.clone(), &stub, tmp.path());
+    store
+        .append_orchestrator_message(ChatRole::User, "what's the status?")
+        .await
+        .unwrap();
+
+    store.orchestrator_hold().await.unwrap();
+    let lane = store.orchestrator_lane().await.unwrap();
+    assert!(lane.held && !lane.may_tick());
+
+    // The hold is the *loop's* gate, not the tick's: a turn already running is
+    // unaffected, which is precisely why interrupting is a second act.
+    assert!(orch.tick(&Arc::new(TurnControl::new())).await.unwrap());
+
+    store.orchestrator_release_hold().await.unwrap();
+    assert!(store.orchestrator_lane().await.unwrap().may_tick());
+}
+
+/// "Held since" is when the lane went quiet, not when somebody last said so.
+#[tokio::test]
+async fn the_hold_is_idempotent_and_keeps_the_instant_it_was_placed() {
+    let store = Store::open_in_memory().await.unwrap();
+    store.orchestrator_hold().await.unwrap();
+    let first = store.orchestrator_lane().await.unwrap();
+    assert!(first.held);
+    let placed = first.held_at.expect("a hold records when it was placed");
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    store.orchestrator_hold().await.unwrap();
+    let second = store.orchestrator_lane().await.unwrap();
+    assert_eq!(second.held_at, Some(placed), "re-holding must not move it");
+
+    // Release is unconditional and idempotent both ways round.
+    store.orchestrator_release_hold().await.unwrap();
+    store.orchestrator_release_hold().await.unwrap();
+    let open = store.orchestrator_lane().await.unwrap();
+    assert!(!open.held && open.held_at.is_none() && open.may_tick());
+}
+
+/// The struct-not-enum decision, at the surface that would lose by it: a
+/// reader told only about the checkout releases it, finds the lane still
+/// quiet, and stops trusting the control.
+#[tokio::test]
+async fn a_held_and_checked_out_lane_reports_both_reasons() {
+    let store = Store::open_in_memory().await.unwrap();
+    assert!(
+        store
+            .orchestrator_lane()
+            .await
+            .unwrap()
+            .describe()
+            .is_none()
+    );
+
+    store.orchestrator_hold().await.unwrap();
+    store.orchestrator_checkout().await.unwrap();
+    let lane = store.orchestrator_lane().await.unwrap();
+    assert!(lane.held && lane.checked_out && !lane.may_tick());
+
+    let why = lane.describe().expect("a quiet lane says why");
+    assert!(why.contains("holding the turn lane"), "{why}");
+    assert!(why.contains("checked out"), "{why}");
+    // Each reason names its own discharge.
+    assert!(why.contains("/orchestrator/release"), "{why}");
+
+    // `checked_out` is filled from the same read as the lane, so the two
+    // cannot disagree about the same instant.
+    let info = store.orchestrator_session_info().await.unwrap();
+    assert_eq!(info.checked_out, info.lane.checked_out);
 }

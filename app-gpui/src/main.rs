@@ -6,6 +6,7 @@ mod context_gauge;
 mod disclaimer;
 mod empty_state;
 mod feed;
+mod first_play;
 mod identity;
 mod issue_composer;
 mod menus;
@@ -73,6 +74,9 @@ fn main() {
         // modal's own field. Registered before `bind_input_keys` and escape
         // stops closing modals you have typed into.
         modal::bind_keys(cx);
+        // Seeded once, from disk: one process-wide answer, so acknowledging in
+        // the Server window does not leave the Workspace about to ask again.
+        server::FirstPlay::seed(cx);
 
         // Every key equivalent in the app, from the one table that also builds
         // the menu bar. Before `menus::set` below: gpui reads shortcuts out of

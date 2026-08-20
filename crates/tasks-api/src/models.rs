@@ -1016,6 +1016,78 @@ impl ChatRole {
     }
 }
 
+/// Why the orchestrator's turn lane is quiet — the two reasons a headless
+/// tick may not start, read through one predicate (#1064).
+///
+/// **A struct and not an enum**, and that is the whole shape. The two are not
+/// alternatives: a human can hold the lane *and* have the session checked out,
+/// and an enum forces a precedence that silently discards one — leaving a
+/// reader to release the wrong thing and find the lane still quiet.
+/// [`Self::describe`] returns both when both hold.
+///
+/// One read behind both, so the loop that decides whether to tick and every
+/// surface that reports why it did not cannot drift into two notions of
+/// "quiet".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OrchestratorLane {
+    /// A human has held the lane: `POST /orchestrator/hold`. Durable — a
+    /// column on the singleton row, so it survives a restart. Deliberately not
+    /// the mode's shape: `TASKS_DEFAULT_MODE` overwrites the stored mode at
+    /// every boot precisely because dispatch should come back quiet, whereas a
+    /// lane hold is a standing decision about the judge, and a restart that
+    /// silently resumed turns would leave a control that looks applied and is
+    /// not.
+    #[serde(default)]
+    pub held: bool,
+    /// When the hold was placed — "held since", which re-holding does not
+    /// move. Decoration for a banner that ages it, so an unreadable timestamp
+    /// can never become "not held".
+    #[serde(default)]
+    pub held_at: Option<DateTime<Utc>>,
+    /// A human has the CC session checked out interactively (a fresh
+    /// heartbeat). CC sessions have no file locking, so a headless turn would
+    /// interleave writes with theirs.
+    #[serde(default)]
+    pub checked_out: bool,
+}
+
+impl OrchestratorLane {
+    /// Whether a headless tick may start. The one predicate — every reader
+    /// asks this rather than testing a field.
+    pub fn may_tick(&self) -> bool {
+        !self.held && !self.checked_out
+    }
+
+    /// Why it may not, in the reader's terms, naming each reason's discharge.
+    /// `None` when the lane is open.
+    ///
+    /// Both reasons when both hold: a reader told only about the checkout
+    /// releases it and finds the lane still quiet, which is how a control
+    /// stops being trusted.
+    pub fn describe(&self) -> Option<String> {
+        let mut reasons = Vec::new();
+        if self.held {
+            reasons.push(
+                "a human is holding the turn lane (POST /orchestrator/release to let turns \
+                 start again)"
+                    .to_string(),
+            );
+        }
+        if self.checked_out {
+            reasons.push(
+                "the session is checked out interactively (it frees itself when the \
+                 checkout heartbeat lapses)"
+                    .to_string(),
+            );
+        }
+        if reasons.is_empty() {
+            None
+        } else {
+            Some(reasons.join("; and "))
+        }
+    }
+}
+
 /// The orchestrator's Claude Code session as clients see it
 /// (`GET /orchestrator/session`): enough to resume it interactively
 /// (`cd <workdir> && claude --resume <cc_session_id>`) and whether someone
@@ -1028,7 +1100,18 @@ pub struct OrchestratorSessionInfo {
     pub workdir: Option<String>,
     /// A human holds an interactive checkout (fresh heartbeat); headless
     /// ticks are suspended while true.
+    ///
+    /// Kept beside [`Self::lane`] rather than replaced by it — existing
+    /// clients read this — and filled from the *same* read, so the two cannot
+    /// disagree about the same instant.
     pub checked_out: bool,
+    /// Both reasons the turn lane may be quiet, and the predicate that decides
+    /// whether a tick starts (#1064). `#[serde(default)]` because a client
+    /// built from this crate may be talking to a server that predates the
+    /// field, and an open lane is the honest reading of a server that has no
+    /// hold to report.
+    #[serde(default)]
+    pub lane: OrchestratorLane,
     /// How much context the session is holding as of its last turn, in
     /// tokens: the input side (fresh + cached) of the prompt behind its last
     /// main-chain model call. An absolute reading — this is the number to
@@ -1614,6 +1697,59 @@ impl Capability {
             Capability::DispatchWorkers => {
                 "dispatch a worker: a fresh host agent that runs a job you \
                  write (POST /workers) and reports back as a [worker] turn"
+            }
+        }
+    }
+
+    /// One clause for a **human** reading what the pipeline is about to be
+    /// allowed to do — the generated half of the before-first-`play` sheet
+    /// (#993).
+    ///
+    /// Two sentences of one fact, and deliberately not one. [`Self::describe`]
+    /// is second person and instructional ("file issues for work you
+    /// discover") because it is a line of the *orchestrator's* generated
+    /// authority section; rendered at a human it reads as though the human is
+    /// being told to file issues. This one names the act sharply, in the third
+    /// person, and says whose account it acts on — "your default branch",
+    /// "your repositories" — because the whole question the sheet answers is
+    /// what this does to things the reader owns.
+    ///
+    /// It never renders its own slug: `land_builds` is a name for a switch,
+    /// not a description of merging a pull request, and a sheet full of slugs
+    /// is one nobody reads. The match is exhaustive, so a capability added
+    /// later is in the sheet because the enum is, not because somebody
+    /// remembered.
+    pub fn permits(&self) -> &'static str {
+        match self {
+            Capability::CaptureWork => "file new issues in your repositories, without asking",
+            Capability::RetireWork => {
+                "close issues in your repositories as done or not planned, and reopen them"
+            }
+            Capability::QueueTasks => {
+                "queue work for a Scout, which starts a VM that reads one of your repositories"
+            }
+            Capability::DispatchBuilds => {
+                "start Builder runs, which write code and push branches to your repositories"
+            }
+            Capability::AutoReviewSpecs => {
+                "approve or reject a Scout's spec itself, with no human reading it first"
+            }
+            Capability::CommentOnWork => {
+                "post comments on your issues and pull requests, under your account"
+            }
+            Capability::LandBuilds => {
+                "merge its own pull requests into your default branch, or close them unmerged"
+            }
+            Capability::CurateWork => {
+                "rewrite the body and labels of issues it filed in your repositories"
+            }
+            Capability::CancelRuns => "stop a Scout or a Builder that is already running",
+            Capability::EnrollAgents => {
+                "hand another agent a short-lived code that lets it speak into this \
+                 conversation under its own name"
+            }
+            Capability::DispatchWorkers => {
+                "start extra agent processes on this machine, which run commands here"
             }
         }
     }

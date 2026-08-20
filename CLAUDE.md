@@ -591,6 +591,62 @@ implementation.
   is retained is a dependency tree `make test` never builds — the steady-state
   size therefore depends on whether app builds share this directory, which
   nobody has decided.
+- **The orchestrator's turn has two live controls, and they are two acts because
+  they answer two questions.** Every other run in the system could be stopped
+  and every one of them held; the turn could be neither, so the honest answer to
+  "stop it, it is wedged on a cold build" was to wait it out. `POST
+  /orchestrator/interrupt` ends the turn in flight and `POST
+  /orchestrator/hold` / `/release` stop new ones starting — all three
+  **human-only and not charter-gated**, on the `build-now` precedent, because
+  they decide whether the judge convenes at all rather than doing a unit of work
+  inside the pipeline. The **interrupt is an in-process signal and not a
+  `cancellations` row**, and the reason is that row's own premise: *the process
+  taking the request need not be the one following the run*, which is true of a
+  scout or a build living in a VM and false of a turn, a local child of this one
+  server that dies with it and can never be reattached. A worker is a local
+  child too and does use a row, because a worker has a durable id; a turn has
+  none, `cancellations` is keyed `(run_kind, run_id)`, and the only id available
+  is the singleton's — so a request landing a moment late would sit on record and
+  stop a *later* turn nobody asked to stop. `TurnControl` is one slot taken while
+  a turn runs, so a request that arrives with nothing running finds no slot, is
+  answered honestly with a **200 and never a 4xx**, and is never stored: "it
+  cannot leak forward" is structural rather than careful, which an `AtomicBool`
+  plus a stored request would give back. `OrchestratorError::Interrupted` is the
+  **one** error that does not become an assistant turn — every other path writes
+  itself into the chat precisely because persisting a reply settles the tick
+  condition so a poison prompt is not retried forever, and settling it is exactly
+  what an interrupt must not do. The watermark moves only in
+  `append_orchestrator_reply`, which the interrupted path never reaches, so the
+  input survives and the next tick re-answers it; a `return` added through that
+  function "to record what happened" would silently eat the input the control
+  exists to preserve. The accounting goes on the feed as a `Note` instead,
+  written **by the turn and not by the route**, because the select is `biased`
+  with the work first (`cancel::bounded`'s rule) and a note written at the
+  request would sometimes claim a stop that never happened. The **hold is a
+  column** rather than a signal, and deliberately not the mode's shape:
+  `TASKS_DEFAULT_MODE` overwrites the stored mode at every boot precisely because
+  dispatch should come back quiet, whereas a hold is a standing decision about
+  the judge and a restart that silently resumed turns would leave a control that
+  looks applied and is not. Re-holding does not move "held since" — that is when
+  the lane went quiet, not when somebody last said so. Both reasons a turn may
+  not start are read through **one** predicate, `Store::orchestrator_lane`, and
+  `OrchestratorLane` is a **struct and not an enum**: the two are not
+  alternatives, a human can hold the lane *and* have the session checked out, and
+  an enum forces a precedence that silently discards one — leaving a reader to
+  release the wrong thing and find the lane still quiet. Two consequences are
+  easy to undo by accident. The **verify-directory reclaim keys on
+  `checked_out` alone, never on the lane**: held means that loop is precisely
+  what is *not* running, so a hold must not stop bounding a directory that
+  reached 51 GB unattended (#1010), while checked out is the one case the
+  "nothing else starts a process in here" argument does not cover. And the child
+  now runs in its **own process group**, swept on the interrupt path *and* on the
+  timeout path, because `kill_on_drop` takes the agent alone and its bash
+  children survive holding the pipes being read — `run_script`'s hazard one
+  surface over, same answer — so a timed-out turn cannot leave a `cargo` behind
+  in that same directory. Liveness between the two signals is
+  `crate::pidfile::pid_alive` (`ps -o state=`, a leading `Z` is dead) and not
+  `/proc`, which this deployment platform does not have, and not `kill(pid, 0)`,
+  which reports every unreaped corpse as alive.
 - **Bulk intake never auto-dispatches, and queue membership is explicit.**
   `tasks.manual_rank` is set only via the API; the GitHub poller must never
   write it. Ingested issues land in `backlog` and are never dispatched — only
