@@ -181,9 +181,9 @@ supervisors in release to `aarch64-unknown-linux-gnu`, runs four
 `container build`s in sequence (`vm-pool-base` → `vm-pool-agent` → `agent:v1`
 and `builder:v1`), and finishes by booting each image to read its `--version`
 back. Long silences are the cross-compiles; it has not hung. Running it here,
-before anything is serving, is safe — it gates on `tasks drain --check`, which
-passes when nothing is serving. Once a server *is* up, that gate is real, and
-the sequence is the one under **Day to day**.
+before anything is serving, is safe: with nothing to hold it simply says so and
+rebuilds. Once a server *is* up, it holds dispatch for the rebuild's own
+duration and restores it afterwards — there is nothing to release by hand.
 
 Keys never reach a VM: agents run on short-lived, repo-bound leases redeemed
 through an in-process broker, and the sealed store means no raw key sits in
@@ -247,12 +247,19 @@ against, GitHub's answer to your token, and the rest, in the order the
 preconditions bite, and names the command that fixes each failure. It reports
 and never fixes, and it writes nothing.
 
-Host work the server cannot do to itself — restarting vm-pool, rebuilding
-images — wants the pipeline quiesced first, and the hold outlives the command:
+Rebuilding the images asks nobody's permission — `make images` wraps its own
+rebuild in `tasks hold`, which pauses dispatch for exactly as long as the
+rebuild runs and puts the mode back when it exits, however it exits. A run
+already in flight is not a reason to wait: what a rebuild can spoil is a run
+*dispatched into* it, and one that started earlier re-attaches or dies
+charging nothing.
 
 ```sh
+make images       # holds dispatch for its own duration; nothing to release
+
+# The one host act with no recovery — restarting vm-pool on the same socket —
+# still wants the pipeline quiesced first, and that hold outlives the command:
 make drain        # hold dispatch, and wait for work in flight to land
-make images       # ...then the host work: this, or a vm-pool restart
 make resume       # ...then give dispatch back
 ```
 
@@ -263,7 +270,7 @@ make resume       # ...then give dispatch back
 | anything, or you don't know yet | `tasks doctor` | whatever it names — every failing check prints the command that changes it |
 | doctor is clean, mode is `play`, nothing dispatches | `curl -s localhost:4800/tasks \| jq -r '.[] \| "\(.id) \(.state)"'` — is it `backlog`? | `POST /tasks/{id}/queue`; backlog never dispatches on its own |
 | doctor warns that dispatch is held | `make status` names which hold: GitHub not answering, an update pending, or a full pool | each clears on its own terms — a GitHub hold on the next good poll, an update hold on `make restart` / `make images`, a pool hold on the next VM handed back |
-| a supervisor change seems to have no effect | `make images-check` (or `tasks doctor --probe-images`) — the images are rebuilt by hand and nothing does it for you | `make drain` → `make images` → `make resume` |
+| a supervisor change seems to have no effect | `make images-check` (or `tasks doctor --probe-images`) — the images are rebuilt by hand and nothing does it for you | `make images` (it holds dispatch for its own duration; nothing to release afterwards) |
 | a scout started and then died | its transcript, in the app or `GET /sessions/{id}/transcript`, and the `exit_reason` on the session | nothing, usually: a dropped API connection is resumed in the VM and costs the task no attempt. Only a run that reached a verdict is charged one, and three of those reject the task |
 
 ## Reading further

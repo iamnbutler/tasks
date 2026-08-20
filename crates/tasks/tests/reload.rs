@@ -1018,8 +1018,11 @@ async fn stop_when_idle_waits_for_the_drain_and_leaves_dispatch_paused() {
         stdout.contains(&format!("stopped pid {}", status.pid)),
         "{stdout}"
     );
-    // The one lasting consequence is the last thing said, with its undo.
-    assert!(stdout.contains("dispatch is left paused"), "{stdout}");
+    // What waiting left the mode at is the last thing said — a report and not
+    // a debt, since a boot overwrites the stored mode from TASKS_DEFAULT_MODE
+    // before the listener binds. The `curl` is for a server already back up.
+    assert!(stdout.contains("nothing put it back"), "{stdout}");
+    assert!(stdout.contains("TASKS_DEFAULT_MODE"), "{stdout}");
     assert!(stdout.contains("/mode"), "{stdout}");
 
     assert!(!pidfile::pid_alive(status.pid));
