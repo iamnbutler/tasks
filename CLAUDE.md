@@ -172,21 +172,105 @@ implementation.
   `Landing::Clear::describe()` says so in words, and a test pins that clause
   and the absence of "ready to merge". Read `mergeable_state` and never
   `mergeable` alone: `false` there means a conflict and nothing else, so a red
-  PR reads ready. The only evidence that a change works is therefore the
-  Builder's own run, which it states as a `Verification: PASSED|FAILED|NOT RUN`
-  trailer in `SUMMARY.md` — a trailer and not a column, because the summary is
-  already stored and already the PR body, so one sentence serves the human
-  reading the PR and the brief reading it back with no migration, no
-  `BuildEvent` field and no image rebuild in between. It is a **claim**, not a
-  check, and the brief attributes it as one; every batch parked before it was
-  asked for parses as `Unreported`, which reads as "no run on record" and goes
-  to a human, which is the direction a mistake here has to fall. All of this
+  PR reads ready. The only evidence that a change works is therefore a run of
+  the project's own suite, and the bullet below is how that run is now
+  obtained — by the Builder **supervisor**, as a check, where this bullet used
+  to describe a `Verification:` trailer the Builder *agent* wrote into
+  `SUMMARY.md` and the host grepped. Every batch parked before that changed
+  carries no verification at all, which reads as "no run on record" and goes to
+  a human, which is the direction a mistake here has to fall. All of this
   lands on the *brief* rather than in the obligation: refining an obligation's
   **kind** after `Store::obligations` returns would lose its
   `(kind, subject_id)` reminder row and nag every tick instead of every thirty
   minutes, and it would cost a GitHub read per parked PR per tick rather than
   one per obligation actually surfaced. Mergeability is never cached — that is
   persisting a GitHub-owned fact with a timestamp on it.
+- **A Builder cannot return untested work, because the supervisor runs the
+  suite and the agent does not — and a green run covers the branch against its
+  own base, never the composition.** `SUMMARY.md`'s
+  `Verification: PASSED|FAILED|NOT RUN` trailer was agent-authored prose,
+  grepped by the host, gating a write to GitHub: a decision resting on text
+  written by the party being graded, which is the defect `FailureClass` already
+  forbids one level up. `builder-supervisor` now runs the project's own suite
+  itself, inside the VM, against the **swept** tree the bundle carries, and
+  stamps a structured `Verification { status, detail }` on
+  `BuildEvent::Completed` — the deliberate sibling of `class: FailureClass`,
+  read off the field and never off `detail`, which is prose. The larger prize is
+  not where verification happens but that **a red suite never reaches GitHub**:
+  it fails the build inside the VM as a `Verdict`, where before it opened a pull
+  request, parked a batch in `awaiting_merge` and spent a reviewer's attention.
+  `VerificationStatus` is `Passed | Undeclared | Unavailable | TimedOut` and
+  there is deliberately **no `Failed`**, so "shipped and red" is unrepresentable
+  rather than merely avoided; `is_green()` is the only way anything asks, so a
+  variant added later cannot become green by omission, and the VM wire's
+  forgiving `Deserialize` decays an unknown status to `Unavailable`, never
+  toward green (a terminal event that will not decode costs the run its
+  outcome, which is why it decodes at all). The suite is declared by the
+  repository at `.tasks/verify` and read out of the build's **base** commit —
+  the agent has write access to the tree, so a tip-resolved gate is the same
+  forgery one level down with `exit 0` in place of `PASSED`. The issue's
+  argument for the tip ("a pull request that changes how the project is tested
+  changes its own gate") is a GitHub-Actions property and **inverts here**,
+  because this gate decides whether a pull request is opened *at all*, so the
+  reviewer only ever sees the diff after it has ruled. Base-resolution alone is
+  not enough either: this pipeline **stacks builds routinely**, so a script
+  build A weakened is already in build B's base, B's own diff changes nothing,
+  and nothing would notice. So `detail` always names the blob SHA of the script
+  that ran — always, including when it matches, because a field that appears
+  only on disagreement is one nobody learns to read — and compares it against
+  the **trunk's** copy, reporting `declaration_changed` on a difference rather
+  than refusing (changing how a project is tested is ordinary work; the reviewer
+  needs to know which script ruled, not to be blocked). A trunk not reachable in
+  the clone is reported as an *unmade comparison*, never as agreement. A project
+  that declares nothing dispatches ungated and reports `Undeclared`, on the
+  standing "absence of evidence never holds" rule — never green, so it routes to
+  a human exactly as it did before, which makes the whole change strictly
+  additive. **Red is a verdict reached; everything else is the absence of one.**
+  A red suite buys exactly one bounded repair round — `--resume` on the same
+  conversation and the same worktree, so the agent repairs rather than rebuilds
+  — and that round shares `BUILDER_MAX_RESUMES`'s *mechanism* while never
+  sharing its counter, because the two bound different questions (how often a
+  dropped connection may be picked up, versus how often the agent may be told
+  its own tests are red). Once a round has returned red, **no later status may
+  ship the build**: round two ends green or the build fails, because shipping on
+  "we do not know" when the last thing actually known was red is the one
+  direction this exists to prevent — and because red being terminal while a
+  hanging suite is not would be an incentive gradient pointing at making the
+  suite slow. The observed status stays honest in `detail` and the *decision* to
+  fail is separate from it; a lie there would be a lie to a human. A **first**
+  round that times out or cannot run is different and **ships**: a suite that
+  never finished is not evidence about the work, the implementation may be
+  perfect, and discarding it because a cold `target/` compiled slowly is the
+  failure #929 and #884 were filed about. The inner suite budget is sized to
+  expire *first* (remaining run budget minus a 120s packaging reserve, floored
+  at 60s), which is what keeps the outer `BUILDER_TIMEOUT_SECS` expiry
+  defensible as a `Verdict` rather than a coin toss about which clock fired.
+  `run_script` must **not** await its output collector on the timeout path —
+  killing `sh` does not close the pipes its children inherited, so the readers
+  never see EOF and the supervisor hangs forever, worse than the timeout it was
+  reporting; `abort()` there, and a bounded grace on the normal path for the
+  same hazard one size down. What a green run does **not** say is the half worth
+  writing down, because the request behind #1020 read as "a green supervisor run
+  should end the orchestrator's own": it tested the branch against **its own
+  base**, and the trunk moves under a queue. Two branches can each be green
+  against their own base and red composed, and no supervisor run can see that,
+  because the thing it would have to test does not exist until merge time. So
+  carve-out (b) below is genuinely discharged and (c) is untouched, but "the
+  orchestrator's own run is stronger evidence than the Builder's trailer" is now
+  false in its stated reason (claim versus check — both are checks) while
+  staying true for a different one (branch versus composition), and
+  `landing_section`/`verification_line` say so in those words. The trailer, its
+  parser, the app's second parser and the prompt instruction that produced it
+  are **deleted rather than kept as a fallback**: deleting the parser while
+  leaving the instruction is the worst of the three options, since the agent
+  would go on writing `Verification: PASSED` into what *is* the PR body, putting
+  a claim beside a field holding a check with the prose one in front of the
+  human. `pr_text` appends a **host-authored** sentence generated from the field
+  instead, and nothing parses it back. **This reaches nothing until `make
+  images` runs** — until the Builder image is rebuilt every build reports
+  `verification: None`, which renders as "no run on record", is never green, and
+  routes everything to a human; that is `#[serde(default)]` doing its job, and
+  the degradation is safe by construction rather than by luck.
 - **The orchestrator can now produce the run it used to only ask for, and what
   made that possible was a warm build directory, not a bigger budget.** Carve-out
   (b) above rested on "nothing re-runs its tests for you", and that was true for
@@ -220,8 +304,11 @@ implementation.
   downstream" for the same one-source reason: what the *pipeline* does not do
   and what its *reader* cannot do are different facts. This widens `land_builds`
   autonomy on purpose — the charter's own principle is that what sends a batch
-  back is unverifiability, and the orchestrator's own run is stronger evidence
-  than the Builder's trailer, a check rather than a claim. Carve-out (c) is
+  back is unverifiability. The *reason* has since narrowed and the bullet above
+  states it: both runs are checks now, so what makes this one worth making is
+  not that it is stronger in kind but that it is the only one that can test the
+  **composition** — the branches merged onto a trunk that moved under them while
+  they queued, which is the run nothing upstream can make. Carve-out (c) is
   untouched and still routes to a human. Verifying a composition stays the
   orchestrator's own work and does **not** become a Builder-shaped VM run: that
   would need its own run kind, artifact, charter capability and answer to the
@@ -894,7 +981,9 @@ implementation.
   heading, declines included — and since the summary *is* the PR body, that
   accounting is in front of the reviewer without anything being fetched.
   `summary_accounts_for_review_feedback` is a **presence check** and is
-  reported as the build's own claim, exactly like `Verification:`; it is a
+  reported as the build's own claim — the last thing that reads agent prose,
+  now that the `Verification:` trailer beside it is gone, and deliberately so:
+  what it reports is a fact for a reviewer, never a gate on a write. It is a
   brief fact and **not a fourth `landing_section` carve-out**, since those three
   are about whether a change can be *verified* and a fact that reads like a veto
   is a second source of truth about who decides. `rationale` must never follow
@@ -1150,6 +1239,9 @@ make images                            # rebuild the Scout/Builder VM images
                                        #   FORCE=1 skips the gate)
 make images-check                      # boot each image, read `--version` back
 make verify-warm                       # prime the orchestrator's build directory
+sh .tasks/verify                       # what a Builder VM runs before it packages
+                                       #   anything — a red run fails the build
+                                       #   inside the VM and opens no PR
 make test                              # see Tests below
 ```
 
@@ -1610,6 +1702,7 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `SCOUT_MAX_RESUMES` / `BUILDER_MAX_RESUMES` | 2 | times a supervisor re-invokes an agent with `--resume <session_id>` after its API connection dropped mid-response (#845). Only a transport death is retried, and the backoff rises 2s / 15s / 30s. `0` disables it. Read *inside* the VM, so both live in `images/{scout,builder}/Dockerfile` |
 | `SCOUT_VM_CPUS` / `SCOUT_VM_MEMORY_MB` | 4 / 6144 | shape of a Scout VM. Multiplied by `SCOUT_MAX_CONCURRENT` on the host — lower one of the three on a small machine |
 | `BUILDER_VM_CPUS` / `BUILDER_VM_MEMORY_MB` | 4 / 8192 | shape of a Builder VM. Larger than a Scout's because builds are serial (nothing multiplies it) and a killed Builder costs a whole implementation |
+| `BUILDER_SUITE_BUDGET_SECS` | derived | hard cap on the in-VM test suite (`.tasks/verify`), overriding the derivation outright; `0` skips the suite and reports `Unavailable`, which is never green. Derived, it is the run budget still unspent minus a 120s packaging reserve, floored at 60s — sized to expire *before* `BUILDER_TIMEOUT_SECS` does, which is what keeps the outer expiry defensible as a `Verdict`. Read *inside* the VM, so it belongs in `images/builder/Dockerfile` rather than here |
 | `BUILDER_TIMEOUT_SECS` | 3600 | budget per build, allocation included, measured on both clocks (see *Budgets and a host that sleeps*). Past it the VM is deallocated, the build fails and every spec in the batch is charged a build attempt — unless the host was asleep for enough of it (a quarter of the budget left unspent), which is `Suspended` and charges nothing (#929). Same ceiling argument as the scout's: keep it below vm-pool's `vm_timeout` (7200) |
 | `SCOUT_BUILD_JOBS` / `BUILDER_BUILD_JOBS` | derived | `CARGO_BUILD_JOBS` injected per-VM. Derived from the VM's memory — `(memory_mb − 2048) / 2048`, clamped to `[1, cpus]` — because cargo defaults `-j` to the CPU count and knows nothing about the memory limit, which is how 4 CPU / 4 GB VMs got a linker OOM-killed. Set either to override the derivation |
 | `VM_POOL_SOCKET` | `/tmp/vm-pool.sock` | vm-pool service socket. A start against a socket something is already listening on **refuses** rather than taking the path over — stop the running daemon first. A socket file left by a dead one is unlinked and reclaimed |
