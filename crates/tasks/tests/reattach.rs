@@ -80,6 +80,7 @@ fn test_config(vm_pool_socket: &Path, data_dir: &Path, clone_root: &Path) -> Con
         orchestrator_timeout: Duration::from_secs(60),
         orchestrator_workdir: None,
         orchestrator_target_dir: None,
+        orchestrator_target_budget_gb: 20,
         update_hold: true,
         // Off in every harness: these tests own their pool (or its absence),
         // and a server spawning one behind their back would race both.

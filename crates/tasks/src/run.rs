@@ -111,6 +111,25 @@ const DEFAULT_ORCHESTRATOR_TIMEOUT_SECS: u64 = 900;
 /// says otherwise. Shared and long-lived on purpose — the warmth is the whole
 /// value.
 const DEFAULT_ORCHESTRATOR_TARGET_DIR: &str = "verify-target";
+/// Where the orchestrator keeps the **one** checkout it verifies in.
+///
+/// Derived and deliberately not a knob: what matters is that there is exactly
+/// one of these paths, and a second setting is a second thing to get wrong.
+///
+/// Cargo keys an artifact on a metadata hash that includes the source path, so
+/// a *fresh* `git worktree` per verification adds a complete new set of
+/// workspace artifacts and keeps the previous set forever — which is what took
+/// the build directory to 51 GB (#1010).
+const DEFAULT_ORCHESTRATOR_WORKTREE_DIR: &str = "verify-worktree";
+/// Ceiling on the verification build directory, in GB, unless
+/// `ORCHESTRATOR_TARGET_BUDGET_GB` says otherwise.
+///
+/// A judgement rather than a measurement: it leaves room for several
+/// verifications' accumulation on a host whose VM pool already reserves ~22 GB,
+/// and is high enough that the tier which costs a cold build is rare. If the
+/// two source-side fixes work as expected the ceiling should stop being reached
+/// at all — the reclaim is the backstop, not the mechanism.
+const DEFAULT_ORCHESTRATOR_TARGET_BUDGET_GB: u64 = 20;
 /// How often the orchestrator loop checks for unanswered input turns.
 const ORCHESTRATOR_TICK: Duration = Duration::from_secs(1);
 /// Debounce for pipeline-event nudges: after the first nudge-worthy event,
@@ -328,6 +347,14 @@ pub struct Config {
     /// be inherited by `tasks reload`'s own build of the server and would
     /// silently redirect the Makefile's `TEST_BIN_DIR`.
     pub orchestrator_target_dir: Option<PathBuf>,
+    /// Ceiling on [`Self::orchestrator_target_dir`] in GB
+    /// (`ORCHESTRATOR_TARGET_BUDGET_GB`), past which
+    /// [`crate::verify_dir::VerifyDir`] reclaims it in two graduated tiers.
+    ///
+    /// `0` keeps the report and drops the reclaim — the `TASKS_UPDATE_HOLD=off`
+    /// shape. The *report* half is deliberately not switchable: a directory
+    /// that grows silently is exactly what #1010 was.
+    pub orchestrator_target_budget_gb: u64,
     /// Whether the update watch gates new dispatch (`TASKS_UPDATE_HOLD`,
     /// default on). Off, what is pending is still reported in `/status`; only
     /// the dispatchers stop listening. See [`crate::updates`].
@@ -423,6 +450,11 @@ impl Config {
             )?),
             orchestrator_workdir: env_string("ORCHESTRATOR_WORKDIR").map(PathBuf::from),
             orchestrator_target_dir: env_string("ORCHESTRATOR_TARGET_DIR").map(PathBuf::from),
+            orchestrator_target_budget_gb: parse_env(
+                "ORCHESTRATOR_TARGET_BUDGET_GB",
+                "a number of gigabytes (0 to report without reclaiming)",
+                DEFAULT_ORCHESTRATOR_TARGET_BUDGET_GB,
+            )?,
             update_hold: {
                 let raw = env_string("TASKS_UPDATE_HOLD");
                 crate::updates::parse_enabled(raw.as_deref()).map_err(|_| ConfigError::Invalid {
@@ -464,6 +496,18 @@ impl Config {
         self.orchestrator_target_dir
             .clone()
             .unwrap_or_else(|| self.data_dir.join(DEFAULT_ORCHESTRATOR_TARGET_DIR))
+    }
+
+    /// The single checkout the orchestrator verifies in,
+    /// `<data dir>/verify-worktree`.
+    ///
+    /// Named in the prompt so the agent reuses **one** worktree path rather
+    /// than making a fresh one per verification — see
+    /// [`DEFAULT_ORCHESTRATOR_WORKTREE_DIR`] for why that is the whole ballgame.
+    /// Not created here: `git worktree add` creates it, and a directory this
+    /// process had already made is one git refuses to add.
+    pub fn orchestrator_worktree_dir(&self) -> PathBuf {
+        self.data_dir.join(DEFAULT_ORCHESTRATOR_WORKTREE_DIR)
     }
 
     /// Where the orchestrator's actor credential is written.
@@ -875,6 +919,17 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     // gates make between them, never from classifying a refusal — see
     // `crate::pool_health`.
     let pool_health = Arc::new(crate::pool_health::PoolHealth::new());
+    // Resolved and created here, once per boot, for the reason
+    // `verify_target_dir` gives: the prompt names this directory, so it must
+    // never name one the agent will find missing. `None` when the orchestrator
+    // has no checkout to build in — there is then nothing to measure and
+    // `/status` says so by reporting no reading at all.
+    let verify_dir = verify_target_dir(&config).await.map(|dir| {
+        Arc::new(crate::verify_dir::VerifyDir::new(
+            dir,
+            config.orchestrator_target_budget_gb,
+        ))
+    });
 
     let poll = tokio::spawn(poll_loop(
         store.clone(),
@@ -903,6 +958,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     let orchestrate = tokio::spawn(orchestrator_loop(
         store.clone(),
         config.clone(),
+        verify_dir.clone(),
         shutdown_rx.clone(),
     ));
     let nudge = tokio::spawn(orchestrator_nudge_loop(
@@ -947,6 +1003,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
             github_health: Some(health.clone()),
             updates: Some(updates.clone()),
             pool_health: Some(pool_health.clone()),
+            verify_dir: verify_dir.clone(),
             viewer: Default::default(),
         },
         async move {
@@ -2986,6 +3043,54 @@ async fn verify_target_dir(config: &Config) -> Option<PathBuf> {
     }
 }
 
+/// Measure the orchestrator's build directory, reclaim it if it is over its
+/// ceiling, and put whatever that produced on the event feed.
+///
+/// The module decides everything; this is only the half that touches the store,
+/// which is the [`crate::pool_health`] split — a health record that wrote
+/// events could not be unit tested without one.
+///
+/// A [`EventPayload::Note`] and **not an obligation**: obligations go to the
+/// orchestrator, which is the one actor that must not be asked to manage this
+/// directory, because it is the one that builds in it. Same argument that kept
+/// `ObligationKind::StaleImage` from existing. The feed is for whoever is
+/// reading; `/status` carries the standing answer for whoever arrives later,
+/// which is why a reclaim stays there for the rest of the boot.
+///
+/// No charter gate and no `decisions` row: this is [`Actor::System`]
+/// maintenance of a local cache, like [`reclaim_bundles`] — not an agent action
+/// and not a GitHub write. And it is affordable in a way reclaiming a rejected
+/// bundle is not, because everything here is reproducible from the checkout: a
+/// deletion costs time, never work.
+pub async fn maintain_verify_dir(
+    store: &Store,
+    verify_dir: Option<&crate::verify_dir::VerifyDir>,
+    may_reclaim: bool,
+) {
+    let Some(dir) = verify_dir else {
+        return;
+    };
+    let message = match dir.maintain(may_reclaim).await {
+        None => return,
+        Some(crate::verify_dir::Notice::Reclaimed(reclaim)) => reclaim.describe(dir.path()),
+        Some(crate::verify_dir::Notice::OverBudget { reading, budget }) => format!(
+            "the orchestrator's verification build directory ({}) is {} against a {}              ceiling, and is not being reclaimed while the orchestrator session is              checked out — a human may be building in it. It is reclaimed on the first              pass after the checkout lapses",
+            dir.path().display(),
+            crate::verify_dir::humanize_bytes(reading.bytes),
+            crate::verify_dir::humanize_bytes(budget),
+        ),
+    };
+    if let Err(e) = store
+        .append_event(EventPayload::Note {
+            source: ORCHESTRATOR.into(),
+            message,
+        })
+        .await
+    {
+        warn!(error = %e, "could not record the verification build directory's size");
+    }
+}
+
 /// Answer pending orchestrator turns until `shutdown` flips.
 ///
 /// Not mode-gated on purpose: asking the orchestrator "what's the status?"
@@ -2993,6 +3098,7 @@ async fn verify_target_dir(config: &Config) -> Option<PathBuf> {
 pub async fn orchestrator_loop(
     store: Arc<Store>,
     config: Config,
+    verify_dir: Option<Arc<crate::verify_dir::VerifyDir>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let workdir = config.agent_workdir();
@@ -3011,7 +3117,8 @@ pub async fn orchestrator_loop(
             timeout: config.orchestrator_timeout,
             workdir,
             workdir_is_checkout: config.orchestrator_workdir.is_some(),
-            target_dir: verify_target_dir(&config).await,
+            target_dir: verify_dir.as_ref().map(|dir| dir.path().to_path_buf()),
+            worktree_dir: config.orchestrator_worktree_dir(),
             github_configured: config.github_configured(),
             api_port: config.port,
             curl_config: config.orchestrator_curl_config(),
@@ -3026,8 +3133,17 @@ pub async fn orchestrator_loop(
         // would interleave with theirs. Input keeps accumulating as
         // unanswered turns and is answered once the checkout lapses.
         match store.orchestrator_checked_out().await {
-            Ok(true) => {}
+            // Measured and reported, never reclaimed: a human with the session
+            // checked out may be building in this directory right now, and this
+            // is the one case the "nothing else starts a process in here"
+            // argument below does not cover.
+            Ok(true) => maintain_verify_dir(&store, verify_dir.as_deref(), false).await,
             Ok(false) => {
+                // **Before** the tick, deliberately. This loop is the only
+                // thing that starts a process in that directory, so a deletion
+                // cannot race a compile — by construction rather than by a
+                // lock.
+                maintain_verify_dir(&store, verify_dir.as_deref(), true).await;
                 if let Err(e) = orchestrator.tick().await {
                     warn!(error = %e, "orchestrator tick failed");
                 }

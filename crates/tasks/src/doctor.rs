@@ -1667,15 +1667,18 @@ fn orchestrator_section(config: &crate::run::Config) -> Section {
         Some(free) if free >= 8192 => Check::ok(
             "verify target dir",
             format!(
-                "{} ({free} MB free; expect ~7.5 GB once warm)",
+                "{} ({free} MB free; one warm workspace build measured 3.2 GB, and the \
+                 directory is bounded by ORCHESTRATOR_TARGET_BUDGET_GB — its current \
+                 size is on `tasks status`)",
                 target.display()
             ),
         ),
         Some(free) => Check::warn(
             "verify target dir",
             format!(
-                "{} has {free} MB free; a warm build directory is ~7.5 GB, and without \
-                 one the orchestrator's verification drops back to a typecheck",
+                "{} has {free} MB free; one warm workspace build measured 3.2 GB, and \
+                 without room for it the orchestrator's verification drops back to a \
+                 typecheck",
                 target.display()
             ),
             "free space, or point ORCHESTRATOR_TARGET_DIR at a roomier filesystem",

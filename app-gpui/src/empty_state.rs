@@ -995,6 +995,9 @@ mod tests {
                 observations: 4,
                 total: 6,
             }),
+            // Not a hold: the build directory's size is never a reason the
+            // pipeline is idle, which is what this fixture is about.
+            verify_dir: None,
         }
     }
 

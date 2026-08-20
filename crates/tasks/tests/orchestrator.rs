@@ -12,7 +12,7 @@ use tasks::models::{
     SessionEndReason, SessionId, SessionStatus, Spec, SpecId, SpecQueueEntry, SpecQueueStatus,
     Task, TaskId, TaskState,
 };
-use tasks::orchestrator::{Orchestrator, OrchestratorConfig};
+use tasks::orchestrator::{Orchestrator, OrchestratorConfig, VERIFICATION_ENV};
 use tasks::run::orchestrator_nudge_loop;
 use tasks::store::Store;
 use tokio::sync::watch;
@@ -56,6 +56,7 @@ fn orchestrator(store: Arc<Store>, stub: &Path, tmp: &Path) -> Orchestrator {
             workdir: tmp.join("orch-workdir"),
             workdir_is_checkout: false,
             target_dir: None,
+            worktree_dir: tmp.join("verify-worktree"),
             github_configured: true,
             api_port: 4800,
             curl_config: tmp.join("orchestrator-curl.conf"),
@@ -624,6 +625,7 @@ async fn the_agent_identifies_its_writes_with_the_curl_config_and_no_shell_expan
             workdir: workdir.clone(),
             workdir_is_checkout: false,
             target_dir: None,
+            worktree_dir: tmp.path().join("verify-worktree"),
             github_configured: true,
             api_port: port,
             curl_config: curl_config.clone(),
@@ -1438,6 +1440,7 @@ async fn the_agent_gets_a_warm_build_directory_and_a_command_ceiling_below_its_t
         workdir: tmp.path().join("orch-workdir"),
         workdir_is_checkout: true,
         target_dir: Some(target_dir.clone()),
+        worktree_dir: tmp.path().join("verify-worktree"),
         github_configured: true,
         api_port: 4800,
         curl_config: tmp.path().join("orchestrator-curl.conf"),
@@ -1475,6 +1478,13 @@ async fn the_agent_gets_a_warm_build_directory_and_a_command_ceiling_below_its_t
     // the max would leave un-annotated commands at its 120s default.
     assert_eq!(env.get("BASH_DEFAULT_TIMEOUT_MS").unwrap(), "450000");
     assert_eq!(env.get("BASH_MAX_TIMEOUT_MS").unwrap(), "450000");
+    // And the cargo settings that bound what the directory can grow to. They
+    // travel *with* `CARGO_TARGET_DIR`, and `make verify-warm` sets the same
+    // ones — see `verification_env_matches_the_makefile` for why a mismatch
+    // costs more than either setting saves.
+    for (key, value) in VERIFICATION_ENV {
+        assert_eq!(env.get(key).map(String::as_str), Some(value), "{key}");
+    }
 
     // And with no directory configured, the variable is not invented.
     let store = Arc::new(Store::open_in_memory().await.unwrap());
@@ -1499,4 +1509,50 @@ async fn the_agent_gets_a_warm_build_directory_and_a_command_ceiling_below_its_t
         std::env::var("CARGO_TARGET_DIR").ok(),
         "with no target dir the child must see exactly what the parent had"
     );
+    for (key, _) in VERIFICATION_ENV {
+        assert_eq!(
+            env.get(key).cloned(),
+            std::env::var(key).ok(),
+            "{key} is set with the build directory or not at all — a cargo setting \
+             invented where nothing asked for one would redirect whatever else runs \
+             under this server"
+        );
+    }
+}
+
+/// The other half of "set in both places or neither".
+///
+/// `make verify-warm` primes the very directory the orchestrator builds in, so
+/// the two must agree exactly: toggling `CARGO_INCREMENTAL` or a debuginfo
+/// level invalidates every *workspace* artifact (registry dependencies are
+/// untouched — verified empirically), so a Makefile and a server that disagreed
+/// would rebuild the whole workspace on every alternation between them, which
+/// costs far more than the disk either setting saves.
+///
+/// A test rather than a shared constant because one side is a Makefile: there
+/// is nothing to share, so the only mechanism available is a check that fails
+/// when they drift.
+#[test]
+fn verification_env_matches_the_makefile() {
+    let makefile = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("Makefile"),
+    )
+    .expect("the workspace Makefile");
+    let recipe = makefile
+        .split("\nverify-warm:")
+        .nth(1)
+        .expect("a verify-warm target")
+        .split("\n\n")
+        .next()
+        .expect("its recipe");
+    for (key, value) in VERIFICATION_ENV {
+        assert!(
+            recipe.contains(&format!("{key}={value}")),
+            "`make verify-warm` must set {key}={value} — the orchestrator child does, \
+             and a mismatch rebuilds the workspace on every alternation:\n{recipe}"
+        );
+    }
 }
