@@ -857,10 +857,10 @@ impl<'a> Brief<'a> {
 
 /// What the build said about its own test run, attributed as a claim.
 ///
-/// It *is* a claim — nothing here re-ran anything, and this repository has no
-/// workflows and no required checks, so there is no second opinion anywhere in
-/// the loop. Saying so on the line is the difference between evidence and the
-/// appearance of evidence.
+/// It *is* a claim — nothing here re-ran anything, and no workflow in this
+/// repository produces a pull-request check and there are no required checks,
+/// so there is no second opinion anywhere in the loop. Saying so on the line is
+/// the difference between evidence and the appearance of evidence.
 ///
 /// It says "no automated check" rather than "nothing downstream", and the
 /// narrowing is necessary: on a host where the orchestrator has a warm build

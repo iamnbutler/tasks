@@ -5,6 +5,7 @@ GitHub issue tracker into shipped pull requests by orchestrating headless
 [Claude Code](https://claude.com/claude-code) agents — and keeps a human in
 the position of *reviewer*, not operator.
 
+<!-- disclaimer:start -->
 ## Read this first
 
 Tasks runs coding agents against your repositories with nobody in the loop
@@ -54,6 +55,7 @@ where a bad pull request costs you a click. This is software one person wrote
 to run on his own machine, published in case it is useful to you: there is no
 warranty, nobody is on call, and if it breaks something of yours, fixing it is
 your job. The `LICENSE` says the same thing in the legal register.
+<!-- disclaimer:end -->
 
 ## The idea
 

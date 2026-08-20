@@ -785,6 +785,84 @@ pub struct RejectedBundle {
     pub superseded: bool,
 }
 
+/// The answer to `GET /viewer`: who the server's own GitHub credential is.
+///
+/// Not a login flow. The identity that matters to this system is the one whose
+/// branches get pushed and whose issues get closed, and that is exactly the
+/// account the server's token names — a second, client-side identity beside it
+/// would be a second answer to a question with one.
+///
+/// **An enum rather than a struct of `Option`s**, and that is the load-bearing
+/// choice: a half-identity — a login with no avatar, an avatar with no profile
+/// to open — is unrepresentable, and every renderer is forced by the compiler
+/// to answer all three cases rather than defaulting two of them into a broken
+/// image and a link to nowhere.
+///
+/// The route always answers 200. All three are *states this route reports*,
+/// not failures of it: a fresh machine with no token is the common case, and a
+/// 503 there would put a red banner on an app that is working correctly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Viewer {
+    /// GitHub answered, and every field it needs came back.
+    Known {
+        login: String,
+        avatar_url: String,
+        /// **GitHub's own `url` field**, never `https://github.com/{login}`
+        /// assembled from the login: on GitHub Enterprise the origin is not
+        /// github.com, and a link built that way opens the wrong host. That
+        /// guess is the same class of mistake that produced #987.
+        profile_url: String,
+    },
+    /// No credential resolves, so nothing was asked. Not an error — the
+    /// ordinary state of a server nobody has sealed a token into yet.
+    Unauthenticated,
+    /// A credential exists and GitHub did not answer with an identity.
+    ///
+    /// `error` is **GitHub's own response message and nothing else** — never a
+    /// URL, a header, or a transport error that quotes what it was sent. It is
+    /// rendered in a tooltip, and a tooltip is output: #971's rule that no
+    /// credential or fragment of one reaches output applies here as much as to
+    /// a log line.
+    Unknown { error: String },
+}
+
+impl Viewer {
+    /// The account name, when there is one.
+    pub fn login(&self) -> Option<&str> {
+        match self {
+            Self::Known { login, .. } => Some(login),
+            _ => None,
+        }
+    }
+
+    /// Where to fetch the avatar image, when there is one.
+    pub fn avatar_url(&self) -> Option<&str> {
+        match self {
+            Self::Known { avatar_url, .. } => Some(avatar_url),
+            _ => None,
+        }
+    }
+
+    /// Where clicking the avatar goes, when there is anywhere to go.
+    pub fn profile_url(&self) -> Option<&str> {
+        match self {
+            Self::Known { profile_url, .. } => Some(profile_url),
+            _ => None,
+        }
+    }
+
+    /// One sentence naming which of the three states this is — what a human
+    /// reads under the cursor, and what a diagnostic prints.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Known { login, .. } => format!("{login} on GitHub"),
+            Self::Unauthenticated => "Not signed in — no GitHub token configured".to_string(),
+            Self::Unknown { error } => format!("GitHub identity unavailable: {error}"),
+        }
+    }
+}
+
 /// One entry of `GET /labels`: the repository's label vocabulary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LabelInfo {
@@ -794,7 +872,59 @@ pub struct LabelInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::AppliedMigration;
+    use super::{AppliedMigration, Viewer};
+
+    fn known() -> Viewer {
+        Viewer::Known {
+            login: "octocat".into(),
+            avatar_url: "https://avatars.example/u/1".into(),
+            profile_url: "https://github.example/octocat".into(),
+        }
+    }
+
+    /// The tag is what a client matches on, and the three names are wire
+    /// vocabulary — renaming one is a client-visible break, so it is pinned.
+    #[test]
+    fn each_state_is_tagged_by_name() {
+        let json = |v: &Viewer| serde_json::to_value(v).unwrap();
+        assert_eq!(json(&known())["state"], "known");
+        assert_eq!(json(&Viewer::Unauthenticated)["state"], "unauthenticated");
+        assert_eq!(
+            json(&Viewer::Unknown {
+                error: "Bad credentials".into()
+            })["state"],
+            "unknown"
+        );
+    }
+
+    /// Round trip, because the app deserializes exactly what the server wrote.
+    #[test]
+    fn a_known_viewer_round_trips_every_field() {
+        let encoded = serde_json::to_string(&known()).unwrap();
+        assert_eq!(serde_json::from_str::<Viewer>(&encoded).unwrap(), known());
+    }
+
+    /// Only `Known` has anywhere to click. This is what makes the chip inert
+    /// in every fallback state rather than a link to a broken page.
+    #[test]
+    fn only_a_known_viewer_offers_a_profile() {
+        assert_eq!(
+            known().profile_url(),
+            Some("https://github.example/octocat")
+        );
+        assert_eq!(known().login(), Some("octocat"));
+        assert_eq!(known().avatar_url(), Some("https://avatars.example/u/1"));
+        for other in [
+            Viewer::Unauthenticated,
+            Viewer::Unknown {
+                error: "Bad credentials".into(),
+            },
+        ] {
+            assert_eq!(other.profile_url(), None);
+            assert_eq!(other.login(), None);
+            assert_eq!(other.avatar_url(), None);
+        }
+    }
 
     fn applied(version: i64, description: &str) -> AppliedMigration {
         AppliedMigration {

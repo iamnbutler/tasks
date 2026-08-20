@@ -12,7 +12,7 @@ use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::Context;
 use tasks_client::api::events::Event;
-use tasks_client::api::http::RejectedBundle;
+use tasks_client::api::http::{RejectedBundle, Viewer};
 use tasks_client::api::models::{
     Build, BuildId, BuildStatus, ChatRole, CloseReason, Mode, OrchestratorFeedEvent,
     OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, Session, Spec,
@@ -78,6 +78,15 @@ pub struct AppState {
     /// it simply shows nothing, and the server logs and the failure reason on
     /// the build still say where the file is.
     pub bundles: Vec<RejectedBundle>,
+    /// Who the *server's* GitHub credential is — the identity whose branches
+    /// get pushed and whose issues get closed, which is the only signed-in
+    /// human this system has. `None` until the first answer lands, which the
+    /// chip renders as its own state rather than as "not signed in" (see
+    /// [`crate::identity`]).
+    pub viewer: Option<Viewer>,
+    /// When the last `/viewer` answer landed, so a settled identity can be
+    /// re-asked coarsely rather than once and never again.
+    viewer_answered_at: Option<std::time::Instant>,
     /// Newest [`ACTIVITY_LIMIT`] events, newest first.
     pub activity: Vec<Event>,
     pub orchestrator_messages: Vec<OrchestratorMessage>,
@@ -166,6 +175,7 @@ struct Snapshot {
     spec_queue: Option<Vec<SpecQueueItem>>,
     builds: Option<Vec<Build>>,
     bundles: Option<Vec<RejectedBundle>>,
+    viewer: Option<Viewer>,
     activity: Option<Vec<Event>>,
     orchestrator_messages: Option<Vec<OrchestratorMessage>>,
     orchestrator_session: Option<OrchestratorSessionInfo>,
@@ -179,7 +189,7 @@ impl Snapshot {
     /// fetched incrementally from there, because a refresh runs on every
     /// SSE event and refetching the whole history each time made transfer
     /// grow as messages x events. `None` opens on the newest window.
-    fn fetch(client: &Client, chat_since: Option<i64>) -> Self {
+    fn fetch(client: &Client, chat_since: Option<i64>, want_viewer: bool) -> Self {
         let mut snapshot = Self::default();
         let mut error: Option<String> = None;
         fn take<T>(
@@ -207,6 +217,14 @@ impl Snapshot {
         // must not raise the banner every refresh forever — the ordinary
         // reading of a red banner is "something broke just now".
         snapshot.bundles = client.bundles().ok();
+        // `.ok()` for the same reason, one route along: a server older than
+        // `/viewer` answers 404, and an app raising the red banner every
+        // refresh over a chip's avatar reports its own version skew as
+        // "something broke just now". Only asked for when the answer is not
+        // already settled — see [`crate::identity::should_ask_for_viewer`].
+        if want_viewer {
+            snapshot.viewer = client.viewer().ok();
+        }
         take(
             &mut snapshot.activity,
             &mut error,
@@ -317,6 +335,8 @@ impl AppState {
             spec_queue: Vec::new(),
             builds: Vec::new(),
             bundles: Vec::new(),
+            viewer: None,
+            viewer_answered_at: None,
             activity: Vec::new(),
             orchestrator_messages: Vec::new(),
             orchestrator_session: None,
@@ -644,9 +664,13 @@ impl AppState {
         // Only what we do not already have. The first pass opens on a
         // window; every later one asks for turns after the newest held.
         let chat_since = self.orchestrator_messages.last().map(|m| m.seq);
+        let want_viewer = crate::identity::should_ask_for_viewer(
+            self.viewer.as_ref(),
+            self.viewer_answered_at.map(|at| at.elapsed()),
+        );
         let fetch = cx
             .background_executor()
-            .spawn(async move { Snapshot::fetch(&client, chat_since) });
+            .spawn(async move { Snapshot::fetch(&client, chat_since, want_viewer) });
         cx.spawn(async move |this, cx| {
             let snapshot = fetch.await;
             this.update(cx, |state, cx| state.apply(snapshot, cx)).ok();
@@ -664,6 +688,13 @@ impl AppState {
             };
         }
         merge!(projects, tasks, sessions, specs, spec_queue, builds, bundles, activity);
+        // Whole-value and only on an answer: a refresh that did not ask (a
+        // settled identity inside its interval) must not blank the one held,
+        // and neither must a 404 from a server too old to have the route.
+        if let Some(viewer) = snapshot.viewer {
+            self.viewer = Some(viewer);
+            self.viewer_answered_at = Some(std::time::Instant::now());
+        }
         // Whole-value, like every other list: the gauge is a reading, so the
         // newest one replaces the last rather than merging into it.
         if let Some(session) = snapshot.orchestrator_session {

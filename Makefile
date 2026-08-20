@@ -33,7 +33,7 @@ TEST_BIN_DIR := $(abspath $(CARGO_TARGET_DIR)/debug)
         server-release dist-install dist \
         app-check app-stubs app-test \
         server serve restart status stop drain resume check-quiesced \
-        migration verify-warm
+        migration verify-warm site-check
 
 # Extra flags for the reload targets: `make restart RELOAD=--when-idle`.
 RELOAD ?=
@@ -429,6 +429,13 @@ test-ci: check-nextest test-bins
 # so the build-on-demand fallback stays exercised.
 test-cargo:
 	cargo test --workspace
+
+# The whole publish gate for `site/`: there is no build step, so this script is
+# all that stands between a bad edit and a deployed page. The Pages workflow
+# runs the same line. Missing screenshots are errors, not warnings — see
+# `site/img/MANIFEST.md`.
+site-check:
+	@bash site/check.sh
 
 check-toolchain:
 	@which $(CROSS_LINKER) >/dev/null || { echo "missing cross linker: brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu"; exit 1; }

@@ -1828,10 +1828,11 @@ mod tests {
     }
 
     /// The Builder's own test run is the only evidence this repository can
-    /// produce that a change works — there are no workflows and no required
-    /// checks — so the prompt has to ask for it, and has to ask for it
-    /// *truthfully*. A line that agents learn to write unconditionally is
-    /// worse than no line, because the brief reads it back as evidence.
+    /// produce that a change works — no workflow here produces a pull-request
+    /// check and there are no required checks — so the prompt has to ask for
+    /// it, and has to ask for it *truthfully*. A line that agents learn to
+    /// write unconditionally is worse than no line, because the brief reads it
+    /// back as evidence.
     #[test]
     fn the_prompt_asks_for_the_verification_line_and_for_the_truth() {
         let prompt = render_prompt(&[item(7, "A thing", "spec")], None);
