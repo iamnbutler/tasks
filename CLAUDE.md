@@ -339,6 +339,30 @@ implementation.
   rate limits: backlog never dispatches, `SCOUT_MAX_CONCURRENT` bounds scouts,
   and builds are serial. `POST /tasks/{id}/build-now` sits inside that shape
   rather than beside it: it is per-task, human-only, and one call is one build.
+- **Builds dispatch when the lane frees, and the lane-free turn is where
+  batching lives.** A build sent into a busy lane gains nothing by existing
+  early — builds are strictly serial — and it costs the two things batching
+  needs: it freezes its batch's composition while the pool is still growing,
+  and it removes its spec from the only text that ever commanded batching
+  (`format_obligations` renders "batch where that is sensible" on two-plus
+  unbuilt specs, a count eager per-approval dispatch held at ≤1 forever —
+  which is why spec batching was observed roughly twice, both times with the
+  pipeline degraded; #1055). So the policy is Nagle's: lane idle → dispatch
+  on approval, batched with whatever else is pooled; lane busy → approved
+  specs pool as *specs*, never as single-spec queue entries; and the
+  `BuildCompleted` nudge is the dispatch moment, listing the pool with its
+  file facts — charter-gated like the landing text, because the paragraph
+  claims an authority and claiming one the server will refuse is worse than
+  silence. The `dispatch_build` obligation goes quiet while the lane is busy
+  (pooling is the healthy state, and an obligation raised against deliberate
+  policy is how a signal gets trained out of use) and holds for one grace
+  after the last build concludes, so the nudge keeps first crack. A lane
+  freed by a *cancel* raises no nudge (the echo rule): that same grace is
+  what gives a cancelled batch its documented pause before anything
+  reconsiders the work. Nothing server-side dispatches anything, exactly as
+  before; what changed is when the prompt says to act, when the obligation
+  nags, and that "carried" and "lane busy" each have one SQL statement
+  (`SPEC_UNCARRIED_SQL`, `BUILD_LANE_BUSY_SQL`) so no two readers can drift.
 - **Mode is global; what is per-repo is the subtraction. And there is no
   project delete.** `projects.status` ∈ `active` | `paused` | `archived` gates
   the three places that select work — scout dispatch, the build claim, and the

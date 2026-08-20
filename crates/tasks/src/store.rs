@@ -4053,6 +4053,69 @@ impl Store {
 
     // --- obligations ---
 
+    /// One statement of "no queued or running build is carrying this spec",
+    /// shared by the dispatch obligation and the lane-free pool so the two
+    /// readers cannot drift — two hand-written versions of one question is
+    /// how two readers come to disagree. Expects the `spec_queue` row aliased
+    /// `q`; binds two [`BuildStatus`] strings: queued, running.
+    const SPEC_UNCARRIED_SQL: &'static str = "NOT EXISTS (SELECT 1 FROM build_specs bs \
+         JOIN builds b ON b.id = bs.build_id \
+         WHERE bs.spec_id = q.spec_id AND b.status IN (?, ?))";
+
+    /// One statement of "the serial build lane is occupied" — a build queued
+    /// or running, anywhere. Global on purpose: there is one lane
+    /// server-wide, so one repo's running build holds it against every
+    /// other's. Binds two [`BuildStatus`] strings: queued, running.
+    const BUILD_LANE_BUSY_SQL: &'static str =
+        "EXISTS (SELECT 1 FROM builds WHERE status IN (?, ?))";
+
+    /// Whether any build is queued or running — the serial lane, as one
+    /// question.
+    ///
+    /// Two readers depend on it staying one question (#1055): the
+    /// dispatch-build obligation goes silent while the lane is busy, because
+    /// pooling approved specs is the *healthy* state under lane-free dispatch
+    /// and an obligation raised against deliberate policy is how a signal
+    /// gets trained out of use; and the lane-free nudge lists the pool only
+    /// when this answers false, because a pool dispatched into a still-busy
+    /// lane freezes its composition early for nothing.
+    pub async fn build_lane_busy(&self) -> Result<bool, StoreError> {
+        let sql = format!("SELECT {} AS busy", Self::BUILD_LANE_BUSY_SQL);
+        let row = sqlx::query(&sql)
+            .bind(BuildStatus::Queued.as_str())
+            .bind(BuildStatus::Running.as_str())
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get::<i64, _>("busy")? != 0)
+    }
+
+    /// The approved specs no queued or running build is carrying — the pool
+    /// the lane-free turn dispatches, oldest approval first.
+    ///
+    /// This is the dispatch obligation's subject set without its grace or
+    /// its lane gate: the pool is listed the moment the lane frees (the
+    /// `BuildCompleted` nudge), and the obligation only chases a pool that
+    /// moment left waiting. The uncarried predicate is kept here even though
+    /// an idle lane implies it, so the answer is honest for a caller that
+    /// did not check the lane first.
+    pub async fn pooled_approved_specs(&self) -> Result<Vec<SpecId>, StoreError> {
+        let sql = format!(
+            "SELECT q.spec_id FROM spec_queue q \
+             WHERE q.status = ? AND {} \
+             ORDER BY q.approved_at",
+            Self::SPEC_UNCARRIED_SQL
+        );
+        let rows = sqlx::query(&sql)
+            .bind(SpecQueueStatus::Approved.as_str())
+            .bind(BuildStatus::Queued.as_str())
+            .bind(BuildStatus::Running.as_str())
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| Ok(SpecId::from_raw(&row.try_get::<String, _>("spec_id")?)))
+            .collect()
+    }
+
     /// Everything the pipeline is owed right now, oldest first.
     ///
     /// Computed, never stored. `grace` keeps freshly-landed work out of the
@@ -4114,57 +4177,78 @@ impl Store {
         // spec did nothing wrong — so the strike count and the failure count
         // legitimately disagree, and a reader who knows only one of them will
         // draw the wrong conclusion from it.
-        let rows = sqlx::query(
-            "SELECT q.spec_id, q.approved_at, q.build_attempts, t.gh_issue_number, t.title, \
-                    (SELECT COUNT(*) FROM build_specs bs \
-                     JOIN builds b ON b.id = bs.build_id \
-                     WHERE bs.spec_id = q.spec_id AND b.status = ?) AS failed_builds, \
-                    (SELECT b.exit_reason FROM build_specs bs \
-                     JOIN builds b ON b.id = bs.build_id \
-                     WHERE bs.spec_id = q.spec_id AND b.status = ? \
-                     ORDER BY b.completed_at DESC LIMIT 1) AS last_failure \
-             FROM spec_queue q \
-             JOIN specs s ON s.id = q.spec_id \
-             JOIN tasks t ON t.id = s.task_id \
-             WHERE q.status = ? AND q.approved_at IS NOT NULL AND q.approved_at <= ? \
-               AND NOT EXISTS (SELECT 1 FROM build_specs bs \
-                               JOIN builds b ON b.id = bs.build_id \
-                               WHERE bs.spec_id = q.spec_id AND b.status IN (?, ?)) \
-             ORDER BY q.approved_at",
-        )
-        .bind(BuildStatus::Failed.as_str())
-        .bind(BuildStatus::Failed.as_str())
-        .bind(SpecQueueStatus::Approved.as_str())
-        .bind(&cutoff)
-        .bind(BuildStatus::Queued.as_str())
-        .bind(BuildStatus::Running.as_str())
-        .fetch_all(&self.pool)
-        .await?;
-        for row in rows {
-            let since = parse_ts(&row.try_get::<String, _>("approved_at")?, "approved_at")?;
-            let mut summary = format!(
-                "#{} \"{}\" was approved {} and no build is carrying it",
-                row.try_get::<i64, _>("gh_issue_number")?,
-                row.try_get::<String, _>("title")?,
-                since.format("%Y-%m-%d %H:%M UTC"),
+        //
+        // Two more gates make pooling healthy rather than nagged (#1055),
+        // because builds dispatch at lane-free time: a build sent into a busy
+        // lane gains nothing by existing early — builds are serial — and it
+        // freezes its batch's composition while the pool is still growing.
+        // The *lane* gate: while any build is queued or running, an approved
+        // spec is pooling on purpose, and an obligation raised against
+        // deliberate policy is how a signal gets trained out of use. The
+        // *completion* gate: for one grace period after the last build
+        // concludes, the lane-free nudge gets first crack at the pool — the
+        // same first-crack rule the cutoff gives every other obligation. A
+        // lane freed by a *cancel* raises no nudge (the echo rule), so that
+        // same grace is what gives a cancelled batch its documented pause
+        // before anyone reconsiders the work. An idle lane formally implies
+        // the uncarried predicate below; it stays because this query should
+        // be honest about its subject on its own terms, not via a global
+        // argument about the lane.
+        if !self.build_lane_busy().await? {
+            let sql = format!(
+                "SELECT q.spec_id, q.approved_at, q.build_attempts, t.gh_issue_number, t.title, \
+                        (SELECT COUNT(*) FROM build_specs bs \
+                         JOIN builds b ON b.id = bs.build_id \
+                         WHERE bs.spec_id = q.spec_id AND b.status = ?) AS failed_builds, \
+                        (SELECT b.exit_reason FROM build_specs bs \
+                         JOIN builds b ON b.id = bs.build_id \
+                         WHERE bs.spec_id = q.spec_id AND b.status = ? \
+                         ORDER BY b.completed_at DESC LIMIT 1) AS last_failure \
+                 FROM spec_queue q \
+                 JOIN specs s ON s.id = q.spec_id \
+                 JOIN tasks t ON t.id = s.task_id \
+                 WHERE q.status = ? AND q.approved_at IS NOT NULL AND q.approved_at <= ? \
+                   AND {} \
+                   AND COALESCE((SELECT MAX(b2.completed_at) FROM builds b2), '') <= ? \
+                 ORDER BY q.approved_at",
+                Self::SPEC_UNCARRIED_SQL
             );
-            let failed: i64 = row.try_get("failed_builds")?;
-            if failed > 0 {
-                let attempts: i64 = row.try_get("build_attempts")?;
-                summary.push_str(&format!(
-                    " — but {failed} earlier build(s) failed, most recently: {}. \
-                     {attempts} of {MAX_BUILD_ATTEMPTS} attempts are charged against it. \
-                     Read why it failed before asking for the same work again",
-                    row.try_get::<Option<String>, _>("last_failure")?
-                        .unwrap_or_else(|| "no reason recorded".into()),
-                ));
+            let rows = sqlx::query(&sql)
+                .bind(BuildStatus::Failed.as_str())
+                .bind(BuildStatus::Failed.as_str())
+                .bind(SpecQueueStatus::Approved.as_str())
+                .bind(&cutoff)
+                .bind(BuildStatus::Queued.as_str())
+                .bind(BuildStatus::Running.as_str())
+                .bind(&cutoff)
+                .fetch_all(&self.pool)
+                .await?;
+            for row in rows {
+                let since = parse_ts(&row.try_get::<String, _>("approved_at")?, "approved_at")?;
+                let mut summary = format!(
+                    "#{} \"{}\" was approved {} and no build is carrying it",
+                    row.try_get::<i64, _>("gh_issue_number")?,
+                    row.try_get::<String, _>("title")?,
+                    since.format("%Y-%m-%d %H:%M UTC"),
+                );
+                let failed: i64 = row.try_get("failed_builds")?;
+                if failed > 0 {
+                    let attempts: i64 = row.try_get("build_attempts")?;
+                    summary.push_str(&format!(
+                        " — but {failed} earlier build(s) failed, most recently: {}. \
+                         {attempts} of {MAX_BUILD_ATTEMPTS} attempts are charged against it. \
+                         Read why it failed before asking for the same work again",
+                        row.try_get::<Option<String>, _>("last_failure")?
+                            .unwrap_or_else(|| "no reason recorded".into()),
+                    ));
+                }
+                obligations.push(Obligation {
+                    kind: ObligationKind::DispatchBuild,
+                    subject_id: row.try_get("spec_id")?,
+                    summary,
+                    since,
+                });
             }
-            obligations.push(Obligation {
-                kind: ObligationKind::DispatchBuild,
-                subject_id: row.try_get("spec_id")?,
-                summary,
-                since,
-            });
         }
 
         // A batch that ran out of build attempts. Stopped work stays visible
@@ -7853,6 +7937,136 @@ mod tests {
         assert_eq!(
             open.iter().map(|o| o.kind).collect::<Vec<_>>(),
             vec![ObligationKind::DispatchBuild]
+        );
+    }
+
+    /// While the lane is busy, an approved spec is pooling on purpose (#1055):
+    /// a build dispatched into a busy lane only freezes its batch's
+    /// composition early, so the obligation stays quiet — and the pool itself
+    /// stays readable, because the lane-free turn is what dispatches it.
+    #[tokio::test]
+    async fn a_busy_lane_pools_approved_specs_without_nagging() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_t1, carried) = seed_spec(&store, 1).await;
+        let (_t2, pooled) = seed_spec(&store, 2).await;
+        for spec in [&carried, &pooled] {
+            store
+                .review_spec(
+                    &spec.id,
+                    SpecQueueStatus::Approved,
+                    None,
+                    DecisionInput::human(),
+                )
+                .await
+                .unwrap();
+        }
+        let build = store
+            .create_build(
+                std::slice::from_ref(&carried.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+
+        assert!(store.build_lane_busy().await.unwrap());
+        let kinds: Vec<_> = store
+            .open_obligations(chrono::Duration::zero())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|o| o.kind)
+            .collect();
+        assert!(
+            !kinds.contains(&ObligationKind::DispatchBuild),
+            "pooling is the healthy state, not owed work: {kinds:?}"
+        );
+        assert_eq!(
+            store.pooled_approved_specs().await.unwrap(),
+            vec![pooled.id.clone()],
+            "the pool is the uncarried approved specs, readable while the lane is busy"
+        );
+
+        // The lane freeing is what turns the pool back into owed work — at
+        // grace zero here; the completion gate has its own test below.
+        store
+            .finalize_build_failed(&build.id, "boom")
+            .await
+            .unwrap();
+        assert!(!store.build_lane_busy().await.unwrap());
+        let owed: Vec<_> = store
+            .open_obligations(chrono::Duration::zero())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.kind == ObligationKind::DispatchBuild)
+            .map(|o| o.subject_id)
+            .collect();
+        assert_eq!(
+            owed.len(),
+            2,
+            "the failed build's spec and the pooled one are both owed again: {owed:?}"
+        );
+    }
+
+    /// For one grace after the last build concludes, the lane-free nudge gets
+    /// first crack at the pool — the dispatch obligation is the safety net,
+    /// not the first responder. A lane freed by a *cancel* raises no nudge at
+    /// all (the echo rule), so this same grace is the documented pause a
+    /// cancelled batch gets before anything reconsiders it.
+    #[tokio::test]
+    async fn the_lane_free_turn_gets_first_crack_before_the_dispatch_obligation() {
+        let store = Store::open_in_memory().await.unwrap();
+        let (_task, spec) = seed_spec(&store, 1).await;
+        store
+            .review_spec(
+                &spec.id,
+                SpecQueueStatus::Approved,
+                None,
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        // Approved long ago, so the approval-age half of the cutoff cannot be
+        // what keeps the obligation quiet.
+        sqlx::query("UPDATE spec_queue SET approved_at = ?")
+            .bind((Utc::now() - chrono::Duration::hours(2)).to_rfc3339())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let build = store
+            .create_build(
+                std::slice::from_ref(&spec.id),
+                "main",
+                DecisionInput::human(),
+            )
+            .await
+            .unwrap();
+        store
+            .finalize_build_failed(&build.id, "boom")
+            .await
+            .unwrap();
+
+        // The lane just freed: inside the grace the pool belongs to the
+        // lane-free turn...
+        assert!(
+            store
+                .open_obligations(chrono::Duration::minutes(15))
+                .await
+                .unwrap()
+                .iter()
+                .all(|o| o.kind != ObligationKind::DispatchBuild),
+            "a fresh completion leaves the pool to the lane-free nudge"
+        );
+        // ...and past it the safety net fires.
+        assert!(
+            store
+                .open_obligations(chrono::Duration::zero())
+                .await
+                .unwrap()
+                .iter()
+                .any(|o| o.kind == ObligationKind::DispatchBuild)
         );
     }
 

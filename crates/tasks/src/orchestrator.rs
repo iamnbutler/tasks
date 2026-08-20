@@ -939,10 +939,71 @@ pub async fn format_nudge(store: &Store, brief: &Brief<'_>, events: &[Event]) ->
     if ingested > 1 {
         lines.push(format!("({ingested} tasks ingested in this batch)"));
     }
-    let notification = format!(
+    let mut notification = format!(
         "[pipeline] Automated notification — not the human. Recent activity:\n{}",
         lines.join("\n")
     );
+
+    // A build concluding is the lane-free moment, and the lane-free moment is
+    // the dispatch moment (#1055): it is the one instant the whole pool of
+    // approved-unbuilt specs is in front of the orchestrator, so the batching
+    // decision is put here, with the specs and their file facts below —
+    // where the specs are in front of it, for the same reason
+    // `format_obligations` says it there. Left to the standing prompt,
+    // arrival-time habit wins; left to the obligation loop, it fires only
+    // after this turn failed. A *cancelled* build never reaches this turn
+    // (`nudge_worthy` filters it — the echo rule), so a pool freed by a
+    // cancel is picked up by the dispatch obligation after its grace, which
+    // is the documented pause before anyone reconsiders that work. Nothing
+    // under Shadow or Off: this paragraph claims an authority, and claiming
+    // one the server will refuse is worse than silence.
+    let lane_freed = events.iter().any(|e| {
+        matches!(&e.payload, EventPayload::BuildCompleted { status, .. }
+            if *status != BuildStatus::Cancelled)
+    });
+    let mut pool: Vec<crate::models::SpecId> = Vec::new();
+    if lane_freed
+        && matches!(
+            store.charter_entry(Capability::DispatchBuilds).await,
+            Ok(entry) if entry.level == CharterLevel::Live
+        )
+    {
+        match store.build_lane_busy().await {
+            // Another build is already queued behind the one that finished —
+            // the lane is not actually free, and a pool dispatched into a
+            // busy lane freezes its composition early for nothing. The next
+            // completion asks again.
+            Ok(true) => {}
+            Ok(false) => match store.pooled_approved_specs().await {
+                Ok(specs) => pool = specs,
+                // Loud, not silent: an unreadable pool degrades to the
+                // obligation's grace-late reminder, and the reader should
+                // know that is happening rather than reading quiet as empty.
+                Err(e) => notification.push_str(&format!(
+                    "\n\n(the lane freed but the spec pool could not be read: {e} — \
+                     GET /spec-queue still shows it)"
+                )),
+            },
+            Err(e) => notification.push_str(&format!(
+                "\n\n(the lane freed but its state could not be read: {e} — \
+                 GET /spec-queue shows what is pooled)"
+            )),
+        }
+    }
+    if !pool.is_empty() {
+        notification.push_str(&format!(
+            "\n\n{} approved spec(s) are pooled and the build lane is now idle — \
+             dispatch waited for this moment on purpose, because this turn sees \
+             the whole pool and no approval turn can. One build takes a list \
+             (`POST /builds`): batch specs from the same project that touch the \
+             same files into one build — one branch, one PR — and split \
+             unrelated work; the facts below say what each claims. Dispatch \
+             them in this turn, or say what a spec you leave pooled is waiting \
+             for.",
+            pool.len()
+        ));
+    }
+
     let mut sections = Vec::new();
     for spec_id in &briefed_specs {
         sections.push((
@@ -950,7 +1011,13 @@ pub async fn format_nudge(store: &Store, brief: &Brief<'_>, events: &[Event]) ->
             spec_facts(brief, spec_id).await,
         ));
     }
-    if !briefed_specs.is_empty() {
+    for spec_id in &pool {
+        sections.push((
+            spec_heading(store, spec_id).await,
+            spec_facts(brief, spec_id).await,
+        ));
+    }
+    if !briefed_specs.is_empty() || !pool.is_empty() {
         sections.push(("In flight:".to_string(), pipeline_facts(brief).await));
     }
     match Brief::render(&sections) {
@@ -1584,13 +1651,26 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
            then render the verdict — what you may do with it is in the \
            authority section below, and how it reaches the human is in the \
            reporting section, not here.\n\
-         - You approved a spec → carry it through in the same turn. Approval \
-           is not delivery: nothing dispatches on its own, and your own \
-           verdicts do not come back to you as news. Either queue the build \
-           now (POST /builds) or say what it is waiting for. A `dispatch_build` \
-           obligation will eventually chase an approved spec nobody built, but \
-           that is the safety net catching a dropped ball, not the normal \
-           path.\n\
+         - You approved a spec → approval is not delivery: nothing dispatches \
+           on its own, and your own verdicts do not come back to you as news. \
+           But WHEN to dispatch depends on the build lane, because builds are \
+           strictly serial and a build sent into a busy lane gains nothing by \
+           existing early — it only freezes its batch's composition while the \
+           pool is still growing. Lane idle (no build queued or running) → \
+           dispatch in this turn (POST /builds), batched with every other \
+           pooled approved spec from the same project that touches the same \
+           files. Lane busy → dispatch nothing and say the spec pools until \
+           the lane frees; that is the policy working, not work left undone. \
+           A `dispatch_build` obligation chases a pool left waiting at an \
+           idle lane, but that is the safety net catching a dropped ball, \
+           not the normal path.\n\
+         - A build completed → the lane is free, and this turn is where \
+           batching lives: the notification lists every pooled approved spec \
+           when there is one, each with its file facts. Dispatch the pool in \
+           this same turn — specs from the same project that touch the same \
+           files go in ONE build, one branch, one PR; unrelated work splits. \
+           No approval turn can see what this turn sees, which is the whole \
+           pool at once.\n\
          - `land_batch` obligation → a succeeded build's PR has not shipped. \
            Its subject is a BUILD id, not a spec id. A pull request is not \
            delivery any more than approval is, and a PR reading \"merged\" is \
@@ -1681,7 +1761,9 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
            required changes in it is a real verdict rather than a hedge\n\
          - POST /builds {{\"spec_ids\":[...],\"rationale\",\"directions\"}} — \
            batch approved specs into one Builder run (serial; one at a \
-           time)\n\
+           time). Dispatch when the lane is idle; while a build is queued \
+           or running, approved specs pool on purpose — the build-completed \
+           rule above is where the pool dispatches\n\
          - POST /sessions/{{id}}/cancel, POST /builds/{{id}}/cancel \
            {{\"rationale\"}} — stop a scout or a build that is already in \
            flight. The rationale is mandatory and lands in the run's \
@@ -2038,6 +2120,27 @@ mod tests {
         for section in [with, without] {
             assert!(section.contains("say what was denied"), "{section}");
         }
+    }
+
+    /// Dispatch timing is the batching mechanism (#1055). Eager per-approval
+    /// dispatch kept the pool at one spec forever, so the only text that
+    /// commanded batching (`format_obligations`, on two-plus unbuilt specs)
+    /// almost never rendered — the standing prompt has to state the lane
+    /// policy, and the unconditional "queue the build now" has to be gone.
+    #[test]
+    fn dispatch_waits_for_an_idle_lane_and_batches_at_lane_free() {
+        let p = prompt(4800, &[]);
+        assert!(
+            p.contains("WHEN to dispatch depends on the build lane"),
+            "{p}"
+        );
+        assert!(p.contains("Lane busy → dispatch nothing"), "{p}");
+        assert!(p.contains("A build completed → the lane is free"), "{p}");
+        assert!(p.contains("approved specs pool on purpose"), "{p}");
+        assert!(
+            !p.contains("carry it through in the same turn"),
+            "the eager-dispatch instruction is what produced one-spec builds: {p}"
+        );
     }
 
     #[test]
