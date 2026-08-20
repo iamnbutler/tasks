@@ -1,7 +1,7 @@
 //! What the scout dispatcher may start, and whether it may start it — asked
 //! together, so the second question cannot be dropped from the first (#973).
 //!
-//! [`top_up`](crate::run::top_up) reads the four standing dispatch holds twice:
+//! [`top_up`](crate::run::top_up) reads the five standing dispatch holds twice:
 //! once before its loop, for cost, and once **per scout**, because each
 //! iteration starts a VM and a pause landing mid-pass must stop the next one
 //! rather than merely the next pass (#948). That per-scout read is correct and
@@ -42,7 +42,7 @@ use crate::store::{Store, StoreError};
 ///
 /// The fields are private and there is exactly one constructor — inside
 /// [`next_scout`], after the hold read — so holding one of these **is** the
-/// evidence that the four holds were re-read since the queue was scanned. That
+/// evidence that the five holds were re-read since the queue was scanned. That
 /// is the whole mechanism: the caller cannot assemble one, and cannot reach the
 /// pair any other way, because [`next_dispatchable`] does not leave this module.
 pub struct Cleared {
@@ -97,6 +97,7 @@ pub async fn next_scout(
     health: &GitHubHealth,
     updates: &crate::updates::UpdateWatch,
     pool_health: &crate::pool_health::PoolHealth,
+    broker_health: &crate::broker_health::BrokerHealth,
     handle: &ClientHandle<TasksProtocol>,
     skip: &HashSet<TaskId>,
 ) -> Result<NextScout, StoreError> {
@@ -110,16 +111,16 @@ pub async fn next_scout(
     // `a_hold_that_lands_after_the_pass_began_stops_the_next_scout` kills;
     // hoisting it above the scan is the one
     // `the_holds_are_read_after_the_scan_not_before_it` kills.
-    if dispatch_held(store, health, updates, pool_health, handle).await? {
+    if dispatch_held(store, health, updates, pool_health, broker_health, handle).await? {
         return Ok(NextScout::Held);
     }
 
     Ok(NextScout::Start(Cleared { task, project }))
 }
 
-/// Whether new scouts must wait: the four standing reasons, asked together.
+/// Whether new scouts must wait: the five standing reasons, asked together.
 ///
-/// One function rather than four inline checks so a fifth reason cannot be
+/// One function rather than five inline checks so a sixth reason cannot be
 /// added at one call site and forgotten at another — [`crate::run::top_up`]
 /// asks once before its loop (for cost), [`next_scout`] once per dispatch (for
 /// freshness), and [`crate::run::build_loop`] once per tick ahead of its claim.
@@ -128,8 +129,8 @@ pub async fn next_scout(
 ///
 /// Silent by design, like the checks it replaces: a pause is the human's own
 /// act, the GitHub edge is announced by the poller, the update edge by the
-/// watch and the pool edge by [`announce_pool`], and `/status` answers for
-/// whoever asks later. A 500 ms loop that logged its refusals is what trains a
+/// watch, and the pool and broker edges by [`announce_pool`] and
+/// [`announce_broker`], and `/status` answers for whoever asks later. A 500 ms loop that logged its refusals is what trains a
 /// reader to ignore them.
 ///
 /// The serial build lane ([`crate::run::build_loop`]) calls this too, since
@@ -140,12 +141,14 @@ pub async fn next_scout(
 /// await, which is what forced them apart in the first place). What that
 /// argument does not cover is the one this function exists for: with two
 /// implementations, a *fifth* reason reaches scouts and not builds unless
-/// somebody remembers both. There is now one.
+/// somebody remembers both. There is now one — and the fifth reason arrived
+/// (#1006), reaching both without either call site being touched.
 pub async fn dispatch_held(
     store: &Store,
     health: &GitHubHealth,
     updates: &crate::updates::UpdateWatch,
     pool_health: &crate::pool_health::PoolHealth,
+    broker_health: &crate::broker_health::BrokerHealth,
     handle: &ClientHandle<TasksProtocol>,
 ) -> Result<bool, StoreError> {
     if store.get_mode().await? != Mode::Play {
@@ -175,6 +178,15 @@ pub async fn dispatch_held(
     // `PROBE_INTERVAL` across both gates, so asking here costs at most one
     // local round trip every five seconds.
     if pool_hold(pool_health, handle, store).await {
+        return Ok(true);
+    }
+
+    // And the broker, which is the one every check above is blind to: GitHub
+    // can be healthy, the pool can have slack, the images can be current, and
+    // every clone inside a VM still fails — because a clone is redeemed
+    // against the broker and not against github.com. Dispatching into that is
+    // not a delay, it is a `rejected` task in under a minute (#1006).
+    if broker_hold(broker_health, store).await {
         return Ok(true);
     }
 
@@ -244,6 +256,63 @@ async fn announce_pool(store: &Store, transition: crate::pool_health::Transition
         .await
     {
         warn!(error = %e, "could not record the vm-pool capacity hold on the feed");
+    }
+}
+
+/// Refresh the broker record if a probe is due, then read the hold.
+///
+/// The probe is an *active* TCP round trip to the advertised address, not a
+/// passive record like [`github_hold`]'s — because during a broker outage
+/// there are no served requests to observe: the runs that would generate them
+/// are the runs that are failing. See [`crate::broker_health`] for why the
+/// address must be the advertised one and why a 401 is the success condition.
+///
+/// Private, for the reason [`pool_hold`] is: leaving it reachable would leave
+/// a route by which a caller could assemble four of the five checks and go
+/// green.
+async fn broker_hold(broker_health: &crate::broker_health::BrokerHealth, store: &Store) -> bool {
+    if broker_health.probe_due(chrono::Utc::now()) {
+        let probe = broker_health.probe().await;
+        let transition = broker_health.observe(&probe, chrono::Utc::now());
+        announce_broker(store, transition).await;
+    }
+    broker_health.hold(chrono::Utc::now()).is_some()
+}
+
+/// Say once, per edge, that the broker stopped or started answering — in the
+/// log and on the event feed.
+///
+/// Driven by the [`Transition`](crate::broker_health::Transition) taken under
+/// the probe claim, never by the `hold` predicate, for the reason
+/// [`announce_pool`] states.
+async fn announce_broker(store: &Store, transition: crate::broker_health::Transition) {
+    use crate::broker_health::Transition;
+    let message = match transition {
+        Transition::Unchanged => return,
+        Transition::Down(run) => {
+            let message = run.describe();
+            warn!(address = %run.address, "{message}");
+            message
+        }
+        Transition::Back(run) => {
+            let message = format!(
+                "the credential broker at {} is answering again (it was down for {}s, {}                  probe(s)); dispatch resumes",
+                run.address,
+                (run.last - run.since).num_seconds(),
+                run.probes
+            );
+            tracing::info!("{message}");
+            message
+        }
+    };
+    if let Err(e) = store
+        .append_event(EventPayload::Note {
+            source: DISPATCHER.into(),
+            message,
+        })
+        .await
+    {
+        warn!(error = %e, "could not record the broker hold on the feed");
     }
 }
 
@@ -428,6 +497,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (_svc, client) = pool_with_room(dir.path(), 4).await;
         let pool_health = crate::pool_health::PoolHealth::new();
+        let broker = crate::broker_health::BrokerHealth::unprobed();
         let handle = client.handle();
 
         let project = project();
@@ -443,9 +513,17 @@ mod tests {
         // Whatever the first turn of a pass does, the second turn must ask
         // again — so each leg starts from a clean, dispatching state.
         let mut skip: HashSet<TaskId> = HashSet::new();
-        let turn_one = next_scout(&store, &health, &updates, &pool_health, &handle, &skip)
-            .await
-            .unwrap();
+        let turn_one = next_scout(
+            &store,
+            &health,
+            &updates,
+            &pool_health,
+            &broker,
+            &handle,
+            &skip,
+        )
+        .await
+        .unwrap();
         let NextScout::Start(cleared) = turn_one else {
             panic!("nothing is holding dispatch: the first scout of the pass must start");
         };
@@ -457,9 +535,17 @@ mod tests {
         store.set_mode(Mode::Pause).await.unwrap();
         assert!(
             matches!(
-                next_scout(&store, &health, &updates, &pool_health, &handle, &skip)
-                    .await
-                    .unwrap(),
+                next_scout(
+                    &store,
+                    &health,
+                    &updates,
+                    &pool_health,
+                    &broker,
+                    &handle,
+                    &skip
+                )
+                .await
+                .unwrap(),
                 NextScout::Held
             ),
             "the second scout of the same pass must see the pause (#948)"
@@ -472,9 +558,17 @@ mod tests {
         store.set_mode(Mode::Stop).await.unwrap();
         assert!(
             matches!(
-                next_scout(&store, &health, &updates, &pool_health, &handle, &skip)
-                    .await
-                    .unwrap(),
+                next_scout(
+                    &store,
+                    &health,
+                    &updates,
+                    &pool_health,
+                    &broker,
+                    &handle,
+                    &skip
+                )
+                .await
+                .unwrap(),
                 NextScout::Held
             ),
             "and so must a stop"
@@ -486,9 +580,17 @@ mod tests {
         health.observe(&unavailable(), now);
         assert!(
             matches!(
-                next_scout(&store, &health, &updates, &pool_health, &handle, &skip)
-                    .await
-                    .unwrap(),
+                next_scout(
+                    &store,
+                    &health,
+                    &updates,
+                    &pool_health,
+                    &broker,
+                    &handle,
+                    &skip
+                )
+                .await
+                .unwrap(),
                 NextScout::Held
             ),
             "a 5xx observed mid-pass holds the next scout of that pass"
@@ -509,9 +611,17 @@ mod tests {
         .await;
         assert!(
             matches!(
-                next_scout(&store, &health, &updates, &pool_health, &handle, &skip)
-                    .await
-                    .unwrap(),
+                next_scout(
+                    &store,
+                    &health,
+                    &updates,
+                    &pool_health,
+                    &broker,
+                    &handle,
+                    &skip
+                )
+                .await
+                .unwrap(),
                 NextScout::Held
             ),
             "an image observed stale by this pass's own first scout holds its second"
@@ -524,9 +634,17 @@ mod tests {
         pool_health.observe(&full(), Utc::now());
         assert!(
             matches!(
-                next_scout(&store, &health, &released, &pool_health, &handle, &skip)
-                    .await
-                    .unwrap(),
+                next_scout(
+                    &store,
+                    &health,
+                    &released,
+                    &pool_health,
+                    &broker,
+                    &handle,
+                    &skip
+                )
+                .await
+                .unwrap(),
                 NextScout::Held
             ),
             "a pool that filled up mid-pass holds the next scout of that pass (#967)"
@@ -534,9 +652,17 @@ mod tests {
         pool_health.observe(&has_room(), Utc::now());
 
         // Every hold released, and the queue still has the task nothing started.
-        let resumed = next_scout(&store, &health, &released, &pool_health, &handle, &skip)
-            .await
-            .unwrap();
+        let resumed = next_scout(
+            &store,
+            &health,
+            &released,
+            &pool_health,
+            &broker,
+            &handle,
+            &skip,
+        )
+        .await
+        .unwrap();
         let NextScout::Start(cleared) = resumed else {
             panic!("with every hold released the second scout starts");
         };
@@ -559,6 +685,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (_svc, client) = pool_with_room(dir.path(), 4).await;
         let pool_health = crate::pool_health::PoolHealth::new();
+        let broker = crate::broker_health::BrokerHealth::unprobed();
         let handle = client.handle();
 
         // Every hold live at once, so no single one of them can be the reason
@@ -575,7 +702,7 @@ mod tests {
         .await;
         pool_health.observe(&full(), Utc::now());
         assert!(
-            dispatch_held(&store, &health, &updates, &pool_health, &handle)
+            dispatch_held(&store, &health, &updates, &pool_health, &broker, &handle)
                 .await
                 .unwrap(),
             "the four holds really are in force"
@@ -589,9 +716,17 @@ mod tests {
         let skip: HashSet<TaskId> = HashSet::new();
         assert!(
             matches!(
-                next_scout(&store, &health, &updates, &pool_health, &handle, &skip)
-                    .await
-                    .unwrap(),
+                next_scout(
+                    &store,
+                    &health,
+                    &updates,
+                    &pool_health,
+                    &broker,
+                    &handle,
+                    &skip
+                )
+                .await
+                .unwrap(),
                 NextScout::Drained
             ),
             "the scan has to run first: only it can say the queue is empty, and \
@@ -615,11 +750,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (_svc, client) = pool_with_room(dir.path(), 4).await;
         let pool_health = crate::pool_health::PoolHealth::new();
+        let broker = crate::broker_health::BrokerHealth::unprobed();
         let handle = client.handle();
 
         store.set_mode(Mode::Play).await.unwrap();
         assert!(
-            !dispatch_held(&store, &health, &updates, &pool_health, &handle)
+            !dispatch_held(&store, &health, &updates, &pool_health, &broker, &handle)
                 .await
                 .unwrap(),
             "playing, GitHub answering, nothing pending: dispatch is free"
@@ -628,14 +764,14 @@ mod tests {
         for mode in [Mode::Pause, Mode::Stop] {
             store.set_mode(mode).await.unwrap();
             assert!(
-                dispatch_held(&store, &health, &updates, &pool_health, &handle)
+                dispatch_held(&store, &health, &updates, &pool_health, &broker, &handle)
                     .await
                     .unwrap(),
                 "{mode:?} must be seen by the very next read"
             );
             store.set_mode(Mode::Play).await.unwrap();
             assert!(
-                !dispatch_held(&store, &health, &updates, &pool_health, &handle)
+                !dispatch_held(&store, &health, &updates, &pool_health, &broker, &handle)
                     .await
                     .unwrap(),
                 "and so must the play that follows it"
@@ -645,14 +781,14 @@ mod tests {
         let now = Utc::now();
         health.observe(&unavailable(), now);
         assert!(
-            dispatch_held(&store, &health, &updates, &pool_health, &handle)
+            dispatch_held(&store, &health, &updates, &pool_health, &broker, &handle)
                 .await
                 .unwrap(),
             "an outage that started mid-pass holds the next dispatch"
         );
         health.observe(&Ok::<(), GhError>(()), now);
         assert!(
-            !dispatch_held(&store, &health, &updates, &pool_health, &handle)
+            !dispatch_held(&store, &health, &updates, &pool_health, &broker, &handle)
                 .await
                 .unwrap(),
             "and a success releases it just as promptly"
@@ -669,14 +805,14 @@ mod tests {
         )
         .await;
         assert!(
-            dispatch_held(&store, &health, &updates, &pool_health, &handle)
+            dispatch_held(&store, &health, &updates, &pool_health, &broker, &handle)
                 .await
                 .unwrap(),
             "a stale image observed since boot holds new scouts"
         );
         let off = crate::updates::UpdateWatch::at_boot(false);
         assert!(
-            !dispatch_held(&store, &health, &off, &pool_health, &handle)
+            !dispatch_held(&store, &health, &off, &pool_health, &broker, &handle)
                 .await
                 .unwrap(),
             "TASKS_UPDATE_HOLD=off keeps the report and drops the gate"
@@ -686,17 +822,39 @@ mod tests {
         // next read sees.
         pool_health.observe(&full(), Utc::now());
         assert!(
-            dispatch_held(&store, &health, &off, &pool_health, &handle)
+            dispatch_held(&store, &health, &off, &pool_health, &broker, &handle)
                 .await
                 .unwrap(),
             "a full pool holds new scouts (#967)"
         );
         pool_health.observe(&has_room(), Utc::now());
         assert!(
-            !dispatch_held(&store, &health, &off, &pool_health, &handle)
+            !dispatch_held(&store, &health, &off, &pool_health, &broker, &handle)
                 .await
                 .unwrap(),
             "and a slot coming back releases it"
+        );
+
+        // And the broker — the fifth reason, and the one every check above is
+        // blind to (#1006). `observe` is deliberately independent of whether
+        // this record probes, so a seeded outage reads exactly as a probed one
+        // would.
+        broker.observe(
+            &crate::doctor::BrokerProbe::Silent("it returned no bytes at all".into()),
+            Utc::now(),
+        );
+        assert!(
+            dispatch_held(&store, &health, &off, &pool_health, &broker, &handle)
+                .await
+                .unwrap(),
+            "a broker that is not answering holds new scouts (#1006)"
+        );
+        broker.observe(&crate::doctor::BrokerProbe::DemandedLease, Utc::now());
+        assert!(
+            !dispatch_held(&store, &health, &off, &pool_health, &broker, &handle)
+                .await
+                .unwrap(),
+            "and a 401 — which is what a healthy broker answers — releases it"
         );
     }
 

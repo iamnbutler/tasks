@@ -875,6 +875,14 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     // gates make between them, never from classifying a refusal — see
     // `crate::pool_health`.
     let pool_health = Arc::new(crate::pool_health::PoolHealth::new());
+    // The fourth, and the only one that observes something no other check can
+    // see: every clone inside a VM is redeemed against the broker, so a broker
+    // that stops answering fails every scout and every build at the clone
+    // while GitHub, the pool and the images all read healthy (#1006).
+    let broker_health = Arc::new(crate::broker_health::BrokerHealth::new(
+        config.broker.advertise_host.clone(),
+        config.broker.port,
+    ));
 
     let poll = tokio::spawn(poll_loop(
         store.clone(),
@@ -889,6 +897,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         health.clone(),
         updates.clone(),
         pool_health.clone(),
+        broker_health.clone(),
         shutdown_rx.clone(),
     ));
     let build = tokio::spawn(build_loop(
@@ -898,6 +907,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         health.clone(),
         updates.clone(),
         pool_health.clone(),
+        broker_health.clone(),
         shutdown_rx.clone(),
     ));
     let orchestrate = tokio::spawn(orchestrator_loop(
@@ -949,6 +959,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
             github_health: Some(health.clone()),
             updates: Some(updates.clone()),
             pool_health: Some(pool_health.clone()),
+            broker_health: Some(broker_health.clone()),
             viewer: Default::default(),
         },
         async move {
@@ -2142,6 +2153,7 @@ fn builder_config(config: &Config, leases: Option<crate::broker::LeaseIssuer>) -
 /// vm-pool one above it: a Scout's first act is a clone, so starting one while
 /// GitHub is not answering buys a setup failure and a dispatch strike for work
 /// that did nothing wrong.
+#[expect(clippy::too_many_arguments, reason = "one argument per standing hold")]
 pub async fn dispatch_loop(
     store: Arc<Store>,
     config: Config,
@@ -2149,6 +2161,7 @@ pub async fn dispatch_loop(
     health: Arc<GitHubHealth>,
     updates: Arc<crate::updates::UpdateWatch>,
     pool_health: Arc<crate::pool_health::PoolHealth>,
+    broker_health: Arc<crate::broker_health::BrokerHealth>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -2191,6 +2204,7 @@ pub async fn dispatch_loop(
             &health,
             &updates,
             &pool_health,
+            &broker_health,
             client,
             &mut shutdown,
         )
@@ -2631,6 +2645,7 @@ async fn dispatch_connected(
     health: &GitHubHealth,
     updates: &crate::updates::UpdateWatch,
     pool_health: &crate::pool_health::PoolHealth,
+    broker_health: &crate::broker_health::BrokerHealth,
     client: Client<TasksProtocol>,
     shutdown: &mut watch::Receiver<bool>,
 ) {
@@ -2658,6 +2673,7 @@ async fn dispatch_connected(
                 health,
                 updates,
                 pool_health,
+                broker_health,
                 &handle,
                 &scout,
                 &mut in_flight,
@@ -2712,6 +2728,7 @@ async fn top_up(
     health: &GitHubHealth,
     updates: &crate::updates::UpdateWatch,
     pool_health: &crate::pool_health::PoolHealth,
+    broker_health: &crate::broker_health::BrokerHealth,
     handle: &ClientHandle<TasksProtocol>,
     scout: &Arc<Scout>,
     in_flight: &mut JoinSet<(TaskId, Result<Spec, ScoutError>)>,
@@ -2720,7 +2737,9 @@ async fn top_up(
     // Cheap pre-check, and only that: the per-dispatch read inside
     // `next_scout` is the one that decides. A held dispatcher must not walk the
     // whole task table every `DISPATCH_TICK` to reach the same answer.
-    if dispatch_gate::dispatch_held(store, health, updates, pool_health, handle).await? {
+    if dispatch_gate::dispatch_held(store, health, updates, pool_health, broker_health, handle)
+        .await?
+    {
         return Ok(());
     }
 
@@ -2736,6 +2755,7 @@ async fn top_up(
             health,
             updates,
             pool_health,
+            broker_health,
             handle,
             in_flight_ids,
         )
@@ -3221,6 +3241,7 @@ pub async fn obligation_loop(
 /// runs normally. Mode gates the *start* of a run only — `Pause` never
 /// interrupts a running build, which has more at stake than a scout: a
 /// half-built branch has no home.
+#[expect(clippy::too_many_arguments, reason = "one argument per standing hold")]
 pub async fn build_loop(
     store: Arc<Store>,
     config: Config,
@@ -3228,6 +3249,7 @@ pub async fn build_loop(
     health: Arc<GitHubHealth>,
     updates: Arc<crate::updates::UpdateWatch>,
     pool_health: Arc<crate::pool_health::PoolHealth>,
+    broker_health: Arc<crate::broker_health::BrokerHealth>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let Some(github) = config.github_client() else {
@@ -3291,12 +3313,21 @@ pub async fn build_loop(
             // property the function was extracted for: a *fifth* reason to
             // hold new work cannot be added for scouts and forgotten here. The
             // match guard the four checks used to live in is gone because a
-            // guard cannot await, which is what forced the copies apart.
+            // guard cannot await, which is what forced the copies apart. That
+            // fifth reason arrived with #1006's broker hold and reached this
+            // lane without this line being touched, which is the whole claim.
             let held = if in_flight.builds() > 0 {
                 true
             } else {
-                match dispatch_gate::dispatch_held(&store, &health, &updates, &pool_health, &handle)
-                    .await
+                match dispatch_gate::dispatch_held(
+                    &store,
+                    &health,
+                    &updates,
+                    &pool_health,
+                    &broker_health,
+                    &handle,
+                )
+                .await
                 {
                     Ok(held) => held,
                     // The old shape warned on an unreadable *mode* and skipped

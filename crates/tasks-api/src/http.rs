@@ -546,6 +546,40 @@ pub struct ServerStatus {
     /// reason as the fields above.
     #[serde(default)]
     pub pool: Option<PoolHold>,
+    /// Set for as long as scout and build dispatch is being held because the
+    /// credential broker is not answering. `#[serde(default)]` for the same
+    /// reload-skew reason as the fields above.
+    #[serde(default)]
+    pub broker: Option<BrokerHold>,
+}
+
+/// Why the pipeline is idle when the credential broker is not answering.
+///
+/// Every clone inside a VM is redeemed against the broker, so a broker that
+/// stops answering fails every scout and every build at the clone — a
+/// pre-agent setup failure, which the strike rule charges deliberately. An
+/// outage of one minute therefore does not delay work, it destroys it: two
+/// tasks went from `queued` to `rejected` in 27 and 43 seconds on 2026-08-18
+/// (#1006). Holding costs nothing: queued work stays queued, and the next
+/// probe that gets a `401` releases it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerHold {
+    /// The first failed probe in this run — "down since", which later probes
+    /// do not move.
+    pub since: DateTime<Utc>,
+    /// The most recent failed probe. The gap between this and now is the
+    /// difference between a hold a dispatcher is still refreshing and one
+    /// about to expire on its own.
+    pub last_seen: DateTime<Utc>,
+    /// How many probes have failed since `since`.
+    pub probes: u32,
+    /// The advertised address that was probed (`TASKS_BROKER_ADVERTISE` and
+    /// `TASKS_BROKER_PORT`) — never loopback, which answers correctly while
+    /// the bridge gateway is severed. Carried so the report names the thing to
+    /// check rather than the concept.
+    pub address: String,
+    /// The most recent failure, rendered — prose for a reader.
+    pub error: String,
 }
 
 /// Why the pipeline is idle when vm-pool has no room.

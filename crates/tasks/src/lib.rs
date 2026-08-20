@@ -8,6 +8,9 @@ pub mod brief;
 /// Short-lived credential leases and the proxy that redeems them, so VMs
 /// operate on credit and never hold a raw key (#971).
 pub mod broker;
+/// Whether the broker is answering, and whether dispatch should wait for it —
+/// the fourth standing hold (#1006).
+pub mod broker_health;
 pub mod builder;
 pub mod bundles;
 pub mod cancel;

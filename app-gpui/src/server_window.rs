@@ -18,14 +18,15 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, size, App, Bounds, ClickEvent, Context, Entity, Global, Hsla, TitlebarOptions, Window,
-    WindowBounds, WindowHandle, WindowOptions,
+    div, px, size, App, Bounds, ClickEvent, Context, Entity, FocusHandle, Global, Hsla,
+    TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
 };
 use gpuikit::theme::{ActiveTheme, Themeable};
 use tasks_client::api::http::{InFlight, ServerStatus};
 use tasks_client::api::models::Mode;
 
 use crate::about;
+use crate::modal::{self, modal, Dismissal, ModalLayer, Placement, Scrim};
 use crate::server::{Op, ServerControl};
 use crate::time;
 use crate::workspace::FONT;
@@ -43,8 +44,16 @@ struct ServerWindowHandle(WindowHandle<ServerWindow>);
 
 impl Global for ServerWindowHandle {}
 
+/// This window's seat in the modal layer. One name, because a window that
+/// wants to ask two things at once is asking one of them of nobody.
+const CONFIRM_MODAL: &str = "Stop confirmation";
+
 pub struct ServerWindow {
     control: Entity<ServerControl>,
+    /// Where focus rests when no modal is up, and what a dismissed modal
+    /// hands focus back to when nothing else held it.
+    focus_handle: FocusHandle,
+    modals: ModalLayer,
 }
 
 /// Open the window, or raise it if it is already open.
@@ -131,7 +140,43 @@ impl ServerWindow {
         })
         .detach();
 
-        Self { control }
+        let focus_handle = cx.focus_handle();
+        Self {
+            control,
+            modals: ModalLayer::new(focus_handle.clone()),
+            focus_handle,
+        }
+    }
+
+    /// Keep the modal layer in step with the question the *control* is
+    /// holding.
+    ///
+    /// `ServerControl::pending` stays the single source of truth for whether
+    /// there is anything to ask — it is set from a menu item this window never
+    /// sees, and collapsed from a poll when the work it was about lands
+    /// (`ServerControl::refresh`). So the modal is opened and closed from that
+    /// one fact rather than from each of the four things that can change it:
+    /// the three buttons and the poll would otherwise be four places to
+    /// remember to put the surface away.
+    fn sync_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let asking = self.control.read(cx).pending.is_some();
+        if asking && !self.modals.is_open(CONFIRM_MODAL) {
+            if let Err(conflict) = self.modals.open(CONFIRM_MODAL, None, window, cx) {
+                // Nothing else in this window opens a modal, so this is a
+                // future bug rather than a state to handle — said out loud
+                // where the window's other refusals are said.
+                eprintln!("{conflict}");
+            }
+        } else if !asking && self.modals.is_open(CONFIRM_MODAL) {
+            self.modals.dismiss(window, cx);
+        }
+    }
+
+    /// Drop the parked question. Escape, the scrim and the Cancel button all
+    /// arrive here — one answer, three gestures.
+    fn cancel_pending(&mut self, cx: &mut Context<Self>) {
+        self.control
+            .update(cx, |control, cx| control.cancel_pending(cx));
     }
 
     // --- the report ---
@@ -201,6 +246,10 @@ impl ServerWindow {
             .as_ref()
             .and_then(pool_hold_line)
             .map(|line| self.fact("vm-pool", line, cx));
+        let broker = status
+            .as_ref()
+            .and_then(broker_hold_line)
+            .map(|line| self.fact("Broker", line, cx));
 
         div()
             .flex()
@@ -211,6 +260,7 @@ impl ServerWindow {
             .children(github)
             .children(update)
             .children(pool)
+            .children(broker)
             .child(self.fact("Migrations", migrations, cx))
             .child(self.fact("In flight", in_flight, cx))
             .child(self.fact("Server build", server_build, cx))
@@ -595,6 +645,18 @@ impl ServerWindow {
     /// not a lock. If the work lands while it is up the question collapses
     /// (see `ServerControl::refresh`) and the click is dropped — stopping on a
     /// question nobody is being asked any more would be worse.
+    ///
+    /// It draws as [`crate::modal`]'s one modal rather than as a panel inline
+    /// in the column, which is what makes the two ways *out* of it real: this
+    /// used to be three buttons over a window whose every other control stayed
+    /// live behind them, so the question could be walked past rather than
+    /// answered.
+    ///
+    /// It is [`Dismissal::Dismissible`] and not [`Dismissal::MustAnswer`],
+    /// even though the thing it guards is destructive: Cancel *is* an answer
+    /// here, and a modal whose safe exit needs a specific button is one whose
+    /// destructive button is the easier target. ⌘-Enter takes the cautious
+    /// side, never the one that ends work.
     fn render_confirm(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let control = self.control.read(cx);
         let op = control.pending?;
@@ -602,62 +664,71 @@ impl ServerWindow {
         let theme = cx.theme().clone();
 
         Some(
-            div()
-                .flex_none()
-                .flex()
-                .flex_col()
-                .gap(px(6.))
-                .p(px(8.))
-                .rounded(px(6.))
-                .bg(theme.surface())
+            modal(&self.modals)?
+                .scrim(Scrim::Dim)
+                .placement(Placement::Center)
+                .dismissal(Dismissal::Dismissible)
+                .on_dismiss(cx, |this, _window, cx| this.cancel_pending(cx))
+                // The default answer, and deliberately the one that ends
+                // nothing: whatever ⌘-Enter is on, it is what an impatient
+                // hand reaches for.
+                .on_submit(cx, |this, _window, cx| {
+                    this.start(Op::StopWhenIdle, cx);
+                })
                 .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.fg())
-                        .child(format!("Stop now, with {work} in flight?")),
-                )
-                .child(div().text_xs().text_color(theme.fg_muted()).child(
-                    "Stopping now leaves that work's VMs running with nothing \
+                    modal::panel(cx)
+                        .id("stop-confirm")
+                        .w(px(420.))
+                        .gap(px(8.))
+                        .p(px(12.))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme.fg())
+                                .child(format!("Stop now, with {work} in flight?")),
+                        )
+                        .child(div().text_xs().text_color(theme.fg_muted()).child(
+                            "Stopping now leaves that work's VMs running with nothing \
                              reading them until vm-pool reaps them. Waiting stops the \
                              server once it lands — and leaves dispatch paused, since \
                              no boot resumes it.",
-                ))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap(px(6.))
-                        .child(self.button(
-                            "confirm-wait-then-stop",
-                            "Wait, then stop",
-                            true,
-                            None,
-                            cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                                this.start(Op::StopWhenIdle, cx);
-                            }),
-                            cx,
                         ))
-                        .child(self.button(
-                            "confirm-stop-anyway",
-                            "Stop anyway",
-                            true,
-                            Some(gpui::hsla(0. / 360., 0.8, 0.62, 1.)),
-                            cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                                this.start(op, cx);
-                            }),
-                            cx,
-                        ))
-                        .child(self.button(
-                            "confirm-cancel",
-                            "Cancel",
-                            true,
-                            None,
-                            cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                                this.control
-                                    .update(cx, |control, cx| control.cancel_pending(cx));
-                            }),
-                            cx,
-                        )),
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(px(6.))
+                                .child(self.button(
+                                    "confirm-wait-then-stop",
+                                    "Wait, then stop  ⌘↩",
+                                    true,
+                                    None,
+                                    cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                        this.start(Op::StopWhenIdle, cx);
+                                    }),
+                                    cx,
+                                ))
+                                .child(self.button(
+                                    "confirm-stop-anyway",
+                                    "Stop anyway",
+                                    true,
+                                    Some(gpui::hsla(0. / 360., 0.8, 0.62, 1.)),
+                                    cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                                        this.start(op, cx);
+                                    }),
+                                    cx,
+                                ))
+                                .child(self.button(
+                                    "confirm-cancel",
+                                    "Cancel  esc",
+                                    true,
+                                    None,
+                                    cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                        this.cancel_pending(cx);
+                                    }),
+                                    cx,
+                                )),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -665,7 +736,12 @@ impl ServerWindow {
 }
 
 impl Render for ServerWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The layer follows the parked question, and then holds the focus that
+        // question needs to be answerable from the keyboard.
+        self.sync_confirm(window, cx);
+        self.modals.hold_focus(window, cx);
+
         let theme = cx.theme().clone();
         let facts = self.render_facts(cx);
         let actions = self.render_actions(cx);
@@ -674,6 +750,13 @@ impl Render for ServerWindow {
         let run = self.render_run(cx);
 
         div()
+            // An id and a tracked focus handle so this window has somewhere to
+            // put focus at rest — which is what a dismissed modal hands it back
+            // to, and what keeps a focused element in the frame at all.
+            .id("server-window")
+            .track_focus(&self.focus_handle)
+            // The containing block the modal positions against.
+            .relative()
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -685,7 +768,6 @@ impl Render for ServerWindow {
             .child(facts)
             .child(actions)
             .child(pipeline)
-            .children(confirm)
             .child(
                 div()
                     .flex_none()
@@ -694,6 +776,9 @@ impl Render for ServerWindow {
                     .bg(theme.border_subtle()),
             )
             .child(run)
+            // Last, over everything: the question is not one of the rows of
+            // this window any more.
+            .children(confirm)
     }
 }
 
@@ -797,6 +882,30 @@ fn pool_hold_line(status: &ServerStatus) -> Option<String> {
     ))
 }
 
+/// Why new work is waiting, when the reason is that the credential broker is
+/// not answering. Same contract again: `None` renders no row at all.
+///
+/// It names the **address**, because that is what the reader checks and
+/// because it is deliberately the advertised one and not loopback — loopback
+/// answers correctly while the bridge gateway is severed. And it says what
+/// dispatching anyway would cost, which is what makes this hold different in
+/// kind from the pool's: a clone inside a VM is redeemed at the broker, so
+/// work started now does not wait, it dies at the clone and is charged an
+/// attempt for it (#1006).
+fn broker_hold_line(status: &ServerStatus) -> Option<String> {
+    let hold = status.broker.as_ref()?;
+    Some(format!(
+        "{} not answering for {} ({} probe(s), last {} ago) — scout and build dispatch \
+         waits for it; every clone inside a VM is redeemed there, so work started now \
+         would die at the clone. {}",
+        hold.address,
+        time::since(hold.since),
+        hold.probes,
+        time::since(hold.last_seen),
+        hold.error
+    ))
+}
+
 /// Work a restart would destroy, with ages — the thing you are about to
 /// interrupt, named.
 fn in_flight_lines(status: &ServerStatus) -> String {
@@ -846,6 +955,7 @@ mod tests {
             github: None,
             update: None,
             pool: None,
+            broker: None,
         }
     }
 

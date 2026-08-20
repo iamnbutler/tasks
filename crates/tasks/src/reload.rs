@@ -1366,6 +1366,7 @@ pub fn render_status(
             out.push_str(&render_github_hold(status, now));
             out.push_str(&render_update_pending(status));
             out.push_str(&render_pool_hold(status, now));
+            out.push_str(&render_broker_hold(status, now));
             out.push_str(&render_images(status));
             out.push_str(&render_in_flight(&status.in_flight, now));
         }
@@ -1437,6 +1438,35 @@ pub fn render_pool_hold(status: &ServerStatus, now: DateTime<Utc>) -> String {
         humanize(now - hold.since),
         hold.observations,
         humanize(now - hold.last_seen),
+    )
+}
+
+/// Why the pipeline is idle, when the reason is that the credential broker is
+/// not answering.
+///
+/// Silent with no hold, for the same reason as the three lines above it. It
+/// names the **address** rather than "the broker", because the address is what
+/// the reader checks and because it is deliberately the advertised one and not
+/// loopback — during the outage this check was written for, loopback answered
+/// correctly while the bridge gateway returned nothing at all.
+///
+/// It also says what dispatching anyway would cost, which is the part that
+/// makes this hold different in kind from the pool's: a clone inside a VM is
+/// redeemed here, so work started now does not wait, it dies at the clone and
+/// is charged an attempt for it (#1006).
+pub fn render_broker_hold(status: &ServerStatus, now: DateTime<Utc>) -> String {
+    let Some(hold) = &status.broker else {
+        return String::new();
+    };
+    format!(
+        "broker   {} not answering for {} ({} probe(s), last {} ago) — scout and build \
+         dispatch waits for it; every clone inside a VM is redeemed there, so work \
+         started now would die at the clone\n         {}\n",
+        hold.address,
+        humanize(now - hold.since),
+        hold.probes,
+        humanize(now - hold.last_seen),
+        hold.error
     )
 }
 
@@ -1597,6 +1627,7 @@ mod tests {
             github: None,
             update: None,
             pool: None,
+            broker: None,
         }
     }
 

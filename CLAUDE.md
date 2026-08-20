@@ -964,9 +964,67 @@ implementation.
   blocking dispatch on a signal that may never arrive. It is narrower than it
   looks, since a boot takes `TASKS_DEFAULT_MODE` (`pause`) and the path that
   carries `play` over is `tasks reload`, a deliberate human act.
+- **A broker outage is the same failure one layer down, and it is the one every
+  other check is blind to.** Every credentialed operation inside a VM is
+  redeemed against the broker — the Anthropic traffic and the **git clone**
+  both — so a broker that stops answering fails every scout and every build at
+  the clone. That is a pre-agent setup failure, which the rule above charges
+  deliberately, so an outage of one minute does not *delay* work, it
+  **destroys** it: on 2026-08-18 19:35–19:36 UTC #996 burned two attempts in 12
+  seconds and #982 burned all three in 27, and both were `rejected` — terminal —
+  for a fault neither task had anything to do with, with ten more queued tasks
+  seconds behind (#1006). Nothing that existed covered it, and the near misses
+  are instructive: `GitHubHealth` is written from calls the *poller* makes, and
+  the poller talks to `api.github.com` directly with the server's own
+  credential, so GitHub read perfectly healthy throughout; `PoolHealth` has the
+  wrong subject, since a pool with free slots and a dead broker allocates
+  happily and then dies at the clone. #939 already settled where the fix goes —
+  **in dispatch, not in classification** — so `broker_health::BrokerHealth` is
+  the fifth standing hold, in memory beside the other three and at the same
+  gates. **The evidence has to be a probe, and that is the one thing genuinely
+  harder here than for `github_health`**: the broker's own successful
+  request-serving would be the honest passive signal, but during an outage
+  there are *no* requests to observe — the runs that would generate them are
+  exactly the runs that are failing, so a passive record is blank at precisely
+  the moment it is needed and its only clearing signal is the thing the outage
+  prevents. It also settles the other half: the clone failure is reported by
+  the supervisor, inside the VM, as prose (`clone: … Empty reply from server`),
+  and deciding a hold off message text is what `FailureClass` and
+  `GhError::is_unavailable` forbid — a host-side probe needs no protocol change
+  and no image rebuild, and it observes the fault *before* a VM is spent on it,
+  which an in-VM signal arriving after the allocation and the teardown
+  structurally cannot. It reuses `doctor::probe_broker_within` rather than
+  growing a second opinion (one implementation with a timeout parameter — three
+  seconds on the dispatch path where a gate awaiting it stalls the tick, ten for
+  a human running a diagnostic), so both of that probe's load-bearing properties
+  carry over: it goes to the **advertised** address and never loopback, because
+  during the firewall outage that produced the check loopback answered a correct
+  401 while the bridge gateway returned zero bytes; and **an unauthenticated 401
+  is the success condition**, since every broker route demands a lease first.
+  Which answers hold is where the three rules bite, and the first one bites
+  harder here than anywhere else in the tree. **`Unreachable` never holds** —
+  apple/container's bridge gateway does not exist until the first container has
+  started, so on a cold machine the advertised address is unreachable as a
+  matter of course, and a hold on it would prevent the container that creates
+  the gateway: the gateway would never appear and the hold would never clear, a
+  gate only the gate itself keeps closed, which is the shape the update watch
+  refuses for a pre-boot image observation. **Only a fresh 401 clears one**, so
+  an unreachable address does not release a hold a silent listener set. **A hold
+  nobody refreshes expires.** And a listener that **spoke HTTP** is deliberately
+  not an outage, whatever it answered — that is the line
+  `GhError::is_unavailable` draws when it excludes every `4xx`, and a hold set
+  on a thing that answers has no clearing signal of its own. `BrokerHealth::unprobed`
+  is `pub` on the `Secrets::for_tests` precedent and is **structural rather than
+  a pre-claimed probe**: claiming one would go quiet for the probe interval and
+  then start probing, so a test that happened to run past it would fail
+  intermittently for a reason it is not about. The strike rule is **not**
+  relaxed, exactly as #939 said. What is deliberately left alone is the
+  aftermath: `rejected` is terminal and there is no endpoint that returns a task
+  from it, so the two tasks that died that night are still there. Whether
+  `rejected` should be reversible, and by whom, is its own decision.
 - **The scout dispatcher asks *what is next* and *may I start it* in one call,
   because a call site is not pinnable by a test of its predicate.** `top_up`
-  reads the four dispatch holds twice — once before its loop for cost, and once
+  reads the five dispatch holds twice — once before its loop for cost, and once
   **per scout**, since each iteration starts a VM and a pause landing mid-pass
   must stop the next one rather than merely the next pass (#948). That
   per-scout read was correct and invisible: deleting it left the whole suite
@@ -1959,7 +2017,7 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `GITHUB_CLONE_URL_BASE` | `https://github.com` | clone URL prefix, and where the broker forwards git traffic. A non-http(s) base (a `file://` mirror) cannot be proxied and clones direct — see the credential-custody rule |
 | `TASKS_BROKER_PORT` | 4801 | credential broker listener — where VMs redeem run leases. A second listener on purpose; the API stays loopback-only |
 | `TASKS_BROKER_BIND` | `0.0.0.0` | broker bind address. All interfaces because the vmnet gateway does not exist until the first container starts; every route demands a live lease |
-| `TASKS_BROKER_ADVERTISE` | `192.168.64.1` | the broker's address as VMs see it (apple/container's bridge gateway) |
+| `TASKS_BROKER_ADVERTISE` | `192.168.64.1` | the broker's address as VMs see it (apple/container's bridge gateway). Also what the dispatch gates probe every 15s to decide the broker hold, and what `tasks doctor` probes — never loopback, which answers correctly while the gateway is severed |
 | `TASKS_BROKER_ANTHROPIC_UPSTREAM` | `https://api.anthropic.com` | where Anthropic traffic forwards — override for tests only |
 | `TASKS_SECRETS_KEY_FILE` | — | unseal-key file, outranking the credential-store item the store header names. The Linux/test path — and **first-class on macOS too, not a fallback**: an access list is granted to an *application*, so an unsigned dev build is a different one on every `cargo build` and a natively-stored key re-prompts each time, which a launchd-started server has no window server to answer |
 | `ORCHESTRATOR_CMD` | `claude --print … --allowedTools Bash(curl:*)` | orchestrator agent command; its permission flags decide what the orchestrator may do. Split shell-style, so quotes group — `--allowedTools "Bash(git log:*)"` survives as one argument, which is the only way a prefix-matched allowlist can be written in verbs (#976) |

@@ -92,13 +92,15 @@ impl Reachability {
     }
 }
 
-/// Which of the three dispatch holds this is.
+/// Which of the four dispatch holds this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoldKind {
     /// An upgrade is half-applied — `make restart` / `make images`.
     Update,
     /// vm-pool has no free slot.
     Pool,
+    /// The credential broker is not answering.
+    Broker,
     /// GitHub is not answering.
     GitHub,
 }
@@ -113,13 +115,14 @@ pub struct Hold {
     ///
     /// `TASKS_UPDATE_HOLD=off` keeps the report and drops the gate, so a
     /// non-binding hold must never be *the reason* nothing is starting — it
-    /// is still said, as a note. The other two have no such switch.
+    /// is still said, as a note. The other three have no such switch.
     pub binding: bool,
 }
 
-/// The three holds, in the order of who can discharge them: the operator's
+/// The four holds, in the order of who can discharge them: the operator's
 /// own two commands first, then a pool that clears when a VM comes back, then
-/// GitHub, which nobody here can hurry.
+/// the broker — which is the operator's again, since it is this server's own
+/// listener — and then GitHub, which nobody here can hurry.
 pub fn observe(status: Option<&ServerStatus>) -> Vec<Hold> {
     let Some(status) = status else {
         return Vec::new();
@@ -154,6 +157,19 @@ pub fn observe(status: Option<&ServerStatus>) -> Vec<Hold> {
                  It clears when a run hands one back; `VM_POOL_MAX_VMS` is \
                  what sizes the pool.",
                 pool.total
+            ),
+            binding: true,
+        });
+    }
+    if let Some(broker) = &status.broker {
+        holds.push(Hold {
+            kind: HoldKind::Broker,
+            sentence: format!(
+                "The credential broker at {} is not answering ({}), and every \
+                 clone inside a VM is redeemed there — so work dispatched now \
+                 would die at the clone and be charged an attempt for it. It \
+                 clears on the first probe that gets a 401.",
+                broker.address, broker.error
             ),
             binding: true,
         });
@@ -689,6 +705,9 @@ mod tests {
             sentence: match kind {
                 HoldKind::Update => "An update is half-applied: run `make restart`.".into(),
                 HoldKind::Pool => "vm-pool has 0 of 6 VMs free; `VM_POOL_MAX_VMS` sizes it.".into(),
+                HoldKind::Broker => {
+                    "the credential broker is not answering; it clears on the next 401.".into()
+                }
                 HoldKind::GitHub => "GitHub is not answering; it clears on the next poll.".into(),
             },
             binding,
@@ -929,15 +948,20 @@ mod tests {
     }
 
     /// The reader's next question is always "what do I run" — every hold
-    /// sentence has to answer it, including the two nobody can hurry.
+    /// sentence has to answer it, including the ones nobody can hurry.
     #[test]
     fn every_hold_sentence_names_its_own_discharge() {
         let status = status_with_every_hold(true);
         let holds = observe(Some(&status));
-        assert_eq!(holds.len(), 3);
+        assert_eq!(holds.len(), 4);
         assert!(holds[0].sentence.contains("make restart"));
         assert!(holds[1].sentence.contains("VM_POOL_MAX_VMS"));
-        assert!(holds[2].sentence.contains("clears on the first poll"));
+        assert!(holds[2].sentence.contains("clears on the first probe"));
+        assert!(holds[3].sentence.contains("clears on the first poll"));
+        // The broker hold names its address, because that is the thing the
+        // reader checks — and because it is deliberately the advertised one
+        // and not loopback (#1006).
+        assert!(holds[2].sentence.contains("192.168.64.1:4801"));
     }
 
     #[test]
@@ -949,7 +973,12 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            vec![HoldKind::Update, HoldKind::Pool, HoldKind::GitHub]
+            vec![
+                HoldKind::Update,
+                HoldKind::Pool,
+                HoldKind::Broker,
+                HoldKind::GitHub
+            ]
         );
     }
 
@@ -959,7 +988,7 @@ mod tests {
         let holds = observe(Some(&status));
         assert!(!holds[0].binding);
         assert!(holds[0].sentence.contains("TASKS_UPDATE_HOLD"));
-        assert!(holds[1].binding && holds[2].binding);
+        assert!(holds[1].binding && holds[2].binding && holds[3].binding);
     }
 
     /// Nothing observed is not a clean bill of health — but it is also not a
@@ -971,7 +1000,7 @@ mod tests {
     }
 
     fn status_with_every_hold(enforced: bool) -> ServerStatus {
-        use tasks_client::api::http::{GitHubHold, InFlight, PoolHold, UpdatePending};
+        use tasks_client::api::http::{BrokerHold, GitHubHold, InFlight, PoolHold, UpdatePending};
         ServerStatus {
             pid: 1,
             started_at: Utc::now(),
@@ -994,6 +1023,13 @@ mod tests {
                 last_seen: Utc::now(),
                 observations: 4,
                 total: 6,
+            }),
+            broker: Some(BrokerHold {
+                since: Utc::now(),
+                last_seen: Utc::now(),
+                probes: 2,
+                address: "192.168.64.1:4801".into(),
+                error: "it accepted the connection and then it returned no bytes at all".into(),
             }),
         }
     }

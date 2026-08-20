@@ -481,7 +481,7 @@ fn free_disk_mb(path: &Path) -> Option<u64> {
 /// the connection and returned nothing at all — so a `127.0.0.1` probe reads
 /// as a pass at exactly the moment the thing is broken.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BrokerProbe {
+pub enum BrokerProbe {
     /// It spoke HTTP and demanded a lease. **This is the success condition**,
     /// which reads backwards to anyone skimming — hence [`Self::describe`]
     /// saying so out loud.
@@ -515,11 +515,29 @@ pub(crate) enum BrokerProbe {
 /// connection and sent nothing" are one HTTP-client error each and are three
 /// different findings here.
 pub(crate) async fn probe_broker(host: &str, port: u16) -> BrokerProbe {
+    probe_broker_within(host, port, PROBE_TIMEOUT).await
+}
+
+/// [`probe_broker`] with the patience named by the caller.
+///
+/// `doctor` keeps the ten seconds a human running a diagnostic wants — the
+/// most patient reading available. [`crate::broker_health`] runs the same probe
+/// on the *dispatch* path, where a gate awaiting it stalls the tick, and asks
+/// for three: a broker that has not answered in three seconds is not one a
+/// clone is going to reach either. One implementation with a parameter rather
+/// than two probes, for the reason `doctor` reads `ImageFreshness` instead of
+/// judging freshness a second time.
+pub async fn probe_broker_within(host: &str, port: u16, timeout: Duration) -> BrokerProbe {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let connect = tokio::net::TcpStream::connect((host, port));
-    let stream = match tokio::time::timeout(PROBE_TIMEOUT, connect).await {
-        Err(_) => return BrokerProbe::Unreachable(format!("no answer from {host}:{port} in 10s")),
+    let stream = match tokio::time::timeout(timeout, connect).await {
+        Err(_) => {
+            return BrokerProbe::Unreachable(format!(
+                "no answer from {host}:{port} in {}s",
+                timeout.as_secs()
+            ));
+        }
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
             return BrokerProbe::Refused(e.to_string());
         }
@@ -540,7 +558,7 @@ pub(crate) async fn probe_broker(host: &str, port: u16) -> BrokerProbe {
         let read = stream.read(&mut buf).await?;
         Ok::<_, std::io::Error>(String::from_utf8_lossy(&buf[..read]).into_owned())
     };
-    match tokio::time::timeout(PROBE_TIMEOUT, exchange).await {
+    match tokio::time::timeout(timeout, exchange).await {
         Err(_) => BrokerProbe::Silent("it accepted the connection and never answered".into()),
         Ok(Err(e)) => BrokerProbe::Silent(e.to_string()),
         Ok(Ok(reply)) => classify_broker_reply(&reply),
@@ -1208,7 +1226,7 @@ fn server_section(config: &crate::run::Config, probe: &ServerProbe) -> Section {
     });
 
     // Each hold already names its own discharge, so they are rendered rather
-    // than summarized. Absence of all three is the ordinary case.
+    // than summarized. Absence of all four is the ordinary case.
     let mut holds = Vec::new();
     if let Some(github) = &status.github {
         holds.push(format!(
@@ -1222,6 +1240,12 @@ fn server_section(config: &crate::run::Config, probe: &ServerProbe) -> Section {
     if let Some(pool) = &status.pool {
         holds.push(format!("vm-pool full (0 of {})", pool.total));
     }
+    if let Some(broker) = &status.broker {
+        holds.push(format!(
+            "broker at {} not answering since {}: {}",
+            broker.address, broker.since, broker.error
+        ));
+    }
     section.push(match holds.is_empty() {
         true => Check::ok("dispatch holds", "none"),
         false => Check::warn(
@@ -1229,7 +1253,8 @@ fn server_section(config: &crate::run::Config, probe: &ServerProbe) -> Section {
             holds.join(" | "),
             "each hold clears on its own terms: a GitHub hold on the next successful \
              poll, an update hold on `make restart` / `make images`, a pool hold on the \
-             next VM handed back",
+             next VM handed back, a broker hold on the next probe that gets a 401 (the \
+             `broker reachable` check above is the same question, asked here directly)",
         ),
     });
     section

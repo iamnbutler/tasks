@@ -186,6 +186,10 @@ pub struct Services {
     /// written by a gate, so a router with no dispatchers behind it would have
     /// nothing to report even if it held one.
     pub pool_health: Option<Arc<crate::pool_health::PoolHealth>>,
+    /// The broker reachability record the two dispatchers write and read.
+    /// Absent for the same reason as `pool_health`, and written the same way —
+    /// only ever by a gate, from a probe it claimed.
+    pub broker_health: Option<Arc<crate::broker_health::BrokerHealth>>,
     /// Who the server's own GitHub credential is, remembered for a while.
     ///
     /// **The only non-`Option` field here**, and deliberately: every other
@@ -236,6 +240,12 @@ impl FromRef<AppState> for Option<Arc<crate::updates::UpdateWatch>> {
 impl FromRef<AppState> for Option<Arc<crate::pool_health::PoolHealth>> {
     fn from_ref(state: &AppState) -> Self {
         state.services.pool_health.clone()
+    }
+}
+
+impl FromRef<AppState> for Option<Arc<crate::broker_health::BrokerHealth>> {
+    fn from_ref(state: &AppState) -> Self {
+        state.services.broker_health.clone()
     }
 }
 
@@ -3494,6 +3504,7 @@ async fn get_status(
     State(github_health): State<Option<Arc<GitHubHealth>>>,
     State(updates): State<Option<Arc<crate::updates::UpdateWatch>>>,
     State(pool_health): State<Option<Arc<crate::pool_health::PoolHealth>>>,
+    State(broker_health): State<Option<Arc<crate::broker_health::BrokerHealth>>>,
 ) -> ApiResult<Json<ServerStatus>> {
     // Through the same watch the dispatchers consult, so `/status` cannot
     // claim a hold they are not honouring.
@@ -3529,6 +3540,14 @@ async fn get_status(
         // few seconds anyway — the staleness window is what keeps this honest
         // if they stop.
         pool: pool_health
+            .and_then(|health| health.hold(Utc::now()))
+            .map(|run| run.to_hold()),
+        // The fourth, on the same terms — and *especially* not probed here: a
+        // broker probe is a TCP round trip to the bridge gateway, so a status
+        // request that made one would let any caller drive traffic at that
+        // address, and a hung broker would hang `/status` with it. `reload`
+        // uses this route as its liveness probe.
+        broker: broker_health
             .and_then(|health| health.hold(Utc::now()))
             .map(|run| run.to_hold()),
     }))
