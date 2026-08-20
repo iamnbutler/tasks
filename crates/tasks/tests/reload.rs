@@ -9,17 +9,31 @@
 //! blocked inside `reload`), so "has it exited" and "has it been reaped"
 //! differ, and the reap races with tokio's SIGCHLD handling.
 //!
-//! Three environment settings are forced on every child, and each closes a
+//! Four environment settings are forced on every child, and each closes a
 //! route by which ambient configuration decides a result here.
 //! `TASKS_DEFAULT_MODE` decides what a boot comes up in. `ORCHESTRATOR_CMD` is
 //! pointed at a stub: the default is `claude`, so on any machine that has it
 //! installed the mode flips below started a live agent turn that the shutdown
 //! then waited out — minutes of wall clock spent on nothing, in a suite about
-//! restarts. And `TASKS_ENV_FILES=off`, because `env_remove` is the *opposite*
+//! restarts. `TASKS_ENV_FILES=off`, because `env_remove` is the *opposite*
 //! of a scrub: these children are real `tasks` processes, `main` runs
 //! `env_file::load()`, and the real environment is the only thing a `.env`
 //! entry loses to — so removing a variable is exactly what lets this
-//! checkout's (gitignored, so per-machine) `.env` decide it.
+//! checkout's (gitignored, so per-machine) `.env` decide it. And
+//! `TASKS_VM_POOL_AUTOSPAWN=off`, because unset it is *derived from where the
+//! binary lives* — and this binary does not always live in the checkout. Under
+//! `make test` it does and the derivation answers `off`, which is why the
+//! omission was invisible; under a relocated `CARGO_TARGET_DIR` (the
+//! orchestrator's verification runs, `ORCHESTRATOR_TARGET_DIR`) it reads as
+//! *installed*, and every `serve` boot here spawned a detached vm-pool onto
+//! the tempdir socket — own process group, no pidfile for [`DataDir`]'s Drop
+//! to find, unique socket so the occupied-socket refusal never fires. One
+//! leaked daemon per boot, ~350 found live on 2026-08-19 (#1038). The leak is
+//! the visible half: the pool also *binds* the socket `serve_command`
+//! deliberately points at nothing, turning "dispatch off" into dispatch
+//! against a real pool in exactly one environment.
+//! [`a_test_server_spawns_no_vm_pool`] pins the property where the filesystem
+//! can see it.
 //!
 //! # The budget
 //!
@@ -143,6 +157,11 @@ fn serve_command(data_dir: &Path, port: u16) -> Command {
         // Without this the `env_remove` below hands the decision to whichever
         // `.env` this checkout happens to have. See the module docs.
         .env(tasks::env_file::DISABLE_VAR, "off")
+        // Unset, this derives from where the binary lives, and under a
+        // relocated target dir a test binary reads as installed — one leaked
+        // detached pool per boot, bound to the socket this command points at
+        // nothing (#1038). See the module docs.
+        .env("TASKS_VM_POOL_AUTOSPAWN", "off")
         .env_remove("GITHUB_TOKEN")
         .env_remove("TASKS_DEFAULT_MODE")
         .stdin(Stdio::null())
@@ -220,6 +239,10 @@ async fn cli_with(
         .env("TASKS_BROKER_PORT", blocking_free_port().to_string())
         .env("TASKS_BROKER_BIND", "127.0.0.1")
         .env(tasks::env_file::DISABLE_VAR, "off")
+        // The successor `reload` spawns inherits this too — the same route
+        // the `.env` switch above rides. Without it, the server a reload
+        // test brings up autospawns a pool the test's server did not (#1038).
+        .env("TASKS_VM_POOL_AUTOSPAWN", "off")
         .env_remove("GITHUB_TOKEN")
         .stdin(Stdio::null());
     match default_mode {
@@ -370,6 +393,51 @@ async fn a_dot_env_decides_the_boot_mode_unless_the_switch_is_off() {
 /// The happy path: one command, and a different process is serving the same
 /// port from the same data dir — with the schema question answered by the new
 /// process rather than assumed.
+/// A test server must bring no vm-pool up with it (#1038). The autospawn
+/// default derives from where the binary lives, so under a relocated
+/// `CARGO_TARGET_DIR` — the orchestrator's verification runs — this binary
+/// reads as installed and an unset `TASKS_VM_POOL_AUTOSPAWN` spawned one
+/// detached pool per `serve` boot: no pidfile for [`DataDir`] to kill, a
+/// unique socket so the occupied-socket refusal never fired, ~350 found live.
+/// The observable is the filesystem, not the env line: an autospawn creates
+/// `vm-pool.log` before it spawns and the pool then binds the socket
+/// (`tests/autospawn.rs` proves that half with the switch `on`). Under a
+/// checkout run the derivation answers `off` anyway, so this is deliberately
+/// a canary for the one environment where the omission bites — which is also
+/// the environment that runs it most.
+#[tokio::test]
+async fn a_test_server_spawns_no_vm_pool() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut child, status) = start_server(dir.path(), port).await;
+
+    // The failed connect that would trigger an autospawn happens at boot,
+    // ahead of /status answering; the grace covers scheduling slop, not a
+    // window we are racing.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let log = dir.path().join("vm-pool.log");
+    let socket = dir.path().join("vm-pool.sock");
+    let spawned_log = log.exists();
+    let bound_socket = socket.exists();
+
+    cli(dir.path(), &["stop"]).await;
+    wait_until_gone(status.pid).await;
+    let _ = child.start_kill();
+
+    assert!(
+        !spawned_log,
+        "the server wrote {} — it autospawned a vm-pool, which nothing in \
+         this suite will ever reap",
+        log.display()
+    );
+    assert!(
+        !bound_socket,
+        "something bound {} — a pool came up on the socket this suite \
+         deliberately points at nothing",
+        socket.display()
+    );
+}
+
 #[tokio::test]
 async fn an_idle_swap_replaces_the_process() {
     let dir = DataDir::new();
