@@ -22,6 +22,28 @@ VM_SUPERVISOR_BIN := target/$(LINUX_TARGET)/release/supervisor
 
 # Where cargo puts debug binaries, honouring an environment override.
 # abspath because tests run with cwd set to their own package.
+#
+# Agent worktrees (.claude/worktrees/*) default to one shared target directory
+# instead of a fresh empty target/ each: external deps compile once ever, and
+# cargo keys workspace crates by package path, so two worktrees' artifacts
+# coexist in the directory rather than thrash — measured, not assumed (a
+# rebuild in worktree A after worktree B built into the same directory is a
+# 0.2s no-op). This cut a fresh worktree's `make test` from ~5.3 to ~3
+# minutes, with every later run incremental. Deliberately NOT the main
+# checkout's target/, which rust-analyzer holds the build-directory lock on —
+# the same contention ORCHESTRATOR_TARGET_DIR exists to avoid — and not a
+# committed .cargo/config.toml, which would redirect the main checkout too.
+# Two worktrees building at the same moment serialize on cargo's lock for the
+# build phase only; the test run holds no lock. Nothing prunes the directory
+# (the ORCHESTRATOR_TARGET_DIR precedent): expect ~4 GB warm, `rm -rf` is the
+# reset. `?=`, so the real environment still outranks it. The HOME guard is
+# the app-install one: with HOME unset the path would collapse to
+# /.cache/..., and falling back to a per-worktree target/ costs only time.
+ifneq (,$(findstring /.claude/worktrees/,$(CURDIR)))
+ifneq (,$(wildcard $(HOME)))
+CARGO_TARGET_DIR ?= $(HOME)/.cache/tasks-worktree-target
+endif
+endif
 CARGO_TARGET_DIR ?= target
 TEST_BIN_DIR := $(abspath $(CARGO_TARGET_DIR)/debug)
 
