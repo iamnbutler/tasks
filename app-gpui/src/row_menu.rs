@@ -368,6 +368,155 @@ fn github_refusal(context: RowContext) -> Option<&'static str> {
     }
 }
 
+// --- the bulk half: the same derivation, folded over a selection ---
+
+/// The verbs the All Tasks selection bar offers, in the order it offers them.
+///
+/// A fixed ordered **subset** of [`entries`], not a second list of verbs: the
+/// legality of each still comes from `entries`, so there is exactly one
+/// derivation of "can this run?" in this module and both surfaces read it.
+///
+/// What is deliberately absent is the sharper half of the change. The three
+/// destructive verbs ([`RowAction::CancelRun`], [`RowAction::CloseCompleted`],
+/// [`RowAction::CloseNotPlanned`]) are left off because the single-row menu's
+/// no-confirmation argument — ledger plus recourse, not pre-approval — is
+/// about one misclick with one undo directly beneath it, and it does not
+/// survive multiplication: twelve closes is twelve undos, and a cancelled
+/// run's VM hours no undo returns. [`RowAction::ReviewSpec`] is absent because
+/// there is one composer and one spec, with no N-shaped place for a verdict to
+/// land, and [`RowAction::OpenOnGitHub`] because N browser tabs from one click
+/// is not a verb anyone asked for.
+pub const BULK_ACTIONS: [RowAction; 6] = [
+    RowAction::Queue,
+    RowAction::Dequeue,
+    RowAction::ScoutNow,
+    RowAction::ApproveSpec,
+    RowAction::RequestBuild,
+    RowAction::Reopen,
+];
+
+/// One bulk verb as the Actions menu will render it: how much of the
+/// selection it can run on, and — when some of it cannot — why not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkItem {
+    pub action: RowAction,
+    pub id: &'static str,
+    pub label: &'static str,
+    /// How many of the selected rows admit this verb.
+    pub eligible: usize,
+    /// How many rows were considered.
+    pub total: usize,
+    /// Why the rest cannot, aggregated by reason in first-seen order. The
+    /// refusals are already `&'static str`, so aggregating them is free.
+    pub refusals: Vec<&'static str>,
+}
+
+impl BulkItem {
+    /// Nothing in the selection admits this verb.
+    pub fn is_disabled(&self) -> bool {
+        self.eligible == 0
+    }
+
+    /// The label as the menu renders it: the verb with its reach, or — when
+    /// nothing is eligible — the reason, in the same shape a greyed row item
+    /// uses.
+    pub fn menu_label(&self) -> String {
+        if self.is_disabled() {
+            return match self.refusals.first() {
+                Some(reason) => format!("{} ({reason})", self.label),
+                // Only reachable with an empty selection, where the bar is not
+                // on screen at all.
+                None => format!("{} (nothing selected)", self.label),
+            };
+        }
+        if self.eligible == self.total {
+            return self.label.to_string();
+        }
+        format!("{} ({} of {})", self.label, self.eligible, self.total)
+    }
+
+    /// What the banner says once the verb has run. A different job from
+    /// [`Self::menu_label`]: that one is a forecast, this one is a receipt,
+    /// and a receipt has to account for the rows that were skipped.
+    pub fn receipt(&self) -> String {
+        let skipped = self.total - self.eligible;
+        if skipped == 0 {
+            return format!("{}: {}", self.label, self.eligible);
+        }
+        format!(
+            "{}: {} · {skipped} skipped ({})",
+            self.label,
+            self.eligible,
+            self.refusals.join(", ")
+        )
+    }
+}
+
+/// Fold [`entries`] over a selection: for each bulk verb, how many of these
+/// rows admit it and why the rest do not.
+///
+/// O(rows x verbs), called on every open of the Actions menu and every render
+/// of the bar's count — cheap over a few hundred rows, and it must not grow a
+/// server round trip.
+pub fn bulk_entries(selection: &[RowContext]) -> Vec<BulkItem> {
+    BULK_ACTIONS
+        .into_iter()
+        .map(|action| {
+            let mut eligible = 0;
+            let mut refusals: Vec<&'static str> = Vec::new();
+            let mut label = "";
+            let mut id = "";
+            for context in selection {
+                let Some(row) = item(*context, action) else {
+                    continue;
+                };
+                label = row.label;
+                id = row.id;
+                match row.disabled {
+                    None => eligible += 1,
+                    Some(reason) => {
+                        if !refusals.contains(&reason) {
+                            refusals.push(reason);
+                        }
+                    }
+                }
+            }
+            // An empty selection still has to name its verb: the labels are
+            // fixed strings on the entry list, so read them off a context that
+            // exists rather than leaving the item blank.
+            if label.is_empty() {
+                let fallback = item(
+                    RowContext {
+                        task_state: TaskState::Backlog,
+                        gh_state: GhState::Open,
+                        has_github_url: true,
+                        spec: None,
+                    },
+                    action,
+                )
+                .expect("every bulk action is a row verb");
+                label = fallback.label;
+                id = fallback.id;
+            }
+            BulkItem {
+                action,
+                id,
+                label,
+                eligible,
+                total: selection.len(),
+                refusals,
+            }
+        })
+        .collect()
+}
+
+/// The bulk item for `action`, or `None` when the bar does not offer it.
+pub fn bulk_item(selection: &[RowContext], action: RowAction) -> Option<BulkItem> {
+    bulk_entries(selection)
+        .into_iter()
+        .find(|item| item.action == action)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,6 +923,233 @@ mod tests {
                     item.menu_label()
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod bulk_tests {
+    use super::*;
+
+    fn context(task_state: TaskState) -> RowContext {
+        RowContext {
+            task_state,
+            gh_state: GhState::Open,
+            has_github_url: true,
+            spec: None,
+        }
+    }
+
+    fn with_spec(task_state: TaskState, spec: SpecQueueStatus) -> RowContext {
+        RowContext {
+            spec: Some(spec),
+            ..context(task_state)
+        }
+    }
+
+    fn bulk(selection: &[RowContext], action: RowAction) -> BulkItem {
+        bulk_item(selection, action).expect("the bar offers this verb")
+    }
+
+    /// The bar's verbs are a subset of the row menu's, in the row menu's own
+    /// order — one list of verbs, not two.
+    #[test]
+    fn the_bar_offers_a_subset_of_the_row_menu_in_its_order() {
+        let all: Vec<RowAction> = entries(context(TaskState::Backlog))
+            .into_iter()
+            .filter_map(|entry| match entry {
+                RowEntry::Item(item) => Some(item.action),
+                RowEntry::Separator => None,
+            })
+            .collect();
+        let bar: Vec<RowAction> = BULK_ACTIONS.into_iter().collect();
+        for action in &bar {
+            assert!(all.contains(action), "{action:?} is not a row verb");
+        }
+        let positions: Vec<usize> = bar
+            .iter()
+            .map(|action| all.iter().position(|other| other == action).unwrap())
+            .collect();
+        let mut sorted = positions.clone();
+        sorted.sort_unstable();
+        assert_eq!(positions, sorted, "the bar reorders the row menu");
+    }
+
+    /// The sharper half of this change, and the property that has to survive
+    /// somebody adding a verb later: nothing the bar offers is destructive.
+    /// The single-row menu's no-confirmation argument is about one misclick
+    /// with one undo beneath it, and it does not survive multiplication.
+    #[test]
+    fn every_offered_verb_is_non_destructive() {
+        // Read off `entries` rather than restated, so a verb that *becomes*
+        // destructive later fails here too.
+        let destructive: Vec<RowAction> = entries(context(TaskState::Scouting))
+            .into_iter()
+            .filter_map(|entry| match entry {
+                RowEntry::Item(item) if item.destructive => Some(item.action),
+                _ => None,
+            })
+            .collect();
+        for action in BULK_ACTIONS {
+            assert!(
+                !destructive.contains(&action),
+                "{action:?} is destructive and must not be offered in bulk"
+            );
+        }
+    }
+
+    /// Named individually as well, because the exclusions *are* the
+    /// deliverable: these five are decisions, not an abbreviation.
+    #[test]
+    fn the_named_exclusions_stay_excluded() {
+        for action in [
+            RowAction::CancelRun,
+            RowAction::CloseCompleted,
+            RowAction::CloseNotPlanned,
+            RowAction::ReviewSpec,
+            RowAction::OpenOnGitHub,
+        ] {
+            assert!(
+                !BULK_ACTIONS.contains(&action),
+                "{action:?} must not reach the bulk bar"
+            );
+            assert!(bulk_item(&[context(TaskState::Backlog)], action).is_none());
+        }
+    }
+
+    /// Partial legality is the normal case, and the count is what says so.
+    #[test]
+    fn a_verb_counts_the_rows_that_admit_it() {
+        let selection = [
+            context(TaskState::Backlog),
+            context(TaskState::Backlog),
+            context(TaskState::Queued),
+        ];
+        let queue = bulk(&selection, RowAction::Queue);
+        assert_eq!((queue.eligible, queue.total), (2, 3));
+        assert_eq!(queue.menu_label(), "Add to Queue (2 of 3)");
+        assert!(!queue.is_disabled());
+    }
+
+    /// A verb the whole selection admits does not shout a fraction at you.
+    #[test]
+    fn a_wholly_eligible_verb_reads_as_the_plain_verb() {
+        let selection = [context(TaskState::Backlog), context(TaskState::Backlog)];
+        assert_eq!(
+            bulk(&selection, RowAction::Queue).menu_label(),
+            "Add to Queue"
+        );
+    }
+
+    /// Nothing eligible is greyed with a reason, exactly as a row item is —
+    /// a dead item with no answer is what this shape exists to prevent.
+    #[test]
+    fn a_verb_nothing_admits_says_why() {
+        let selection = [context(TaskState::Done), context(TaskState::Done)];
+        let queue = bulk(&selection, RowAction::Queue);
+        assert!(queue.is_disabled());
+        assert_eq!(queue.menu_label(), "Add to Queue (this task is done)");
+    }
+
+    /// Refusals aggregate by reason, in first-seen order, without repeats.
+    #[test]
+    fn refusals_aggregate_by_reason_in_first_seen_order() {
+        let selection = [
+            context(TaskState::Scouting),
+            context(TaskState::Done),
+            context(TaskState::Scouting),
+        ];
+        let queue = bulk(&selection, RowAction::Queue);
+        assert_eq!(queue.refusals, ["a scout is running", "this task is done"]);
+    }
+
+    /// The receipt is a different sentence from the forecast: it accounts for
+    /// what was skipped and why.
+    #[test]
+    fn the_receipt_accounts_for_the_skipped_rows() {
+        let selection = [
+            context(TaskState::Backlog),
+            context(TaskState::Backlog),
+            context(TaskState::Backlog),
+            context(TaskState::Queued),
+            context(TaskState::Done),
+        ];
+        let queue = bulk(&selection, RowAction::Queue);
+        assert_eq!(
+            queue.receipt(),
+            "Add to Queue: 3 · 2 skipped (already queued, this task is done)"
+        );
+    }
+
+    /// Nothing skipped, nothing to explain.
+    #[test]
+    fn a_clean_run_reports_only_the_count() {
+        let selection = [context(TaskState::Backlog), context(TaskState::Backlog)];
+        assert_eq!(
+            bulk(&selection, RowAction::Queue).receipt(),
+            "Add to Queue: 2"
+        );
+    }
+
+    /// The legality is `entries`' and not a second opinion: every bulk item's
+    /// eligible count is exactly the number of rows the row menu would enable.
+    #[test]
+    fn eligibility_is_the_row_menus_own() {
+        let selection = [
+            context(TaskState::Backlog),
+            context(TaskState::Queued),
+            with_spec(TaskState::InReview, SpecQueueStatus::PendingReview),
+            with_spec(TaskState::ReadyToBuild, SpecQueueStatus::Approved),
+            context(TaskState::Done),
+        ];
+        for bulk in bulk_entries(&selection) {
+            let expected = selection
+                .iter()
+                .filter(|context| {
+                    item(**context, bulk.action).is_some_and(|row| row.disabled.is_none())
+                })
+                .count();
+            assert_eq!(bulk.eligible, expected, "{:?}", bulk.action);
+        }
+    }
+
+    /// An empty selection still names its verbs — the bar is not on screen
+    /// then, but a menu built from a stale selection must not render blanks.
+    #[test]
+    fn an_empty_selection_still_names_every_verb() {
+        for bulk in bulk_entries(&[]) {
+            assert!(!bulk.label.is_empty(), "{:?}", bulk.action);
+            assert!(!bulk.id.is_empty(), "{:?}", bulk.action);
+            assert!(bulk.is_disabled());
+            assert_eq!(
+                bulk.menu_label(),
+                format!("{} (nothing selected)", bulk.label)
+            );
+        }
+    }
+
+    /// Reopen is never greyed on a row, so it is never greyed in bulk either.
+    #[test]
+    fn reopen_is_eligible_for_every_selection() {
+        let selection = [
+            context(TaskState::Done),
+            context(TaskState::Rejected),
+            context(TaskState::Scouting),
+        ];
+        let reopen = bulk(&selection, RowAction::Reopen);
+        assert_eq!(reopen.eligible, 3);
+        assert!(reopen.refusals.is_empty());
+    }
+
+    /// The labels are the row menu's own, so the two surfaces cannot drift
+    /// into calling one verb two things.
+    #[test]
+    fn the_labels_are_the_row_menus() {
+        let selection = [context(TaskState::Backlog)];
+        for bulk in bulk_entries(&selection) {
+            let row = item(context(TaskState::Backlog), bulk.action).unwrap();
+            assert_eq!(bulk.label, row.label);
+            assert_eq!(bulk.id, row.id);
         }
     }
 }

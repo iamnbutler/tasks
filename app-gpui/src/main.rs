@@ -17,6 +17,7 @@ mod rail;
 mod repo_composer;
 mod row_menu;
 mod sections;
+mod selection;
 mod server;
 mod server_window;
 mod state;

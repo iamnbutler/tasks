@@ -11,11 +11,11 @@
 //! in what order.
 
 use gpui::prelude::*;
-use gpui::{div, px, Context, SharedString};
+use gpui::{div, px, App, Context, SharedString};
 use gpuikit::elements::context_menu::context_menu;
 use gpuikit::elements::tooltip::tooltip;
 use gpuikit::theme::{ActiveTheme, Themeable};
-use tasks_client::api::models::{Task, TaskState};
+use tasks_client::api::models::{Task, TaskId, TaskState};
 
 use crate::components::{status_badge, task_state_color, title_case};
 use crate::projects::{self, ProjectFilter};
@@ -55,6 +55,17 @@ fn archive<'a>(
 }
 
 impl Workspace {
+    /// The rows the catalog is showing, in the order it shows them.
+    ///
+    /// Goes through the same [`archive`] the rows do, so the selection and the
+    /// list have one source for the visible order — a second derivation is how
+    /// a sweep comes to disagree with what is on screen.
+    pub(crate) fn visible_task_ids(&self, cx: &App) -> Vec<TaskId> {
+        let state = self.app_state.read(cx);
+        let (visible, _) = archive(&state.tasks, self.show_done, &self.project_filter);
+        visible.into_iter().map(|task| task.id.clone()).collect()
+    }
+
     pub(crate) fn render_tasks(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let state = self.app_state.read(cx);
@@ -82,6 +93,8 @@ impl Workspace {
             .collect();
         let empty = rows.is_empty() && state.loaded;
         let show_done = self.show_done;
+        let ticked_count = self.task_selection.len();
+        let any_ticked = ticked_count > 0;
         // `state` is not read past here, so the diagnosis — which reads both
         // entities and then wants `cx` mutably for its button — is free to
         // take over.
@@ -93,6 +106,9 @@ impl Workspace {
             .flex()
             .flex_col()
             .size_full()
+            // The selection bar is absolutely positioned; without this it
+            // measures against an ancestor and lands somewhere else.
+            .relative()
             .child(
                 div()
                     .id("tasks-list")
@@ -126,6 +142,7 @@ impl Workspace {
                     .children(rows.into_iter().map(
                         |(id, number, title, task_state, updated, repo)| {
                             let is_selected = selected.as_ref() == Some(&id);
+                            let is_ticked = self.task_selection.contains(&id);
                             let color = task_state_color(task_state);
                             let row = div()
                                 // Keyed by task, not by index: with rows
@@ -143,6 +160,10 @@ impl Workspace {
                                 .py(px(4.))
                                 .rounded(px(5.))
                                 .cursor_pointer()
+                                // The reveal needs a *group*: an `.invisible()`
+                                // box with `.hover(visible)` only ever reacts
+                                // to its own 16px, which is the wrong 16px.
+                                .group(SharedString::from(format!("task-row-{id}")))
                                 .when(!is_selected, |el| {
                                     let hover_bg = theme.surface_secondary();
                                     el.hover(move |el| el.bg(hover_bg))
@@ -150,10 +171,64 @@ impl Workspace {
                                 .when(is_selected, |el| el.bg(theme.surface_tertiary()))
                                 .on_click(cx.listener({
                                     let id = id.clone();
-                                    move |this, _event, _window, cx| {
-                                        this.select_task(id.clone(), cx);
+                                    move |this, event: &gpui::ClickEvent, _window, cx| {
+                                        // ⇧ and ⌘ on the row body are the
+                                        // shorthand for sweep and toggle; a
+                                        // plain click still navigates.
+                                        let modifiers = event.modifiers();
+                                        if modifiers.shift {
+                                            this.extend_task_tick(id.clone(), cx);
+                                        } else if modifiers.secondary() {
+                                            this.toggle_task_tick(id.clone(), cx);
+                                        } else {
+                                            this.select_task(id.clone(), cx);
+                                        }
                                     }
                                 }))
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("tick-{id}")))
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .size(px(16.))
+                                        .rounded(px(4.))
+                                        .border_1()
+                                        .border_color(if is_ticked {
+                                            theme.accent()
+                                        } else {
+                                            theme.border_secondary()
+                                        })
+                                        .when(is_ticked, |el| el.bg(theme.accent()))
+                                        // Invisible rather than absent, and
+                                        // visible for every row once anything
+                                        // is ticked, so the column's width
+                                        // never moves under the pointer.
+                                        .when(!is_ticked && !any_ticked, |el| {
+                                            el.invisible().group_hover(
+                                                SharedString::from(format!("task-row-{id}")),
+                                                |el| el.visible(),
+                                            )
+                                        })
+                                        .on_click(cx.listener({
+                                            let id = id.clone();
+                                            move |this, event: &gpui::ClickEvent, _window, cx| {
+                                                // Load-bearing: gpui dispatches
+                                                // clicks in the bubble phase,
+                                                // so without this the row's own
+                                                // handler navigates away from
+                                                // the list you are selecting
+                                                // in.
+                                                cx.stop_propagation();
+                                                if event.modifiers().shift {
+                                                    this.extend_task_tick(id.clone(), cx);
+                                                } else {
+                                                    this.toggle_task_tick(id.clone(), cx);
+                                                }
+                                            }
+                                        })),
+                                )
                                 .child(
                                     div()
                                         .w(px(52.))
@@ -205,6 +280,9 @@ impl Workspace {
             // silent, and this is the sentence that keeps it from being.
             .when(done_count > 0, |el| {
                 el.child(self.render_archive_footer(done_count, show_done, cx))
+            })
+            .when(any_ticked, |el| {
+                el.child(self.render_selection_bar(ticked_count, cx))
             })
     }
 
