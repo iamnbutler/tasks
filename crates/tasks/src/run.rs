@@ -69,7 +69,7 @@ use crate::github::{GhError, GitHubClient, IntakeFilter, PrState};
 use crate::github_health::{GitHubHealth, Transition};
 use crate::models::{
     Actor, Capability, CharterLevel, ChatRole, CloseReason, DecisionAction, DecisionInput,
-    DecisionState, GhState, Mode, Project, Spec, TaskId, TaskState,
+    DecisionState, GhState, Mode, Project, Spec, TaskId, TaskState, WorkerStatus,
 };
 use crate::orchestrator::{self, Orchestrator, OrchestratorConfig};
 use crate::protocol::TasksProtocol;
@@ -132,6 +132,31 @@ const DEFAULT_ORCHESTRATOR_WORKTREE_DIR: &str = "verify-worktree";
 const DEFAULT_ORCHESTRATOR_TARGET_BUDGET_GB: u64 = 20;
 /// How often the orchestrator loop checks for unanswered input turns.
 const ORCHESTRATOR_TICK: Duration = Duration::from_secs(1);
+/// Default agent command for worker runs (#1053). stream-json for the same
+/// reason the orchestrator's is: the result record is the report and the
+/// deltas are the salvage of a run that dies.
+///
+/// **No `curl`, deliberately, and it is the load-bearing omission**: a local
+/// process with no `X-Tasks-Actor` header is attributed as the *human*, whom
+/// the charter never gates — so a worker that can reach the API is a route
+/// around every capability the orchestrator lacks, `build-now` included.
+/// "The prompt says report-only" is not enforcement; the allowlist is. It is
+/// spelled in verbs (`Bash(git fetch:*)`, not `Bash(git:*)`, which would hand
+/// the worker `git push` along with the fetch), and the quoted grouping is
+/// what [`crate::orchestrator::split_command`] exists to preserve (#976).
+pub(crate) const DEFAULT_WORKER_CMD: &str = "claude --print --output-format stream-json --verbose \
+     --include-partial-messages \
+     --allowedTools \"Bash(git fetch:*),Bash(git worktree:*),Bash(git reset:*),\
+Bash(git clean:*),Bash(git checkout:*),Bash(git merge:*),Bash(git merge-tree:*),\
+Bash(git log:*),Bash(git diff:*),Bash(git status:*),Bash(git show:*),\
+Bash(git rev-parse:*),Bash(git branch:*),Bash(cargo:*),Bash(make:*)\"";
+/// Budget for one worker run. An hour, not the orchestrator's fifteen
+/// minutes: the whole point of the lane is that a suite run no longer has to
+/// fit inside the turn the human is waiting behind — this is the "bigger
+/// budget, not a smaller one" consequence named in #1053.
+const DEFAULT_WORKER_TIMEOUT_SECS: u64 = 3600;
+/// How often the worker lane checks for queued jobs.
+const WORKER_TICK: Duration = Duration::from_secs(1);
 /// Debounce for pipeline-event nudges: after the first nudge-worthy event,
 /// wait for this much quiet so a burst (a poller ingesting ten issues, a
 /// scout finishing + its spec landing) becomes ONE event turn — every nudge
@@ -355,6 +380,13 @@ pub struct Config {
     /// shape. The *report* half is deliberately not switchable: a directory
     /// that grows silently is exactly what #1010 was.
     pub orchestrator_target_budget_gb: u64,
+    /// Agent command for worker runs (`WORKER_CMD`, #1053). The default has
+    /// no `curl` and no push — see [`DEFAULT_WORKER_CMD`] for why that is the
+    /// load-bearing omission.
+    pub worker_cmd: String,
+    /// Budget for one worker run (`WORKER_TIMEOUT_SECS`), measured on both
+    /// clocks like every other run budget — see [`crate::deadline`].
+    pub worker_timeout: Duration,
     /// Whether the update watch gates new dispatch (`TASKS_UPDATE_HOLD`,
     /// default on). Off, what is pending is still reported in `/status`; only
     /// the dispatchers stop listening. See [`crate::updates`].
@@ -455,6 +487,12 @@ impl Config {
                 "a number of gigabytes (0 to report without reclaiming)",
                 DEFAULT_ORCHESTRATOR_TARGET_BUDGET_GB,
             )?,
+            worker_cmd: env_string("WORKER_CMD").unwrap_or_else(|| DEFAULT_WORKER_CMD.into()),
+            worker_timeout: Duration::from_secs(parse_env(
+                "WORKER_TIMEOUT_SECS",
+                "a number of seconds",
+                DEFAULT_WORKER_TIMEOUT_SECS,
+            )?),
             update_hold: {
                 let raw = env_string("TASKS_UPDATE_HOLD");
                 crate::updates::parse_enabled(raw.as_deref()).map_err(|_| ConfigError::Invalid {
@@ -898,6 +936,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     let resumed = resume_in_flight(&store, &config, &in_flight).await;
     reconcile_startup_except(&store, &resumed).await?;
     report_interrupted_orchestrator_turn(&store).await;
+    report_orphaned_workers(&store).await;
 
     // After reconciliation: until that has run, this process is not yet the
     // owner of the work in the store.
@@ -973,6 +1012,12 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         shutdown_rx.clone(),
     ));
     let orchestrate = tokio::spawn(orchestrator_loop(
+        store.clone(),
+        config.clone(),
+        verify_dir.clone(),
+        shutdown_rx.clone(),
+    ));
+    let workers = tokio::spawn(worker_loop(
         store.clone(),
         config.clone(),
         verify_dir.clone(),
@@ -1055,6 +1100,12 @@ pub async fn run(config: Config) -> Result<(), RunError> {
                         // inside this deadline; severing a proxied stream is
                         // safe — the in-VM supervisors resume from it.
                         ("broker", broker),
+                        // Returns promptly on the flag: a running worker is
+                        // killed with its dropped future, its row concluded
+                        // and its loss reported — two store writes, well
+                        // inside this deadline. Waiting a worker out is not
+                        // an option; its budget is an hour.
+                        ("workers", workers),
                     ],
                 )
                 .await
@@ -1235,6 +1286,47 @@ async fn report_interrupted_orchestrator_turn(store: &Store) {
         .await
     {
         warn!(error = %e, "could not record the interrupted orchestrator turn");
+    }
+}
+
+/// Write off and report the workers a dead process left behind.
+///
+/// The orchestrator-turn rule one paragraph up, applied to the other local
+/// child: a worker cannot be reattached, so a `queued` or `running` row at
+/// boot is a run that no longer exists anywhere. Each becomes a `[worker]`
+/// event turn — #1053's rule that a worker that dies becomes a report, never
+/// silence — and whatever it streamed before the restart is still on its
+/// transcript. Nothing is redispatched from here: whether the job is still
+/// worth doing is the orchestrator's call on reading the turn.
+async fn report_orphaned_workers(store: &Store) {
+    let orphans = match store
+        .reconcile_orphaned_workers("orphaned by server restart")
+        .await
+    {
+        Ok(orphans) => orphans,
+        Err(e) => {
+            warn!(error = %e, "could not check for orphaned workers");
+            return;
+        }
+    };
+    for worker in orphans {
+        warn!(worker_id = %worker.id, job = %worker.job, "a worker was orphaned by the last shutdown");
+        if let Err(e) = store
+            .append_orchestrator_message(
+                ChatRole::Event,
+                &format!(
+                    "[worker {job}] The worker you dispatched ({id}) was lost to a server \
+                     restart before it finished. It is a local child, so unlike a scout or \
+                     a build there was nothing to reattach to. Whatever it streamed first \
+                     is at GET /workers/{id}/transcript; whether to redispatch is your call.",
+                    job = worker.job,
+                    id = worker.id,
+                ),
+            )
+            .await
+        {
+            warn!(error = %e, worker_id = %worker.id, "could not report the orphaned worker");
+        }
     }
 }
 
@@ -3120,7 +3212,7 @@ pub async fn maintain_verify_dir(
         None => return,
         Some(crate::verify_dir::Notice::Reclaimed(reclaim)) => reclaim.describe(dir.path()),
         Some(crate::verify_dir::Notice::OverBudget { reading, budget }) => format!(
-            "the orchestrator's verification build directory ({}) is {} against a {}              ceiling, and is not being reclaimed while the orchestrator session is              checked out — a human may be building in it. It is reclaimed on the first              pass after the checkout lapses",
+            "the orchestrator's verification build directory ({}) is {} against a {}              ceiling, and is not being reclaimed while it is in use — the orchestrator              session is checked out (a human may be building in it), or a worker is              building in it right now. It is reclaimed on the first pass after the              lane is idle",
             dir.path().display(),
             crate::verify_dir::humanize_bytes(reading.bytes),
             crate::verify_dir::humanize_bytes(budget),
@@ -3161,6 +3253,7 @@ pub async fn orchestrator_loop(
         OrchestratorConfig {
             command: config.orchestrator_cmd.clone(),
             timeout: config.orchestrator_timeout,
+            worker_timeout: config.worker_timeout,
             workdir,
             workdir_is_checkout: config.orchestrator_workdir.is_some(),
             target_dir: verify_dir.as_ref().map(|dir| dir.path().to_path_buf()),
@@ -3198,6 +3291,102 @@ pub async fn orchestrator_loop(
         }
         tokio::select! {
             _ = tokio::time::sleep(ORCHESTRATOR_TICK) => {}
+            _ = shutdown.changed() => return,
+        }
+    }
+}
+
+/// Run queued workers one at a time until `shutdown` flips (#1053).
+///
+/// Serial like the build lane, and for one more reason of its own: the warm
+/// build directory keeps exactly one job's artifacts hot, and two workers
+/// building in it at once would fight over the very thing that makes the lane
+/// affordable. Not mode-gated, like [`orchestrator_loop`]: a worker is the
+/// orchestrator's own labor, and pausing scout/build dispatch is not a reason
+/// to stop verifying or investigating.
+///
+/// A worker is a **local child**, so two rules from the orchestrator's turn
+/// apply verbatim. It does not count toward `InFlight::is_destructible` — a
+/// reload proceeds, the child dies with this process, and the loss is
+/// reported rather than waited out (a run's budget is an hour; no drain can
+/// afford it). And on shutdown the row is concluded *here*, immediately, so
+/// nothing sits `running` with no process behind it.
+pub async fn worker_loop(
+    store: Arc<Store>,
+    config: Config,
+    verify_dir: Option<Arc<crate::verify_dir::VerifyDir>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let worker_config = crate::worker::WorkerConfig {
+        command: config.worker_cmd.clone(),
+        timeout: config.worker_timeout,
+        workdir: config.agent_workdir(),
+        workdir_is_checkout: config.orchestrator_workdir.is_some(),
+        target_dir: verify_dir.as_ref().map(|dir| dir.path().to_path_buf()),
+        worktree_dir: config.orchestrator_worktree_dir(),
+    };
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        match store.claim_next_queued_worker().await {
+            Ok(Some(worker)) => {
+                let id = worker.id.clone();
+                let job = worker.job.clone();
+                let run = crate::worker::run_worker(
+                    &store,
+                    &worker_config,
+                    verify_dir.as_deref(),
+                    worker,
+                );
+                tokio::pin!(run);
+                tokio::select! {
+                    _ = &mut run => {}
+                    _ = shutdown.changed() => {
+                        // Dropping the run kills the child (`kill_on_drop`).
+                        // Conclude the row now — a process that keeps serving
+                        // through the drain must not leave a `running` row
+                        // nothing is following — and say so in the
+                        // conversation, because a worker that dies becomes a
+                        // report, never silence.
+                        if let Err(e) = store
+                            .finish_worker(
+                                &id,
+                                WorkerStatus::Failed,
+                                Some("abandoned by server shutdown"),
+                                None,
+                            )
+                            .await
+                        {
+                            warn!(worker_id = %id, error = %e, "could not conclude the abandoned worker");
+                        }
+                        if let Err(e) = store
+                            .append_orchestrator_message(
+                                ChatRole::Event,
+                                &format!(
+                                    "[worker {job}] The worker you dispatched ({id}) was \
+                                     abandoned by a server shutdown before it finished. \
+                                     Whatever it streamed first is at \
+                                     GET /workers/{id}/transcript; whether to redispatch \
+                                     is your call."
+                                ),
+                            )
+                            .await
+                        {
+                            warn!(worker_id = %id, error = %e, "could not report the abandoned worker");
+                        }
+                        return;
+                    }
+                }
+                // Straight back around: another job may be queued behind this
+                // one, and the claim is what serializes.
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => warn!(error = %e, "could not read the worker queue"),
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(WORKER_TICK) => {}
             _ = shutdown.changed() => return,
         }
     }
@@ -3555,6 +3744,40 @@ mod tests {
     // `Task` left the production half with `next_dispatchable` (#973); the
     // fixtures below still build one.
     use crate::models::{ProjectId, ProjectStatus, Task};
+
+    /// The worker default command is the enforcement of "voice, not
+    /// authority", so its shape is pinned in three ways. The allowlist must
+    /// survive the quote-aware split whole (#976's trap: a shattered
+    /// multi-verb list fails closed and the worker quietly loses the verbs it
+    /// was given); it must carry no `curl`, because an unattributed local
+    /// process writes as the human and API access would be a route around the
+    /// charter; and it must hand out git verbs, never `Bash(git:*)`, which
+    /// would include `git push`.
+    #[test]
+    fn the_worker_default_command_has_no_route_to_the_api_and_no_push() {
+        let words = crate::orchestrator::split_command(DEFAULT_WORKER_CMD);
+        let allow = words
+            .iter()
+            .position(|w| w == "--allowedTools")
+            .map(|i| words[i + 1].as_str())
+            .expect("the default carries an allowlist");
+        // One argument, quotes stripped, spaces inside patterns intact.
+        assert!(allow.contains("Bash(git fetch:*)"), "{allow}");
+        assert!(allow.contains("Bash(cargo:*)"), "{allow}");
+        assert!(allow.contains("Bash(make:*)"), "{allow}");
+        assert!(!allow.contains("curl"), "no route to the API: {allow}");
+        assert!(!allow.contains("push"), "no push verb: {allow}");
+        assert!(
+            !allow.contains("Bash(git:*)"),
+            "verbs, never the whole tool: {allow}"
+        );
+        // The salvage path depends on deltas: without partial messages a
+        // stream-json agent that dies mid-job leaves an empty tail.
+        assert!(
+            words.iter().any(|w| w == "--include-partial-messages"),
+            "{words:?}"
+        );
+    }
 
     /// The autospawn default is derived from where the binary lives, and an
     /// explicit setting beats the derivation in both directions. Garbage is a

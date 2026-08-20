@@ -140,6 +140,11 @@ pub struct OrchestratorConfig {
     /// from the data dir rather than from anything that can fail — the prompt
     /// is what decides whether it is mentioned.
     pub worktree_dir: PathBuf,
+    /// Budget for one worker run (`WORKER_TIMEOUT_SECS`), quoted in the
+    /// delegation text so the prompt never names a budget the lane does not
+    /// have — the same derived-from-the-environment rule as everything else
+    /// the prompt claims.
+    pub worker_timeout: Duration,
     /// Whether the server booted with a GitHub credential.
     ///
     /// Same principle as [`Self::workdir_is_checkout`], applied to the other
@@ -559,7 +564,7 @@ pub struct TurnUsage {
 /// One entry of the `result` record's `modelUsage` map: a model, and the
 /// window it says it has.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ModelReport {
+pub(crate) struct ModelReport {
     /// The map key — the wire id, suffix included.
     id: String,
     /// `canonicalModel`, which is what an `assistant` record's `message.model`
@@ -570,7 +575,7 @@ struct ModelReport {
 }
 
 /// What one line of agent stdout means for the live feed.
-enum StreamLine {
+pub(crate) enum StreamLine {
     /// Assistant text as it's generated (`--include-partial-messages`).
     Delta(String),
     /// A completed assistant turn: its tool invocations (for the feed) and,
@@ -600,7 +605,7 @@ enum StreamLine {
     NotStreamJson,
 }
 
-fn parse_stream_line(line: &str) -> StreamLine {
+pub(crate) fn parse_stream_line(line: &str) -> StreamLine {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return StreamLine::NotStreamJson;
     };
@@ -1380,13 +1385,46 @@ fn workdir_section(is_checkout: bool) -> &'static str {
 ///
 /// (c) is untouched: a green suite still says nothing about whether a pixel
 /// landed.
-fn landing_section(charter: &[CharterEntry], can_verify: bool) -> &'static str {
+fn landing_section(charter: &[CharterEntry], can_verify: bool, delegate: bool) -> &'static str {
     let level = charter
         .iter()
         .find(|e| e.capability == Capability::LandBuilds)
         .map(|e| e.level)
         .unwrap_or(CharterLevel::Off);
     match level {
+        // The delegation arm (#1053): the run still decides the merge, but it
+        // is a worker's to make, not this turn's. What sends a batch to a
+        // human is still unverifiability, not risk — the three carve-outs are
+        // unchanged; only where the (b) run comes from moved.
+        CharterLevel::Live if delegate => {
+            "Landing it is YOURS, and waiting is not the default: merge it this \
+             turn with POST /pull-requests/{number}/merge, and say that you did. \
+             The brief above has already asked the three questions that could \
+             stop you, and they are the whole list: (a) GitHub would refuse the \
+             merge, or reports a check on the head commit that has not gone \
+             green — CI runs this project's suite on every push, `unstable` \
+             means a check FAILED or has not finished and GitHub will not say \
+             which, and nothing will refuse the merge for you, so find out \
+             which it is and stop unless it is green; (b) no passing run backs \
+             it AND you could not obtain one — and under this charter that can \
+             only mean a worker you dispatched came back without one, since a \
+             failing suite fails the build inside the VM and never becomes a \
+             pull request at all, so DISPATCH A WORKER to run it (see the \
+             verification section) rather than handing it over unrun; (c) \
+             nothing runnable here could have checked it — the app-gpui \
+             rendering case. Say which of the three it is rather than \
+             defaulting to caution, and if it is none of them, merge it.\n\n\
+             A batch whose suite passed is not thereby finished with you. That \
+             run tested the branch against its OWN base, and the trunk has moved \
+             since — pull requests land while a queue drains. Two branches can \
+             each be green against their own base and red composed, and nothing \
+             upstream can see that, because the merged result does not exist \
+             until you make it. So when several are waiting, or when one has \
+             sat behind others that landed, dispatch a worker to check them out \
+             together onto current main and run the suite on the composition — \
+             then merge on its report. That run is the one nobody else can \
+             make; the judgment on it stays yours."
+        }
         CharterLevel::Live if can_verify => {
             "Landing it is YOURS, and waiting is not the default: merge it this \
              turn with POST /pull-requests/{number}/merge, and say that you did. \
@@ -1554,7 +1592,13 @@ pub fn command_budget(turn: Duration) -> Duration {
 /// when the next verification arrives, and a bare `git checkout` refuses. A
 /// wedged worktree is worse than a slow one — it means no verification at all,
 /// and carve-out (b) then routes every batch to a human.
-fn verification_section(target_dir: Option<&Path>, worktree: &Path, turn: Duration) -> String {
+fn verification_section(
+    target_dir: Option<&Path>,
+    worktree: &Path,
+    turn: Duration,
+    worker_timeout: Duration,
+    delegate: bool,
+) -> String {
     let Some(dir) = target_dir else {
         return String::new();
     };
@@ -1562,6 +1606,46 @@ fn verification_section(target_dir: Option<&Path>, worktree: &Path, turn: Durati
     let tree = worktree.display();
     let command_secs = command_budget(turn).as_secs();
     let turn_secs = turn.as_secs();
+    if delegate {
+        // #1053: the labor moves to the worker lane; the judgment stays here.
+        // The worktree and build-directory discipline are deliberately NOT
+        // restated — they live in the worker's own server-written prompt, and
+        // one source is the rule.
+        let worker_secs = worker_timeout.as_secs();
+        let worker_command_secs = command_budget(worker_timeout).as_secs();
+        return format!(
+            "You can have this repository's tests run, and a merge decision \
+             should rest on that rather than on a typecheck — but the run is \
+             not yours to make in this turn. DISPATCH A WORKER AND END YOUR \
+             TURN: POST /workers with a short `job` label and a `prompt` \
+             saying what to check out and what to run — PR numbers, branch \
+             names, SHAs, and what to report back. The worker is a fresh \
+             session that knows nothing you do not tell it, but it already \
+             knows this host's verification discipline (the fixed worktree, \
+             the warm build directory, its budgets) from its own prompt, so \
+             yours carries only the job. Its report returns as a \
+             `[worker <job>]` turn you will answer within a tick of your lane \
+             being free; running the suite here instead holds the conversation \
+             the human is waiting behind, which is the failure the worker lane \
+             exists to end.\n\n\
+             The threshold, stated once: DELEGATE ANYTHING THAT COMPILES OR \
+             RUNS A SUITE; KEEP ANYTHING THAT ANSWERS IN SECONDS. A `curl` to \
+             this API, a brief fact, a diff read — those answer in seconds, \
+             and a worker round trip for one of them makes you slower, not \
+             faster. The run worth dispatching is the one nobody upstream can \
+             make: each Builder already ran the suite against its own branch, \
+             so what is unknown is whether those branches still pass COMPOSED \
+             with a trunk that moved under them while they queued — put that \
+             in the job prompt when it is the question.\n\n\
+             Budgets: a worker runs up to {worker_secs}s with a \
+             {worker_command_secs}s per-command ceiling — room for a cold \
+             build and the whole suite, which your own turn ({turn_secs}s, \
+             {command_secs}s per command) does not have. A worker that dies \
+             mid-job still reports what it had streamed, so a dispatch is \
+             never a black hole; workers are serial, so jobs queue behind one \
+             another rather than fighting over the build directory.\n\n"
+        );
+    }
     format!(
         "You can run this repository's tests, and a merge decision should rest \
          on that rather than on a typecheck. The run worth making here is the \
@@ -1735,15 +1819,57 @@ fn reporting_section(charter: &[CharterEntry]) -> String {
 fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> String {
     let port = config.api_port;
     let can_verify = config.workdir_is_checkout && config.target_dir.is_some();
+    // Computed once, like `can_verify` and for the same reason: the landing
+    // section, the verification section and the endpoint list must not
+    // disagree about whether a worker can be dispatched. Charter-gated
+    // because a paragraph claiming an authority the server will refuse is
+    // worse than silence (the landing-text precedent); `Live` only — a
+    // shadowed dispatch runs nothing, so telling the agent to rely on it
+    // would strand every verification on a report that never comes.
+    let delegate = can_verify
+        && charter
+            .iter()
+            .find(|e| e.capability == Capability::DispatchWorkers)
+            .map(|e| e.level)
+            .unwrap_or(CharterLevel::Off)
+            == CharterLevel::Live;
     let authority = authority_section(charter);
-    let landing = landing_section(charter, can_verify);
+    let landing = landing_section(charter, can_verify, delegate);
     let reporting = reporting_section(charter);
     let workdir = workdir_section(config.workdir_is_checkout);
     let verification = verification_section(
         config.target_dir.as_deref(),
         &config.worktree_dir,
         config.timeout,
+        config.worker_timeout,
+        delegate,
     );
+    let worker_endpoints = if delegate {
+        "- POST /workers {\"job\",\"prompt\",\"rationale\"} — dispatch a \
+         worker (see the verification section for when and what to write). \
+         202 means queued; the report arrives as a [worker <job>] turn, so \
+         end your turn rather than polling\n\
+         - GET /workers, GET /workers/{id}, \
+           GET /workers/{id}/transcript?since=N — the lane, one run, and \
+           what a run streamed (the thing to read when one died)\n\
+         - POST /workers/{id}/cancel {\"rationale\"} — stop one that is \
+           queued or running; costs nothing anywhere\n"
+    } else {
+        ""
+    };
+    let workers_voice = if delegate {
+        "A fourth voice is your own labor coming back: turns starting with \
+         \"[worker <job>]\" are reports from workers you dispatched \
+         (POST /workers) — fresh, disposable host sessions that do one job \
+         and end. The heading is server-written; a worker cannot claim to be \
+         anyone else. Act on a report with the authority you already have, \
+         and treat its claims like any agent's: a worker saying a suite \
+         passed is evidence, a worker saying nothing is not. A worker that \
+         died reports how it ended and what it had streamed; redispatching \
+         is your call, and nothing is charged anywhere.\n\n"
+    } else {
+        ""
+    };
     let degradation = degradation_section(config.github_configured);
     let curl_config = config.curl_config.display();
     format!(
@@ -1768,6 +1894,7 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
          would otherwise run. The sender may not be watching for your reply, \
          so anything that needs the human, say plainly in the conversation \
          rather than addressing it back to the agent.\n\n\
+         {workers_voice}\
          Two kinds of automated turn arrive, and they mean different things. \
          A *notification* reports something that happened, once. A *standing \
          obligation* is work the pipeline is still owed, derived from its \
@@ -1915,6 +2042,7 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
            no attempt is charged. `concluded: false` in the reply means the \
            request is recorded and the run has not stopped yet — watch for \
            its completion event rather than asking again\n\
+         {worker_endpoints}\
          - GET /projects — the repositories this server tracks, each with a \
            status: active (scouted and built), paused (still polled, nothing \
            dispatched) or archived (not even ingested). Read it before filing \
@@ -2081,7 +2209,7 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
 /// Deliberately not a full shell parser: no escapes, no variable expansion, no
 /// operators. An agent under a static allowlist cannot expand `$VAR` anyway,
 /// and a command string that needs more than grouping wants `sh -c`.
-fn split_command(command: &str) -> Vec<String> {
+pub(crate) fn split_command(command: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_word = false;
@@ -2310,6 +2438,7 @@ mod tests {
         OrchestratorConfig {
             command: "true".into(),
             timeout: Duration::from_secs(900),
+            worker_timeout: Duration::from_secs(3600),
             workdir: PathBuf::from("/repo"),
             workdir_is_checkout: true,
             target_dir: None,
@@ -2658,16 +2787,17 @@ mod tests {
         // An absent row is `off` — `Store::charter_entry` reads a missing row
         // that way, so the prompt has to as well or the two disagree.
         assert_eq!(
-            landing_section(&[], false),
-            landing_section(&charter(CharterLevel::Off), false)
+            landing_section(&[], false, false),
+            landing_section(&charter(CharterLevel::Off), false, false)
         );
 
         // All three name the three carve-outs, so the standard a batch is
         // judged against does not change with who applies it.
         for section in [
-            landing_section(&charter(CharterLevel::Live), false),
-            landing_section(&charter(CharterLevel::Shadow), false),
-            landing_section(&charter(CharterLevel::Off), false),
+            landing_section(&charter(CharterLevel::Live), false, false),
+            landing_section(&charter(CharterLevel::Live), true, true),
+            landing_section(&charter(CharterLevel::Shadow), false, false),
+            landing_section(&charter(CharterLevel::Off), false, false),
         ] {
             assert!(section.contains("three"), "{section}");
             assert!(
@@ -2865,7 +2995,13 @@ mod tests {
     fn verification_is_described_only_where_it_is_possible() {
         let worktree = Path::new("/state/verify-worktree");
         assert_eq!(
-            verification_section(None, worktree, Duration::from_secs(900)),
+            verification_section(
+                None,
+                worktree,
+                Duration::from_secs(900),
+                Duration::from_secs(3600),
+                false
+            ),
             ""
         );
 
@@ -2873,6 +3009,8 @@ mod tests {
             Some(Path::new("/state/verify-target")),
             worktree,
             Duration::from_secs(900),
+            Duration::from_secs(3600),
+            false,
         );
         assert!(section.contains("/state/verify-target"), "{section}");
         assert!(section.contains("CARGO_TARGET_DIR"), "{section}");
@@ -2957,7 +3095,7 @@ mod tests {
     fn a_host_that_can_run_the_suite_is_told_to_run_it_before_handing_over() {
         let live = landing_charter(CharterLevel::Live);
 
-        let can = landing_section(&live, true);
+        let can = landing_section(&live, true, false);
         assert!(
             !can.contains("nothing re-runs its tests for you"),
             "the claim is false on a host that can verify: {can}"
@@ -2974,8 +3112,108 @@ mod tests {
         // Shadow and Off do not vary with it.
         for level in [CharterLevel::Shadow, CharterLevel::Off] {
             let c = landing_charter(level);
-            assert_eq!(landing_section(&c, true), landing_section(&c, false));
+            assert_eq!(
+                landing_section(&c, true, false),
+                landing_section(&c, false, false)
+            );
+            assert_eq!(
+                landing_section(&c, true, true),
+                landing_section(&c, true, false)
+            );
         }
+    }
+
+    /// #1053: with the worker lane live and a host that can build, the labor
+    /// moves off the orchestrator's own turn. The prompt must say so in every
+    /// generated section at once — a delegation instruction beside a standing
+    /// "run the suite yourself" is the two-sources failure the single
+    /// computed `delegate` exists to prevent — and must say none of it when
+    /// the capability is not `Live`, because telling the agent to rely on a
+    /// dispatch the server will refuse (or shadow into a no-op) strands every
+    /// verification on a report that never comes.
+    #[test]
+    fn a_live_worker_lane_moves_the_suite_off_the_orchestrators_own_turn() {
+        let charter = |worker_level: CharterLevel| {
+            vec![
+                CharterEntry {
+                    capability: crate::models::Capability::LandBuilds,
+                    level: CharterLevel::Live,
+                    daily_limit: None,
+                    updated_at: chrono::Utc::now(),
+                },
+                CharterEntry {
+                    capability: crate::models::Capability::DispatchWorkers,
+                    level: worker_level,
+                    daily_limit: None,
+                    updated_at: chrono::Utc::now(),
+                },
+            ]
+        };
+        let config = OrchestratorConfig {
+            target_dir: Some(PathBuf::from("/state/verify-target")),
+            ..prompt_config()
+        };
+
+        let live = system_prompt(&config, &charter(CharterLevel::Live));
+        assert!(
+            live.contains("DISPATCH A WORKER AND END YOUR TURN"),
+            "{live}"
+        );
+        // The threshold, so "always delegate" cannot be over-applied to
+        // things that answer in seconds.
+        assert!(
+            live.contains("DELEGATE ANYTHING THAT COMPILES OR RUNS A SUITE"),
+            "{live}"
+        );
+        assert!(
+            live.contains("KEEP ANYTHING THAT ANSWERS IN SECONDS"),
+            "{live}"
+        );
+        // The voice, the route, and the worker's real budget.
+        assert!(live.contains("[worker <job>]"), "{live}");
+        assert!(live.contains("POST /workers"), "{live}");
+        assert!(
+            live.contains("3600s"),
+            "the worker budget is quoted: {live}"
+        );
+        // The landing arm sends carve-out (b) through the lane too.
+        assert!(live.contains("DISPATCH A WORKER to run it"), "{live}");
+        // The inline worktree discipline moved to the worker's own prompt;
+        // restating it here would be the second source.
+        assert!(!live.contains("CHECK OUT WHAT YOU ARE VERIFYING"), "{live}");
+        assert!(!live.contains("run the suite yourself"), "{live}");
+
+        // Off and Shadow both fall back to the inline instructions whole —
+        // a shadowed dispatch runs nothing, so it must not be relied on. (The
+        // authority section may still *name* the route while describing the
+        // shadowed capability; what must be gone is the instruction to lean
+        // on it.)
+        for level in [CharterLevel::Off, CharterLevel::Shadow] {
+            let p = system_prompt(&config, &charter(level));
+            assert!(
+                p.contains("CHECK OUT WHAT YOU ARE VERIFYING"),
+                "{level:?}: {p}"
+            );
+            assert!(
+                !p.contains("DISPATCH A WORKER AND END YOUR TURN"),
+                "{level:?}: {p}"
+            );
+            assert!(!p.contains("[worker <job>]"), "{level:?}: {p}");
+        }
+
+        // And a host that cannot build gets no delegation text however live
+        // the capability — the prompt claims only what the environment has.
+        let bare = system_prompt(
+            &OrchestratorConfig {
+                target_dir: None,
+                ..prompt_config()
+            },
+            &charter(CharterLevel::Live),
+        );
+        assert!(
+            !bare.contains("DISPATCH A WORKER AND END YOUR TURN"),
+            "{bare}"
+        );
     }
 
     /// Carve-out (b) asks whether a passing run **backs** the batch, never
@@ -2989,8 +3227,8 @@ mod tests {
     #[test]
     fn no_landing_arm_describes_verification_as_something_the_build_reported() {
         for level in [CharterLevel::Live, CharterLevel::Shadow, CharterLevel::Off] {
-            for can_verify in [true, false] {
-                let section = landing_section(&landing_charter(level), can_verify);
+            for (can_verify, delegate) in [(true, false), (false, false), (true, true)] {
+                let section = landing_section(&landing_charter(level), can_verify, delegate);
                 for forbidden in [
                     "the build reported",
                     "reported a passing test run",
@@ -3017,8 +3255,8 @@ mod tests {
     #[test]
     fn every_landing_arm_says_a_passing_run_does_not_cover_the_composition() {
         for level in [CharterLevel::Live, CharterLevel::Shadow, CharterLevel::Off] {
-            for can_verify in [true, false] {
-                let section = landing_section(&landing_charter(level), can_verify);
+            for (can_verify, delegate) in [(true, false), (false, false), (true, true)] {
+                let section = landing_section(&landing_charter(level), can_verify, delegate);
                 assert!(
                     section.contains("its own base") || section.contains("its OWN base"),
                     "{level:?}/{can_verify}: {section}"
@@ -3045,8 +3283,8 @@ mod tests {
     #[test]
     fn every_landing_arm_asks_what_ci_said_and_not_only_whether_github_would_refuse() {
         for level in [CharterLevel::Live, CharterLevel::Shadow, CharterLevel::Off] {
-            for can_verify in [true, false] {
-                let section = landing_section(&landing_charter(level), can_verify);
+            for (can_verify, delegate) in [(true, false), (false, false), (true, true)] {
+                let section = landing_section(&landing_charter(level), can_verify, delegate);
                 assert!(
                     section.contains("check"),
                     "{level:?}/{can_verify}: (a) is refusal-only: {section}"
@@ -3078,8 +3316,9 @@ mod tests {
     /// agent looking for one is looking for something that cannot exist.
     #[test]
     fn the_live_arms_say_a_failing_suite_never_became_a_pull_request() {
-        for can_verify in [true, false] {
-            let section = landing_section(&landing_charter(CharterLevel::Live), can_verify);
+        for (can_verify, delegate) in [(true, false), (false, false), (true, true)] {
+            let section =
+                landing_section(&landing_charter(CharterLevel::Live), can_verify, delegate);
             assert!(
                 section.contains("never became a pull request")
                     || section.contains("never becomes a pull request"),

@@ -62,6 +62,7 @@ pub mod updates;
 pub mod verify_dir;
 pub mod version;
 pub mod viewer;
+pub mod worker;
 
 pub use tasks_api::{events, models};
 pub use tasks_protocol as protocol;

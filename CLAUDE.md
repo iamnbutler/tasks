@@ -453,11 +453,61 @@ implementation.
   not that it is stronger in kind but that it is the only one that can test the
   **composition** — the branches merged onto a trunk that moved under them while
   they queued, which is the run nothing upstream can make. Carve-out (c) is
-  untouched and still routes to a human. Verifying a composition stays the
-  orchestrator's own work and does **not** become a Builder-shaped VM run: that
-  would need its own run kind, artifact, charter capability and answer to the
-  Scout/Builder barrier, all to deliver what a worktree plus a warm directory
-  deliver in seconds — revisit only if compositions outgrow a 15-minute turn.
+  untouched and still routes to a human. Verifying a composition stays under
+  the orchestrator's own **judgment** and does **not** become a Builder-shaped
+  VM run: that would need its own answer to the Scout/Builder barrier, all to
+  deliver what a worktree plus a warm directory deliver in seconds. The
+  "revisit if compositions outgrow the turn" clause fired (#1053) — for
+  *availability* rather than duration, a turn spent on a suite run being a
+  turn the human waits behind — and what moved was the run, never the
+  judgment: it runs on the worker lane (next bullet), a host process under
+  the orchestrator's own instructions, which is the alternative this bullet
+  was written to defend rather than the VM run it was written against.
+- **The conversation lane is for judgment; labor runs on the worker lane
+  (#1053).** The orchestrator was three jobs multiplexed onto one serial turn
+  lane — judge, laborer, front desk — and the laborer half is what made the
+  front desk unreachable: under load, turns chain nearly back-to-back, so a
+  human message waited out a turn that might spend twelve minutes in cargo
+  before reaching it. `POST /workers {job, prompt, rationale}` (charter:
+  `dispatch_workers`, live, ledgered **store-only** — `applied` by
+  construction, the `enroll_agent` shape) queues a **worker**: a fresh,
+  disposable headless Claude Code session the server spawns **on the host**,
+  one serial lane (`run::worker_loop`), no `--resume` and no context carried
+  between jobs, whose result text returns as a server-written
+  `[worker <job>]` event turn the next tick answers. The generated prompt
+  sections flip to always-delegate with the threshold stated in them —
+  **delegate anything that compiles or runs a suite; keep anything that
+  answers in seconds** — and the delegation text is gated on the charter row
+  being `Live` exactly, because a shadowed dispatch runs nothing and a prompt
+  telling the agent to lean on one strands every verification on a report
+  that never comes. **A worker is a voice, not an authority, and the
+  enforcement is the allowlist, never the prompt**: a local process with no
+  `X-Tasks-Actor` header is attributed as the *human*, whom the charter never
+  gates, so a worker that could reach the API would hand the orchestrator a
+  route around every refusal it has — `build-now` included — by putting the
+  instruction in a job prompt. `DEFAULT_WORKER_CMD` therefore carries **no
+  `curl` and no `git push`**, spelled in verbs and quoted through
+  `split_command` (#976); the worker's own server-written prompt carries the
+  verification discipline (fixed worktree, warm directory, budgets), so the
+  dispatcher's job prompt is only the job. **Output streams and every ending
+  becomes a report**: stdout persists line-by-line to `transcript_lines`
+  (third owner arc — the Scout's NOTES.md argument, #1046), and success,
+  failure, timeout, cancel, shutdown and boot-orphaning each land a turn
+  naming how it ended and carrying the tail of what it streamed — never
+  silence, and **never a strike anywhere**; a failed worker is information
+  and redispatch is the orchestrator's call. Budgets invert deliberately:
+  `WORKER_TIMEOUT_SECS` (3600) is four orchestrator turns, because the whole
+  point is that the suite no longer has to fit inside the turn the human is
+  waiting behind; the suspend rules apply unchanged (a napped host reads
+  `abandoned`, not `timed out`). Two structural consequences. The warm build
+  directory's consumer is now the worker lane, which breaks the "only one
+  loop starts a process in there" argument the reclaim rested on — so
+  `VerifyDir` grew a lane lock: runs hold the read half for their duration,
+  the reclaim takes `try_write` and **skips rather than waits**. And a worker
+  is a local child like the orchestrator's turn, with the same rules: it does
+  not count toward `is_destructible`, a shutdown concludes its row and
+  reports the loss immediately, and a boot writes off whatever a dead process
+  left (`report_orphaned_workers`) as report turns rather than silence.
 - **The warm build directory grew because a fresh worktree is a fresh metadata
   hash, not because anything was kept warm — so what bounds it is a prompt
   sentence first and a reclaim second.** `ORCHESTRATOR_TARGET_DIR` was
@@ -2267,4 +2317,6 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `ORCHESTRATOR_TIMEOUT_SECS` | 900 | budget per orchestrator tick, measured on both clocks (see *Budgets and a host that sleeps*). Claude Code's per-command ceiling is derived as **half** of it (`orchestrator::command_budget`, floor 60s) and set on the child as `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS` — so whatever a command spent, at least that much turn is left to report it in. Bounded above by `OBLIGATION_REMINDER` (30 min) |
 | `ORCHESTRATOR_TARGET_DIR` | `<data dir>/verify-target` | `CARGO_TARGET_DIR` for the orchestrator's own verification, set on that child process and nowhere else, alongside `CARGO_INCREMENTAL=0` and `CARGO_PROFILE_{DEV,TEST}_DEBUG=line-tables-only` (`orchestrator::VERIFICATION_ENV` — `make verify-warm` sets the same three, and a test fails if they drift). Shared and long-lived — the warmth is the value. Its size is on `/status`, `tasks status` and the Server window, and it is bounded by `ORCHESTRATOR_TARGET_BUDGET_GB`. `make verify-warm` primes it. There is no `off`: every value here is a path, so `ORCHESTRATOR_TARGET_DIR=<checkout>/target` is the escape hatch |
 | `ORCHESTRATOR_TARGET_BUDGET_GB` | 20 | ceiling on that directory, past which the orchestrator loop reclaims it in two tiers — every `<profile>/incremental` first (no warmth lost), and only if that is not enough, the directory's contents (**the next verification is cold**, and that is announced on the feed and stays on `/status` for the boot). `0` keeps the report and drops the reclaim, the `TASKS_UPDATE_HOLD=off` shape; the *report* half is deliberately not switchable. The default is a judgement, not a measurement — see the design bullet |
+| `WORKER_CMD` | `claude --print …` with a no-`curl`, no-push allowlist | worker agent command (#1053). The default's omissions are the enforcement: no `Bash(curl:*)` (an unattributed local process writes as the *human*, so API access would be a route around the charter) and no `git push`; verbs, quoted, split by `split_command` |
+| `WORKER_TIMEOUT_SECS` | 3600 | budget per worker run, measured on both clocks (see *Budgets and a host that sleeps*). Four orchestrator turns on purpose — the lane exists so a suite run stops having to fit inside the turn the human is waiting behind. Per-command ceiling is derived as half, like the orchestrator's |
 | `TASKS_UPDATE_HOLD` | `on` | whether new scouts and builds wait while an update is pending — a newer server binary on disk awaiting `make restart`, or a VM image observed running a build older than this server's awaiting `make images`. `off` keeps the `/status` report and drops the gate; anything else refuses to boot |

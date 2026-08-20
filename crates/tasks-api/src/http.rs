@@ -440,6 +440,26 @@ pub struct SendMessage {
     pub content: String,
 }
 
+/// Body of `POST /workers` — dispatch a worker run onto the host worker lane.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DispatchWorkerRequest {
+    /// Short label naming the job. It heads the report turn
+    /// (`[worker <job>]`), so it is what the report's words are attributed
+    /// to; chosen by the dispatcher, validated by the server.
+    pub job: String,
+    /// The job itself, free text — what to check out, what to run, what to
+    /// report. The worker already knows the host's verification discipline
+    /// (the fixed worktree, the warm build directory, its budgets) from its
+    /// own server-written prompt; this is the half only the dispatcher knows.
+    pub prompt: String,
+    /// Why this job, now. Required of the orchestrator; lands on the
+    /// decision row.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
 /// Body of `POST /agents` — mint an enrollment code for an external agent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnrollAgentRequest {

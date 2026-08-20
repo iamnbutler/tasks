@@ -31,11 +31,11 @@ use tasks_api::http::DecisionReconciliation;
 use tasks_api::http::{
     AbandonPullRequest, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelAllResponse,
     CancelRunRequest, CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject,
-    EditIssueRequest, EnrollAgentRequest, EnrollAgentResponse, ErrorResponse, GitHubHold,
-    LabelInfo, MergePullRequest, ModeResponse, RejectedBundle, ReopenTaskRequest, ReorderQueue,
-    ReorderSpecQueue, RetargetPullRequest, ReviewCommentRequest, ReviewRequest, RevokeAgentRequest,
-    ScoutRequest, SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode,
-    SetProjectStatus, SettleDecisionRequest, ShadowAck, Viewer,
+    DispatchWorkerRequest, EditIssueRequest, EnrollAgentRequest, EnrollAgentResponse,
+    ErrorResponse, GitHubHold, LabelInfo, MergePullRequest, ModeResponse, RejectedBundle,
+    ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, RetargetPullRequest, ReviewCommentRequest,
+    ReviewRequest, RevokeAgentRequest, ScoutRequest, SendMessage, ServerStatus, SetCharter,
+    SetLabelsRequest, SetMode, SetProjectStatus, SettleDecisionRequest, ShadowAck, Viewer,
 };
 
 use crate::bundles::RejectedBundles;
@@ -47,7 +47,7 @@ use crate::models::{
     CloseReason, Complexity, Decision, DecisionAction, DecisionInput, DecisionState, Directions,
     GhState, Mode, OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId, ProjectStatus,
     RunKind, ScoutNotes, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueItem,
-    SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner,
+    SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner, Worker, WorkerId,
 };
 use crate::store::{
     ACTOR_HEADER, AGENT_HEADER, ActorClaim, MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store,
@@ -392,6 +392,17 @@ fn routes(store: Arc<Store>, services: Services) -> Router {
         .route(
             "/builds/{build_id}/transcript/stream",
             get(stream_build_transcript),
+        )
+        .route("/workers", get(list_workers).post(dispatch_worker))
+        .route("/workers/{worker_id}", get(get_worker))
+        .route("/workers/{worker_id}/cancel", post(cancel_worker))
+        .route(
+            "/workers/{worker_id}/transcript",
+            get(list_worker_transcript),
+        )
+        .route(
+            "/workers/{worker_id}/transcript/stream",
+            get(stream_worker_transcript),
         )
         .route(
             "/orchestrator/messages",
@@ -2307,6 +2318,12 @@ async fn cancel_run(
             .cancel_queued_build(&BuildId::from_raw(id.to_string()), &request.exit_reason())
             .await?;
     }
+    // A queued worker is the same case one lane over.
+    if kind == RunKind::Worker {
+        store
+            .cancel_queued_worker(&WorkerId::from_raw(id.to_string()), &request.exit_reason())
+            .await?;
+    }
 
     let deadline = tokio::time::Instant::now() + CANCEL_SETTLE;
     let (concluded, status) = settle(store, kind, id, deadline).await?;
@@ -2503,6 +2520,16 @@ async fn settle(
                 (
                     build.status.is_terminal(),
                     build.status.as_str().to_string(),
+                )
+            }
+            RunKind::Worker => {
+                let worker = store
+                    .worker(&WorkerId::from_raw(id.to_string()))
+                    .await?
+                    .ok_or_else(|| ApiError::NotFound(format!("worker {id}")))?;
+                (
+                    worker.status.is_terminal(),
+                    worker.status.as_str().to_string(),
                 )
             }
         };
@@ -2966,7 +2993,8 @@ async fn look_up_artifact(
         | DecisionAction::CancelRun
         | DecisionAction::SettleDecision
         | DecisionAction::EnrollAgent
-        | DecisionAction::RevokeAgent => (
+        | DecisionAction::RevokeAgent
+        | DecisionAction::DispatchWorker => (
             "unknown",
             serde_json::Value::Null,
             "this action never reaches another system, so it has no artifact to find —              a pending row here is a bug, not a window"
@@ -3624,6 +3652,119 @@ async fn revoke_agent(
     Ok(Json(enrollment).into_response())
 }
 
+// --- workers (#1053) ---
+
+/// `POST /workers` — dispatch a worker run onto the host worker lane.
+///
+/// 202: the row is queued; the worker lane claims it in order and the result
+/// comes back as a `[worker <job>]` event turn in the conversation — there is
+/// nothing to poll for here, which is the point: the dispatcher's next move
+/// is to end its turn.
+///
+/// The ledger row is written after the row rather than inside it, the
+/// `enroll_agent` shape: dispatching is trivially reversible (cancel), so the
+/// row is audit, not authorization, and it is store-only — `applied` by
+/// construction, since nothing here reaches another system. What `authorize`
+/// puts ahead of the dispatch is the part that must refuse first: the charter
+/// level and the rationale.
+async fn dispatch_worker(
+    State(store): State<Arc<Store>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<DispatchWorkerRequest>,
+) -> ApiResult<Response> {
+    let actor = actor_of(&store, &headers)?;
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    let authority = authorize(
+        &store,
+        &decision,
+        Capability::DispatchWorkers,
+        DecisionAction::DispatchWorker,
+    )
+    .await?;
+    if authority == Authority::Shadow {
+        let seq = store
+            .record_decision(
+                "worker",
+                body.job.trim(),
+                DecisionAction::DispatchWorker,
+                decision,
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "no worker was dispatched"));
+    }
+    let worker = store.create_worker(&body.job, &body.prompt).await?;
+    if actor == Actor::Orchestrator {
+        store
+            .record_decision(
+                "worker",
+                worker.id.as_str(),
+                DecisionAction::DispatchWorker,
+                decision,
+                true,
+            )
+            .await?;
+    }
+    store
+        .append_event(EventPayload::Note {
+            source: WORKER_SOURCE.into(),
+            message: format!(
+                "worker {} (\"{}\") dispatched by {}",
+                worker.id,
+                worker.job,
+                actor.as_str()
+            ),
+        })
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(worker)).into_response())
+}
+
+/// `source` on the worker lane's event-feed breadcrumbs.
+const WORKER_SOURCE: &str = "worker";
+
+/// Workers, newest first — the lane's queue and its history.
+async fn list_workers(State(store): State<Arc<Store>>) -> ApiResult<Json<Vec<Worker>>> {
+    Ok(Json(store.list_workers(100).await?))
+}
+
+async fn get_worker(
+    State(store): State<Arc<Store>>,
+    Path(worker_id): Path<String>,
+) -> ApiResult<Json<Worker>> {
+    let id = WorkerId::from_raw(worker_id);
+    store
+        .worker(&id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound(format!("worker {id}")))
+}
+
+/// `POST /workers/{worker_id}/cancel` — stop a worker that is queued or
+/// running, under `cancel_runs` like every other run.
+async fn cancel_worker(
+    State(store): State<Arc<Store>>,
+    Path(worker_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<CancelRunRequest>>,
+) -> ApiResult<Response> {
+    let id = WorkerId::from_raw(worker_id);
+    let worker = store
+        .worker(&id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("worker {id}")))?;
+    if worker.status.is_terminal() {
+        return Err(ApiError::Conflict(format!(
+            "worker {id} is {} — it has already concluded",
+            worker.status.as_str()
+        )));
+    }
+    cancel_run(&store, &headers, RunKind::Worker, id.as_str(), body).await
+}
+
 /// The conversation, always bounded.
 ///
 /// `?since=` catches a client up, `?before=` pages backwards, and neither
@@ -3920,6 +4061,35 @@ async fn session_owner(store: &Store, raw: String) -> ApiResult<TranscriptOwner>
         return Err(ApiError::NotFound(format!("session {session_id}")));
     }
     Ok(TranscriptOwner::Session { session_id })
+}
+
+/// Catch-up read of a worker's streamed output, on the same contract as the
+/// scout and build reads — it is what a dead worker's report turn points at.
+async fn list_worker_transcript(
+    State(store): State<Arc<Store>>,
+    Path(worker_id): Path<String>,
+    Query(query): Query<TranscriptQuery>,
+) -> ApiResult<Json<Vec<TranscriptLine>>> {
+    let owner = worker_owner(&store, worker_id).await?;
+    list_owner_transcript(&store, &owner, query).await
+}
+
+/// SSE tail of a worker's transcript, on the same contract.
+async fn stream_worker_transcript(
+    State(store): State<Arc<Store>>,
+    Path(worker_id): Path<String>,
+    Query(query): Query<TranscriptQuery>,
+) -> ApiResult<Sse<impl Stream<Item = Result<SseEvent, Infallible>> + use<>>> {
+    let owner = worker_owner(&store, worker_id).await?;
+    stream_owner_transcript(&store, owner, query).await
+}
+
+async fn worker_owner(store: &Store, raw: String) -> ApiResult<TranscriptOwner> {
+    let worker_id = WorkerId::from_raw(raw);
+    if store.worker(&worker_id).await?.is_none() {
+        return Err(ApiError::NotFound(format!("worker {worker_id}")));
+    }
+    Ok(TranscriptOwner::Worker { worker_id })
 }
 
 async fn build_owner(store: &Store, raw: String) -> ApiResult<TranscriptOwner> {

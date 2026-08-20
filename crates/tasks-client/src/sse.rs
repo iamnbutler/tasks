@@ -223,6 +223,7 @@ impl TranscriptTail {
         let collection = match self.owner {
             TranscriptOwner::Session { .. } => "sessions",
             TranscriptOwner::Build { .. } => "builds",
+            TranscriptOwner::Worker { .. } => "workers",
         };
         format!(
             "/{collection}/{}/transcript/stream?since={}",
