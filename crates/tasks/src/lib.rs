@@ -52,6 +52,7 @@ mod teardown;
 pub mod transcript;
 pub mod updates;
 pub mod version;
+pub mod viewer;
 
 pub use tasks_api::{events, models};
 pub use tasks_protocol as protocol;

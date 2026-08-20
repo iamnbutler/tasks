@@ -62,12 +62,6 @@ pub(crate) const FONT: &str = "Menlo";
 /// wrap at a comfortable measure instead of spanning a wide window.
 const CHAT_MAX_WIDTH: gpui::Pixels = px(768.);
 
-/// The signed-in human, hardcoded until device-flow login exists: the chat
-/// chip's avatar and where clicking it goes. One place on purpose — login
-/// replaces these two constants and nothing else.
-const GITHUB_PROFILE_URL: &str = "https://github.com/iamnbutler";
-const GITHUB_AVATAR_URL: &str = "https://avatars.githubusercontent.com/u/1714999?v=4";
-
 /// The chip's microphone, inline as SVG bytes: the radix set gpuikit ships
 /// has no mic, and `Image::from_bytes(Svg, …)` renders without an asset
 /// source. Stroke is gruvbox's muted gray, hardcoded because an `img` does
@@ -251,10 +245,17 @@ pub struct Workspace {
     /// repo's tasks below. `true` shows the repo level — entered by the
     /// header's ‹ chevron, left by choosing a repo.
     pub(crate) rail_shows_repos: bool,
-    /// The chat chip's avatar, fetched once off the main thread. `None`
-    /// until it lands (or forever, offline) — the chip renders a quiet
-    /// placeholder circle rather than blocking on it.
+    /// The chat chip's avatar, fetched off the main thread. `None` until it
+    /// lands (or forever, offline, or on a server with no identity to give) —
+    /// the chip renders a quiet placeholder circle rather than blocking on it.
     avatar: Option<std::sync::Arc<gpui::Image>>,
+    /// Which URL [`Self::avatar`] was fetched for, so [`Self::sync_avatar`] is
+    /// idempotent per URL. The observer fires on every notify, and without
+    /// this it would spawn a fetch thread per event.
+    ///
+    /// Also what makes a *changed* URL — a server whose token was rotated to
+    /// another account — clear the stale face rather than keep it.
+    avatar_source: Option<String>,
     /// The rail header's ⋮ menu — the chrome that lost its titlebar slot
     /// (refresh, the Server window). A popover for the same leak reason as
     /// the switcher.
@@ -289,6 +290,7 @@ impl Workspace {
         // re-derive it. `sync` is a no-op unless something actually moved.
         cx.observe(&app_state, |this: &mut Self, _, cx| {
             this.sync_menus(cx);
+            this.sync_avatar(cx);
             cx.notify();
         })
         .detach();
@@ -506,42 +508,6 @@ impl Workspace {
         let feed_list = ListState::new(0, ListAlignment::Top, px(2048.));
         feed_list.set_follow_mode(FollowMode::Tail);
 
-        // The avatar, once, off the main thread. A miss is a permanent
-        // placeholder, not a retry loop — this is chrome, not data.
-        {
-            let (tx, rx) = futures::channel::oneshot::channel::<gpui::Image>();
-            std::thread::Builder::new()
-                .name("tasks-avatar-fetch".into())
-                .spawn(move || {
-                    let Ok(response) = ureq::get(GITHUB_AVATAR_URL).call() else {
-                        return;
-                    };
-                    let mut bytes = Vec::new();
-                    use std::io::Read as _;
-                    if response.into_reader().read_to_end(&mut bytes).is_err() {
-                        return;
-                    }
-                    // GitHub serves avatars as PNG or JPEG depending on the
-                    // upload; sniff rather than trust the URL.
-                    let format = match bytes.first() {
-                        Some(0xFF) => gpui::ImageFormat::Jpeg,
-                        _ => gpui::ImageFormat::Png,
-                    };
-                    tx.send(gpui::Image::from_bytes(format, bytes)).ok();
-                })
-                .expect("spawn avatar-fetch thread");
-            cx.spawn(async move |this, cx| {
-                if let Ok(image) = rx.await {
-                    this.update(cx, |this: &mut Workspace, cx| {
-                        this.avatar = Some(std::sync::Arc::new(image));
-                        cx.notify();
-                    })
-                    .ok();
-                }
-            })
-            .detach();
-        }
-
         Self {
             focus_handle,
             nav: NavHistory::default(),
@@ -578,6 +544,7 @@ impl Workspace {
             project_filter: ProjectFilter::All,
             rail_shows_repos: false,
             avatar: None,
+            avatar_source: None,
             rail_overflow,
             context_popover,
             repo_input,
@@ -668,6 +635,76 @@ impl Workspace {
     pub(crate) fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         self.app_state
             .update(cx, |state, cx| state.set_mode(mode, cx));
+    }
+
+    /// Fetch the chat chip's avatar when the server's answer names a URL this
+    /// has not already fetched.
+    ///
+    /// Runs from the `app_state` observer rather than at construction: the URL
+    /// is no longer a constant, so at construction there is nothing to fetch.
+    /// The observer fires on **every** notify, which is why this is idempotent
+    /// per URL — without the [`Self::avatar_source`] comparison it would spawn
+    /// a fetch thread per event, including on every event of a server with no
+    /// identity to give.
+    ///
+    /// A changed URL — a token rotated to another account — clears the stale
+    /// face before the new one lands, so the chip never shows one account
+    /// while linking to another. That branch is reachable because a settled
+    /// identity is re-asked on an interval; see
+    /// [`crate::identity::should_ask_for_viewer`].
+    ///
+    /// A miss is a permanent placeholder for that URL, not a retry loop —
+    /// this is chrome, not data. `gpui::img` is only ever handed a *decoded*
+    /// image, so a URL that 404s or a dead network falls through to the
+    /// placeholder circle rather than rendering empty.
+    fn sync_avatar(&mut self, cx: &mut Context<Self>) {
+        let url = crate::identity::avatar_url(self.app_state.read(cx).viewer.as_ref());
+        if url == self.avatar_source {
+            return;
+        }
+        // Clear first: whatever is on screen belongs to the previous answer.
+        self.avatar = None;
+        self.avatar_source = url.clone();
+        let Some(url) = url else {
+            return;
+        };
+
+        let (tx, rx) = futures::channel::oneshot::channel::<gpui::Image>();
+        let fetch_url = url.clone();
+        std::thread::Builder::new()
+            .name("tasks-avatar-fetch".into())
+            .spawn(move || {
+                let Ok(response) = ureq::get(&fetch_url).call() else {
+                    return;
+                };
+                let mut bytes = Vec::new();
+                use std::io::Read as _;
+                if response.into_reader().read_to_end(&mut bytes).is_err() {
+                    return;
+                }
+                // GitHub serves avatars as PNG or JPEG depending on the
+                // upload; sniff rather than trust the URL.
+                let format = match bytes.first() {
+                    Some(0xFF) => gpui::ImageFormat::Jpeg,
+                    _ => gpui::ImageFormat::Png,
+                };
+                tx.send(gpui::Image::from_bytes(format, bytes)).ok();
+            })
+            .expect("spawn avatar-fetch thread");
+        cx.spawn(async move |this, cx| {
+            if let Ok(image) = rx.await {
+                this.update(cx, |this: &mut Workspace, cx| {
+                    // Another answer may have landed while this was in
+                    // flight; only the current URL's bytes may be shown.
+                    if this.avatar_source.as_deref() == Some(url.as_str()) {
+                        this.avatar = Some(std::sync::Arc::new(image));
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// Rebuild the menu bar from the facts it depends on, which live in three
@@ -1476,9 +1513,15 @@ impl Workspace {
     /// The chip at the chat's top-right, per the design: the mic (voice mode
     /// with the orchestrator, later — shipped disabled so the slot exists),
     /// a divider, and the signed-in human's avatar, which opens their GitHub
-    /// profile until device-flow login gives it more to do.
+    /// profile.
+    ///
+    /// Who that is comes from `GET /viewer` — the server's own credential —
+    /// and is **inert in every state but the one with a real identity behind
+    /// it**: no pointer, no click, and the placeholder keeps its footprint so
+    /// nothing reflows. See [`crate::identity`] for the four states.
     fn render_chat_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let identity = crate::identity::chip_identity(self.app_state.read(cx).viewer.as_ref());
         let mic = std::sync::Arc::new(gpui::Image::from_bytes(
             gpui::ImageFormat::Svg,
             MIC_SVG.to_vec(),
@@ -1489,8 +1532,8 @@ impl Workspace {
                 .size(px(22.))
                 .rounded_full()
                 .into_any_element(),
-            // Offline, or not landed yet: a quiet placeholder, same
-            // footprint, still a working link.
+            // No identity, offline, or not landed yet: a quiet placeholder,
+            // same footprint.
             None => div()
                 .size(px(22.))
                 .rounded_full()
@@ -1528,10 +1571,14 @@ impl Workspace {
                 div()
                     .id("github-profile")
                     .flex_none()
-                    .cursor_pointer()
-                    .tooltip(tooltip("iamnbutler on GitHub"))
-                    .on_click(|_event, _window, cx| {
-                        cx.open_url(GITHUB_PROFILE_URL);
+                    .tooltip(tooltip(identity.tooltip))
+                    // No identity ⇒ no cursor and no click. A chip that looks
+                    // clickable and opens nothing (or somebody else's
+                    // profile) is what #987 was.
+                    .when_some(identity.profile_url, |this, url| {
+                        this.cursor_pointer().on_click(move |_event, _window, cx| {
+                            cx.open_url(&url);
+                        })
                     })
                     .child(avatar),
             )

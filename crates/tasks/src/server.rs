@@ -34,7 +34,7 @@ use tasks_api::http::{
     EditIssueRequest, ErrorResponse, GitHubHold, LabelInfo, MergePullRequest, ModeResponse,
     RejectedBundle, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewCommentRequest,
     ReviewRequest, ScoutRequest, SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode,
-    SetProjectStatus, SettleDecisionRequest, ShadowAck,
+    SetProjectStatus, SettleDecisionRequest, ShadowAck, Viewer,
 };
 
 use crate::bundles::RejectedBundles;
@@ -185,6 +185,14 @@ pub struct Services {
     /// written by a gate, so a router with no dispatchers behind it would have
     /// nothing to report even if it held one.
     pub pool_health: Option<Arc<crate::pool_health::PoolHealth>>,
+    /// Who the server's own GitHub credential is, remembered for a while.
+    ///
+    /// **The only non-`Option` field here**, and deliberately: every other
+    /// service's absence has a distinct answer (a 503, no hold), and this
+    /// one's does not — a router with no GitHub client answers
+    /// `Unauthenticated`, which is the same thing an empty cache in front of
+    /// no client would answer. There is nothing for an `Option` to say.
+    pub viewer: Arc<crate::viewer::ViewerCache>,
 }
 
 /// Router state: the store plus [`Services`].
@@ -227,6 +235,12 @@ impl FromRef<AppState> for Option<Arc<crate::updates::UpdateWatch>> {
 impl FromRef<AppState> for Option<Arc<crate::pool_health::PoolHealth>> {
     fn from_ref(state: &AppState) -> Self {
         state.services.pool_health.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<crate::viewer::ViewerCache> {
+    fn from_ref(state: &AppState) -> Self {
+        state.services.viewer.clone()
     }
 }
 
@@ -330,6 +344,7 @@ fn routes(store: Arc<Store>, services: Services) -> Router {
             "/orchestrator/session/release",
             post(release_orchestrator_session),
         )
+        .route("/viewer", get(get_viewer))
         .route("/status", get(get_status))
         .route("/mode", get(get_mode).post(set_mode))
         .route("/queue/reorder", post(reorder_queue))
@@ -3170,6 +3185,36 @@ async fn stream_orchestrator(
     Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
 }
 
+// --- viewer ---
+
+/// `GET /viewer` — who the server's own GitHub credential is.
+///
+/// **Its own route rather than a `/status` field.** `/status` is `reload`'s
+/// liveness probe for a swap and is polled by `tasks status` and the Server
+/// window, and its own `pool` field already carries the rule that a status
+/// request must not make a round trip to another daemon. A GitHub call there
+/// would be the same mistake with a longer tail.
+///
+/// **Always a 200.** All three answers are states this route reports, not
+/// failures of it: a fresh machine with no token is the *common* case, and a
+/// 503 there would put a red banner on an app that is working correctly.
+///
+/// Not charter-gated and it writes no `decisions` row — it is a read that
+/// changes nothing upstream.
+///
+/// It is the second route that spends the server's GitHub credential outbound
+/// on a `GET`, so it joins `GET /decisions/{seq}/reconcile` in
+/// [`crate::loopback`]'s stated residual — a cross-site `<img src>` carries no
+/// `Origin` and a loopback `Host`, so it passes the guard. What bounds it is
+/// the cache this route needed anyway: a forced read costs at most one GitHub
+/// call per failure TTL however often it is triggered.
+async fn get_viewer(
+    State(cache): State<Arc<crate::viewer::ViewerCache>>,
+    State(github): State<Option<Arc<GitHubClient>>>,
+) -> Json<Viewer> {
+    Json(cache.get(github.as_ref()).await)
+}
+
 // --- mode ---
 
 /// `GET /status` — who is serving, since when, what this boot migrated, and
@@ -4733,6 +4778,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
+    }
+
+    /// A router with no GitHub client answers, rather than failing: "nobody
+    /// has sealed a token into this server yet" is the ordinary state of a
+    /// fresh machine, and a 503 there would put a red banner on an app that is
+    /// working correctly.
+    #[tokio::test]
+    async fn viewer_answers_unauthenticated_without_a_credential() {
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let base = spawn(store).await;
+        let resp = reqwest::get(format!("{base}/viewer")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.json::<Viewer>().await.unwrap(),
+            Viewer::Unauthenticated
+        );
+    }
+
+    /// The cache is proved by taking GitHub away between the two reads: the
+    /// second one is answered from memory, so an app refreshing on every SSE
+    /// event costs one GitHub call per `SUCCESS_TTL` rather than one per event.
+    #[tokio::test]
+    async fn viewer_is_cached_across_reads() {
+        let gh_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gh_url = format!("http://{}/graphql", gh_listener.local_addr().unwrap());
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let gh = axum::Router::new().route(
+            "/graphql",
+            post(|| async {
+                Json(json!({"data": {"viewer": {
+                    "login": "octocat",
+                    "avatarUrl": "https://avatars.example/u/9",
+                    "url": "https://github.example/octocat",
+                }}}))
+            }),
+        );
+        let served = tokio::spawn(async move {
+            axum::serve(gh_listener, gh)
+                .with_graceful_shutdown(async {
+                    stopped.await.ok();
+                })
+                .await
+                .unwrap();
+        });
+
+        let store = Arc::new(Store::open_in_memory().await.unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = router_with_services(
+            store,
+            Services {
+                github: Some(Arc::new(GitHubClient::with_base_url("token", gh_url))),
+                ..Default::default()
+            },
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let read = async || {
+            reqwest::get(format!("{base}/viewer"))
+                .await
+                .unwrap()
+                .json::<Viewer>()
+                .await
+                .unwrap()
+        };
+        let first = read().await;
+        assert_eq!(
+            first,
+            Viewer::Known {
+                login: "octocat".into(),
+                avatar_url: "https://avatars.example/u/9".into(),
+                profile_url: "https://github.example/octocat".into(),
+            }
+        );
+
+        // GitHub goes away entirely; the held answer must survive it.
+        stop.send(()).ok();
+        served.await.unwrap();
+        assert_eq!(read().await, first);
     }
 
     /// `/status` is the answer for whoever arrives *after* the edge was

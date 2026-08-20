@@ -5,6 +5,7 @@ mod components;
 mod context_gauge;
 mod disclaimer;
 mod feed;
+mod identity;
 mod issue_composer;
 mod menus;
 mod nav;
