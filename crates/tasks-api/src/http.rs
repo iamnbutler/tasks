@@ -578,6 +578,22 @@ pub struct ServerStatus {
     /// same reload-skew reason as the fields above.
     #[serde(default)]
     pub runtime: Option<RuntimeHold>,
+    /// How big the orchestrator's warm verification build directory is, as
+    /// last measured. `#[serde(default)]` for the same reload-skew reason as
+    /// the fields above.
+    ///
+    /// **Unlike the three holds, this is present whenever there is a reading**,
+    /// not only when something is wrong. A hold is an exception and a row that
+    /// only appears in the bad state is one a reader learns to skip; this is a
+    /// quantity that grows silently, and a report that appeared only once it
+    /// was over its ceiling would reproduce #1010 — 51 GB found by a human
+    /// hunting for disk — exactly.
+    ///
+    /// `None` means no reading: the orchestrator has no checkout to build in,
+    /// this router has no orchestrator behind it, or the first walk has not
+    /// happened yet.
+    #[serde(default)]
+    pub verify_dir: Option<VerifyDirUsage>,
 }
 
 /// Why the pipeline is idle when the container runtime is not running.
@@ -628,6 +644,56 @@ pub struct BrokerHold {
     pub address: String,
     /// The most recent failure, rendered — prose for a reader.
     pub error: String,
+}
+
+/// How big the orchestrator's verification build directory is, and what bounds
+/// it (`ORCHESTRATOR_TARGET_DIR`, `ORCHESTRATOR_TARGET_BUDGET_GB`).
+///
+/// Measured on a cadence rather than at request time — the walk is hundreds of
+/// thousands of files — so `measured_at` is part of the answer rather than
+/// decoration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyDirUsage {
+    /// Absolute path **on the server host**, like [`RejectedBundle::path`].
+    pub path: String,
+    pub bytes: u64,
+    /// Files counted, a hardlinked file once — cargo hardlinks
+    /// `<profile>/<bin>` to `<profile>/deps/<bin>-<hash>`, and a number that
+    /// disagreed with `du -sh` would not be trusted twice.
+    pub files: u64,
+    pub measured_at: DateTime<Utc>,
+    /// The ceiling in bytes, or `None` for `ORCHESTRATOR_TARGET_BUDGET_GB=0`:
+    /// report only, no reclaim. The report half is deliberately not
+    /// switchable.
+    pub budget_bytes: Option<u64>,
+    pub over_budget: bool,
+    /// The last reclaim of this boot, kept for the whole boot: the wholesale
+    /// tier costs the next verification a cold build, and that cost has to
+    /// still be answerable after the event feed has scrolled.
+    pub last_reclaim: Option<VerifyDirReclaim>,
+}
+
+/// A reclaim that happened, with both numbers measured rather than estimated —
+/// each tier re-walks the directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyDirReclaim {
+    pub at: DateTime<Utc>,
+    pub tier: VerifyDirTier,
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+}
+
+/// How far a reclaim had to go — which is also what it cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyDirTier {
+    /// Every `<profile>/incremental`, which is keyed to one worktree path and
+    /// therefore costs no warmth. On the host measured on 2026-08-20 this was
+    /// 24.24 GB of 51.
+    Incremental,
+    /// The directory's contents. **The next verification is cold**, which is
+    /// minutes of compilation before a single test runs.
+    Wholesale,
 }
 
 /// Why the pipeline is idle when vm-pool has no room.

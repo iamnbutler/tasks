@@ -124,6 +124,22 @@ pub struct OrchestratorConfig {
     /// Resolved once per boot by the caller, so the prompt cannot name a
     /// directory the agent will find missing.
     pub target_dir: Option<PathBuf>,
+    /// The **one** checkout the agent verifies in, named in the prompt
+    /// (`<data dir>/verify-worktree`).
+    ///
+    /// This is the half of #1010 that attacks the cause rather than the
+    /// symptom. Cargo keys an artifact on a metadata hash that includes the
+    /// source path, so the old instruction — check out a pull request "in a
+    /// `git worktree`", unnamed and therefore fresh each time — added a
+    /// complete new set of *workspace* artifacts per verification and kept the
+    /// previous set forever, at roughly 2 GB a turn. Registry dependencies,
+    /// whose hash does not include the workspace path, are shared across all
+    /// of them and were never what grew.
+    ///
+    /// Carried even when [`Self::target_dir`] is `None`, because it is derived
+    /// from the data dir rather than from anything that can fail — the prompt
+    /// is what decides whether it is mentioned.
+    pub worktree_dir: PathBuf,
     /// Whether the server booted with a GitHub credential.
     ///
     /// Same principle as [`Self::workdir_is_checkout`], applied to the other
@@ -376,6 +392,18 @@ impl Orchestrator {
         // exactly as this process had it, neither cleared nor invented.
         if let Some(target_dir) = &self.config.target_dir {
             cmd.env("CARGO_TARGET_DIR", target_dir);
+            // Set with it, never separately: toggling `CARGO_INCREMENTAL`
+            // invalidates *workspace* artifacts (a registry dependency is
+            // untouched — verified empirically), which is both what makes it
+            // affordable and what makes a mismatch expensive. `make
+            // verify-warm` sets the same three, and
+            // `the_agent_gets_a_warm_build_directory_and_a_command_ceiling_below_its_turn`
+            // pins this half. See `crate::verify_dir` for why these numbers
+            // matter: `incremental/` was 24.24 GB of a 51 GB directory, and
+            // none of it could ever be reused by a later checkout.
+            for (key, value) in VERIFICATION_ENV {
+                cmd.env(key, value);
+            }
         }
 
         let mut child = cmd.spawn().map_err(OrchestratorError::Spawn)?;
@@ -1407,6 +1435,52 @@ fn landing_section(charter: &[CharterEntry], can_verify: bool) -> &'static str {
     }
 }
 
+/// The cargo settings the verification child builds under, beside
+/// `CARGO_TARGET_DIR`.
+///
+/// **Set in both places or neither.** `make verify-warm` primes the same
+/// directory and must set exactly these, or every alternation between the two
+/// silently rebuilds the whole workspace — which costs far more than either
+/// setting saves. `verification_env_matches_the_makefile` is what keeps the two
+/// in step; there is no way to *share* the values, since one side is a Makefile,
+/// so the test is the mechanism.
+///
+/// Why each one, measured on the real directory on 2026-08-20 (see
+/// [`crate::verify_dir`] for the full breakdown):
+///
+/// - `CARGO_INCREMENTAL=0` — `incremental/` was **24.24 GB of 51**, and every
+///   byte of it was keyed to a worktree path no later checkout could reuse.
+///   Toggling it invalidates *workspace* artifacts and leaves registry
+///   dependencies alone, so the expensive half of a cold build is untouched.
+/// - `CARGO_PROFILE_*_DEBUG=line-tables-only` — nothing in this pipeline
+///   debugs these binaries; they are compiled, run once, and read for pass or
+///   fail. Full dev debuginfo is written and kept for a use that never
+///   happens, and on macOS (`split-debuginfo = "unpacked"`, which this
+///   workspace takes by default) it is 35.24 GB of codegen-unit `.o` files
+///   sitting beside the binaries rather than inside them. Measured here:
+///   `cargo test --workspace --no-run` is **6.26 GB** at the default and
+///   **3.16 GB** at `line-tables-only` — 3.11 GB, 49.6%, off one build.
+///   Deliberately **not** `debug = 0`: a failing test's backtrace is how the
+///   failure gets diagnosed, in a turn, with the worktree about to be reset.
+///   `line-tables-only` keeps every frame addressable to a file and a line
+///   while dropping the type information that is the bulk — confirmed by
+///   running a deliberately failing test under it.
+///
+/// Both profiles, because `cargo test` builds under `test` (which inherits from
+/// `dev`) while `cargo build` uses `dev`, and a setting that covered only one
+/// of them would be the mismatch this constant exists to prevent.
+///
+/// The size measurement above was taken on **Linux**, where debuginfo is
+/// embedded rather than split out, so what changes on the macOS host is where
+/// the removed bytes were sitting (the `.o` files rather than the binaries) and
+/// not whether they go. The percentage there is not this percentage; the
+/// direction is not in doubt.
+pub const VERIFICATION_ENV: [(&str, &str); 3] = [
+    ("CARGO_INCREMENTAL", "0"),
+    ("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"),
+    ("CARGO_PROFILE_TEST_DEBUG", "line-tables-only"),
+];
+
 /// Floor under [`command_budget`], so a very short turn still allows a command
 /// long enough to be worth running.
 const MIN_COMMAND_BUDGET: Duration = Duration::from_secs(60);
@@ -1435,11 +1509,27 @@ pub fn command_budget(turn: Duration) -> Duration {
 /// Everything it claims about the environment is read off the environment: the
 /// directory is the one the caller created this boot, and both budgets are the
 /// ones actually set on the child.
-fn verification_section(target_dir: Option<&Path>, turn: Duration) -> String {
+///
+/// The **worktree** half is the load-bearing half of #1010, and it is a prompt
+/// sentence because there is nothing else it could be: nothing on this side of
+/// the process boundary decides where the agent checks a pull request out. The
+/// old sentence said a worktree "costs you no extra compilation", which was
+/// true of the *dependencies* and false of everything else — a new path is a
+/// new metadata hash for every workspace crate, so each verification added a
+/// full set of artifacts and kept the last one, ~2 GB a turn.
+///
+/// The reset-and-clean sequence is spelled out rather than left as "check out
+/// what you want", because verifying a pull request means merging the trunk
+/// into its head: the worktree is carrying a merge commit, possibly a conflict,
+/// when the next verification arrives, and a bare `git checkout` refuses. A
+/// wedged worktree is worse than a slow one — it means no verification at all,
+/// and carve-out (b) then routes every batch to a human.
+fn verification_section(target_dir: Option<&Path>, worktree: &Path, turn: Duration) -> String {
     let Some(dir) = target_dir else {
         return String::new();
     };
     let dir = dir.display();
+    let tree = worktree.display();
     let command_secs = command_budget(turn).as_secs();
     let turn_secs = turn.as_secs();
     format!(
@@ -1453,9 +1543,23 @@ fn verification_section(target_dir: Option<&Path>, turn: Duration) -> String {
          warm between turns. Do not override it, do not `cargo clean` it, and \
          do not delete it: its warmth is the whole reason the suite is \
          affordable here, and a cold workspace build is minutes before a single \
-         test runs. It follows you into a `git worktree`, so checking out one \
-         or more pull requests somewhere and building there costs you no extra \
-         compilation.\n\n\
+         test runs.\n\n\
+         CHECK OUT WHAT YOU ARE VERIFYING IN ONE FIXED WORKTREE, ALWAYS THE \
+         SAME PATH: {tree}. Cargo keys every artifact on a hash that includes \
+         the source path, so a worktree at a NEW path is a cold workspace \
+         build whose artifacts are then kept forever — that is how this \
+         directory reached 51 GB. Reuse it like this, from the checkout:\n\
+         \x20 git -C <checkout> worktree add --detach {tree} 2>/dev/null || true\n\
+         \x20 git -C {tree} fetch origin\n\
+         \x20 git -C {tree} reset --hard\n\
+         \x20 git -C {tree} clean -fd\n\
+         \x20 git -C {tree} checkout --detach <the sha or FETCH_HEAD you want>\n\
+         The reset and the clean are not optional and they come FIRST: \
+         verifying a pull request means merging the trunk into its head, so the \
+         worktree you arrive at is carrying a merge commit — or a half-finished \
+         conflict — from last time, and a bare `git checkout` refuses. A wedged \
+         worktree means no verification happens at all, and every batch then \
+         goes to a human.\n\n\
          Budgets: one command may run for {command_secs}s and the whole turn \
          for {turn_secs}s. Backgrounding a command buys you nothing — the child \
          dies with the turn. If a genuinely cold first build does not finish \
@@ -1605,7 +1709,11 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
     let landing = landing_section(charter, can_verify);
     let reporting = reporting_section(charter);
     let workdir = workdir_section(config.workdir_is_checkout);
-    let verification = verification_section(config.target_dir.as_deref(), config.timeout);
+    let verification = verification_section(
+        config.target_dir.as_deref(),
+        &config.worktree_dir,
+        config.timeout,
+    );
     let degradation = degradation_section(config.github_configured);
     let curl_config = config.curl_config.display();
     format!(
@@ -2175,6 +2283,7 @@ mod tests {
             workdir: PathBuf::from("/repo"),
             workdir_is_checkout: true,
             target_dir: None,
+            worktree_dir: PathBuf::from("/data/verify-worktree"),
             github_configured: true,
             api_port: 4800,
             curl_config: PathBuf::from("/data/orchestrator-curl.conf"),
@@ -2724,10 +2833,15 @@ mod tests {
     /// environment that cannot do the thing grows no heading about it.
     #[test]
     fn verification_is_described_only_where_it_is_possible() {
-        assert_eq!(verification_section(None, Duration::from_secs(900)), "");
+        let worktree = Path::new("/state/verify-worktree");
+        assert_eq!(
+            verification_section(None, worktree, Duration::from_secs(900)),
+            ""
+        );
 
         let section = verification_section(
             Some(Path::new("/state/verify-target")),
+            worktree,
             Duration::from_secs(900),
         );
         assert!(section.contains("/state/verify-target"), "{section}");
@@ -2742,6 +2856,17 @@ mod tests {
         assert!(section.contains("dies with the turn"), "{section}");
         // A missing tool must be named, not silently downgraded.
         assert!(section.contains("NAME what was missing"), "{section}");
+        // The #1010 half: ONE worktree path, named, with the sequence that
+        // leaves it reusable. A fresh worktree per verification is a fresh
+        // metadata hash for every workspace crate, which is how the build
+        // directory reached 51 GB — and a worktree carrying last time's merge
+        // commit refuses a bare `git checkout`, which is worse, because then no
+        // verification happens at all.
+        assert!(section.contains("/state/verify-worktree"), "{section}");
+        assert!(section.contains("ALWAYS THE SAME PATH"), "{section}");
+        assert!(section.contains("reset --hard"), "{section}");
+        assert!(section.contains("clean -fd"), "{section}");
+        assert!(section.contains("checkout --detach"), "{section}");
 
         // And it reaches the assembled prompt only with a directory.
         let without = prompt(4800, &[]);

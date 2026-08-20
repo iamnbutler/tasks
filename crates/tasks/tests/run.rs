@@ -1509,6 +1509,7 @@ fn test_config(vm_pool_socket: &Path, clone_root: &Path, max_concurrent: usize) 
         orchestrator_timeout: Duration::from_secs(60),
         orchestrator_workdir: None,
         orchestrator_target_dir: None,
+        orchestrator_target_budget_gb: 20,
         update_hold: true,
         // Off in every harness: these tests own their pool (or its absence),
         // and a server spawning one behind their back would race both.
@@ -2298,4 +2299,60 @@ async fn an_update_hold_starts_no_scout_and_observing_the_rebuilt_image_releases
             .dispatch_attempts,
         0
     );
+}
+
+/// The store half of the build-directory maintenance: whatever the module
+/// decides has to reach the event feed, because the cost of a wholesale reclaim
+/// — the next verification is cold, so carve-out (b) goes undischarged and that
+/// batch goes to a human — is otherwise paid silently.
+///
+/// A `Note` and not an obligation: obligations go to the orchestrator, which is
+/// the one actor that must not be asked to manage a directory it builds in.
+#[tokio::test]
+async fn a_reclaim_of_the_verification_build_directory_lands_on_the_event_feed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("verify-target");
+    std::fs::create_dir_all(root.join("debug/deps")).unwrap();
+    std::fs::write(root.join("debug/deps/huge.rlib"), vec![b'x'; 4_000]).unwrap();
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+
+    // Under a ceiling: measured, reported on `/status`, and nothing said.
+    let roomy = tasks::verify_dir::VerifyDir::with_budget(root.clone(), Some(10_000));
+    tasks::run::maintain_verify_dir(&store, Some(&roomy), true).await;
+    assert_eq!(roomy.usage().unwrap().bytes, 4_000);
+    assert!(
+        !store
+            .all_events()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.payload, EventPayload::Note { .. })),
+        "a directory inside its ceiling is not news"
+    );
+
+    // Over it, with nothing incremental to drop: the wholesale tier, which has
+    // to say what it cost.
+    let tight = tasks::verify_dir::VerifyDir::with_budget(root.clone(), Some(1_000));
+    tasks::run::maintain_verify_dir(&store, Some(&tight), true).await;
+    let notes: Vec<String> = store
+        .all_events()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.payload {
+            EventPayload::Note { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains("THE NEXT VERIFICATION IS COLD"),
+        "{notes:?}"
+    );
+    assert!(notes[0].contains("goes to a human"), "{notes:?}");
+    assert!(root.is_dir(), "the directory itself survives the reclaim");
+    assert!(!root.join("debug").exists());
+
+    // And no orchestrator behind this server is not an error, it is nothing.
+    tasks::run::maintain_verify_dir(&store, None, true).await;
 }

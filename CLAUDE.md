@@ -446,6 +446,89 @@ implementation.
   would need its own run kind, artifact, charter capability and answer to the
   Scout/Builder barrier, all to deliver what a worktree plus a warm directory
   deliver in seconds — revisit only if compositions outgrow a 15-minute turn.
+- **The warm build directory grew because a fresh worktree is a fresh metadata
+  hash, not because anything was kept warm — so what bounds it is a prompt
+  sentence first and a reclaim second.** `ORCHESTRATOR_TARGET_DIR` was
+  documented as "expect ~7.5 GB and nothing prunes it", was found at 39 GB by a
+  human hunting for disk (#1010) and measured at **51 GB** on 2026-08-20,
+  growing ~2 GB per verification on a filesystem with 74 GiB free. The cause is
+  not the sharing: cargo keys an artifact on a metadata hash that **includes the
+  source path**, and the section above told the agent a `git worktree` "costs
+  you no extra compilation" — true of the registry dependencies, whose hash does
+  not include the workspace path, and false of every workspace crate, so each
+  new worktree path added a complete fresh set and the previous set was kept
+  forever. The measured breakdown, recorded here so nobody re-measures: `deps/`
+  46.79 GB, of which **35.24 GB is 208,468 codegen-unit `.o` files** (macOS's
+  default `split-debuginfo = "unpacked"` for a workspace that declares no
+  `[profile]` section — the debuginfo sits *beside* the binaries, not inside
+  them), executables 6.14 GB, `.rlib` + `.rmeta` 5.2 GB; and `incremental/`
+  **24.24 GB**. Two of those numbers kill an idea each. An eviction tier that
+  removed only the linked executables — the obvious "test binaries are the
+  biggest artifacts" refinement — frees 13% and leaves every byte it was aimed
+  at; it is measured, wrong, and deliberately **not** recorded as a future
+  refinement, because a deferred idea in a doc gets picked up by someone who
+  does not know it was falsified. And **mtime eviction is backwards here**:
+  registry artifacts are built once at the start and never touched again, so
+  they are always the *oldest* files and `cargo-sweep --time` deletes precisely
+  the warmth while keeping the per-worktree garbage (the stamp-file variant does
+  not rescue it — a no-op `cargo build` touches nothing, so "older than the
+  stamp" means everything). So the fix is three parts in descending order of how
+  much they matter. **Report the size** wherever a human already looks, and
+  **unlike the three dispatch holds this row prints whenever there is a
+  reading** — a hold is an exception, this is a quantity that grows silently,
+  and a row appearing only once it was over its ceiling would reproduce #1010
+  exactly. **Stop the bleeding**: one reused worktree path named in the prompt
+  (`<data dir>/verify-worktree`, derived and not a knob), with the
+  `reset --hard` + `clean -fd` + `checkout --detach` sequence spelled out,
+  because verifying a pull request means merging the trunk into its head and the
+  worktree arrives carrying last time's merge commit — a bare `git checkout`
+  refuses, and a wedged worktree means *no* verification at all, which routes
+  every batch to a human; plus `CARGO_INCREMENTAL=0` and
+  `CARGO_PROFILE_{DEV,TEST}_DEBUG=line-tables-only` on the child. Those cargo
+  settings are set **in both places or neither** — toggling either invalidates
+  every workspace artifact (a registry dependency is untouched, verified
+  empirically), so a `make verify-warm` that disagreed with the child would
+  rebuild the whole workspace on every alternation, costing far more than the
+  disk it saves; `VERIFICATION_ENV` is the one list and
+  `verification_env_matches_the_makefile` fails when they drift. The debuginfo
+  level was **measured rather than assumed**, which is what the change was
+  required to do: `cargo test --workspace --no-run` is **6.26 GB** at the
+  default and **3.16 GB** at `line-tables-only`, a 49.6% saving, with a
+  deliberately failing test producing a byte-identical backtrace naming a file
+  and a line in every frame. Not `debug = 0`, because a failing test's backtrace
+  is how the failure gets diagnosed — in a turn, with the worktree about to be
+  reset. **Bound what is left** with a graduated reclaim past
+  `ORCHESTRATOR_TARGET_BUDGET_GB` (20, a judgement rather than a measurement):
+  tier 1 removes every `<profile>/incremental`, which is keyed to one worktree
+  path and therefore costs no warmth at all, and only if that leaves it over
+  does tier 2 empty the directory — **keeping the directory itself**, since it
+  is created once per boot precisely so the prompt cannot name a missing one.
+  Each tier re-walks, so every number reported is measured rather than
+  estimated. The reclaim is permissible here in a way it is not for a rejected
+  bundle because everything in this directory is reproducible from the checkout:
+  a deletion costs time, never work. The cost that must not be paid quietly is
+  that the wholesale tier makes the next verification **cold**, which leaves
+  carve-out (b) undischarged and sends that batch to a human — so it is a `Note`
+  on the feed and stays on `/status` for the rest of the boot. A `Note` and
+  **not an obligation**, for the reason `ObligationKind::StaleImage` does not
+  exist, one notch sharper: obligations go to the orchestrator, which is the one
+  actor that must not be asked to manage a directory it builds in. It runs from
+  `orchestrator_loop` **before** each `tick()`, which is the whole safety
+  argument — that loop is the only thing that starts a process in there, so a
+  deletion cannot race a compile by construction rather than by a lock; while a
+  human has the session checked out it measures and reports and reclaims
+  nothing, because that is the one case the argument does not cover. The
+  reading is in memory and never a table (a fact about a filesystem with a
+  timestamp on it), refreshed on a 15-minute cadence rather than at read time
+  because the walk is hundreds of thousands of files, with hardlinks counted
+  once so the number agrees with the `du -sh` that found the problem, and
+  `measure_due` claiming on the **attempt** rather than on success so an
+  unreadable directory is not re-walked every tick with a `warn!` each time. One
+  thing is measured and undecided: the directory also holds `gpui` artifacts in
+  two hash variants, and `app-gpui` is not a workspace member, so part of what
+  is retained is a dependency tree `make test` never builds — the steady-state
+  size therefore depends on whether app builds share this directory, which
+  nobody has decided.
 - **Bulk intake never auto-dispatches, and queue membership is explicit.**
   `tasks.manual_rank` is set only via the API; the GitHub poller must never
   write it. Ingested issues land in `backlog` and are never dispatched — only
@@ -2108,5 +2191,6 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `ORCHESTRATOR_CMD` | `claude --print … --allowedTools Bash(curl:*)` | orchestrator agent command; its permission flags decide what the orchestrator may do. Split shell-style, so quotes group — `--allowedTools "Bash(git log:*)"` survives as one argument, which is the only way a prefix-matched allowlist can be written in verbs (#976) |
 | `ORCHESTRATOR_WORKDIR` | `<data dir>/orchestrator` | orchestrator cwd; point at the repo checkout (with `--dangerously-skip-permissions` in the cmd) to run it as a full dev agent |
 | `ORCHESTRATOR_TIMEOUT_SECS` | 900 | budget per orchestrator tick, measured on both clocks (see *Budgets and a host that sleeps*). Claude Code's per-command ceiling is derived as **half** of it (`orchestrator::command_budget`, floor 60s) and set on the child as `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS` — so whatever a command spent, at least that much turn is left to report it in. Bounded above by `OBLIGATION_REMINDER` (30 min) |
-| `ORCHESTRATOR_TARGET_DIR` | `<data dir>/verify-target` | `CARGO_TARGET_DIR` for the orchestrator's own verification, set on that child process and nowhere else. Shared and long-lived — the warmth is the value; expect ~7.5 GB and nothing prunes it. `make verify-warm` primes it. There is no `off`: every value here is a path, so `ORCHESTRATOR_TARGET_DIR=<checkout>/target` is the escape hatch |
+| `ORCHESTRATOR_TARGET_DIR` | `<data dir>/verify-target` | `CARGO_TARGET_DIR` for the orchestrator's own verification, set on that child process and nowhere else, alongside `CARGO_INCREMENTAL=0` and `CARGO_PROFILE_{DEV,TEST}_DEBUG=line-tables-only` (`orchestrator::VERIFICATION_ENV` — `make verify-warm` sets the same three, and a test fails if they drift). Shared and long-lived — the warmth is the value. Its size is on `/status`, `tasks status` and the Server window, and it is bounded by `ORCHESTRATOR_TARGET_BUDGET_GB`. `make verify-warm` primes it. There is no `off`: every value here is a path, so `ORCHESTRATOR_TARGET_DIR=<checkout>/target` is the escape hatch |
+| `ORCHESTRATOR_TARGET_BUDGET_GB` | 20 | ceiling on that directory, past which the orchestrator loop reclaims it in two tiers — every `<profile>/incremental` first (no warmth lost), and only if that is not enough, the directory's contents (**the next verification is cold**, and that is announced on the feed and stays on `/status` for the boot). `0` keeps the report and drops the reclaim, the `TASKS_UPDATE_HOLD=off` shape; the *report* half is deliberately not switchable. The default is a judgement, not a measurement — see the design bullet |
 | `TASKS_UPDATE_HOLD` | `on` | whether new scouts and builds wait while an update is pending — a newer server binary on disk awaiting `make restart`, or a VM image observed running a build older than this server's awaiting `make images`. `off` keeps the `/status` report and drops the gate; anything else refuses to boot |

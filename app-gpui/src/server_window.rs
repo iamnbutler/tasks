@@ -22,7 +22,7 @@ use gpui::{
     TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
 };
 use gpuikit::theme::{ActiveTheme, Themeable};
-use tasks_client::api::http::{InFlight, ServerStatus};
+use tasks_client::api::http::{InFlight, ServerStatus, VerifyDirTier};
 use tasks_client::api::models::Mode;
 
 use crate::about;
@@ -254,6 +254,12 @@ impl ServerWindow {
             .as_ref()
             .and_then(runtime_hold_line)
             .map(|line| self.fact("Runtime", line, cx));
+        // Unlike the three above it, this row is NOT an exception report: it
+        // appears whenever there is a reading. See `verify_dir_line`.
+        let verify_dir = status
+            .as_ref()
+            .and_then(verify_dir_line)
+            .map(|line| self.fact("Verify dir", line, cx));
 
         div()
             .flex()
@@ -266,6 +272,7 @@ impl ServerWindow {
             .children(pool)
             .children(broker)
             .children(runtime)
+            .children(verify_dir)
             .child(self.fact("Migrations", migrations, cx))
             .child(self.fact("In flight", in_flight, cx))
             .child(self.fact("Server build", server_build, cx))
@@ -930,6 +937,70 @@ fn runtime_hold_line(status: &ServerStatus) -> Option<String> {
     ))
 }
 
+/// How big the orchestrator's warm verification build directory is — the same
+/// reading `tasks status` prints.
+///
+/// **The one row here that is not an exception report.** `github_hold_line`,
+/// `update_pending_line` and `pool_hold_line` are `None` while things are fine,
+/// because a standing "all clear" is a row a reader learns to skip. This is a
+/// quantity that grows silently — it reached 51 GB on a disk with 74 GiB free
+/// before a human hunting for space found it (#1010) — so a row that appeared
+/// only once it was over its ceiling would reproduce that exactly. `None` here
+/// means there is no reading at all: no orchestrator checkout to build in, or
+/// no walk yet this boot.
+///
+/// A reclaim is shown for the rest of the boot, and the wholesale tier says
+/// what it cost, because a cold verification is what sends the next batch to a
+/// human.
+fn verify_dir_line(status: &ServerStatus) -> Option<String> {
+    let usage = status.verify_dir.as_ref()?;
+    let bound = match usage.budget_bytes {
+        Some(budget) if usage.over_budget => {
+            format!("OVER its {} ceiling", humanize_bytes(budget))
+        }
+        Some(budget) => format!("of {}", humanize_bytes(budget)),
+        None => "unbounded (ORCHESTRATOR_TARGET_BUDGET_GB=0, report only)".to_string(),
+    };
+    let mut line = format!(
+        "{} {}, measured {} ago",
+        humanize_bytes(usage.bytes),
+        bound,
+        time::since(usage.measured_at)
+    );
+    if let Some(reclaim) = &usage.last_reclaim {
+        let what = match reclaim.tier {
+            VerifyDirTier::Incremental => "incremental caches only, no warmth lost",
+            VerifyDirTier::Wholesale => "whole directory — the next verification is COLD",
+        };
+        line.push_str(&format!(
+            ".  Reclaimed {} ago: {} -> {}, {what}",
+            time::since(reclaim.at),
+            humanize_bytes(reclaim.before_bytes),
+            humanize_bytes(reclaim.after_bytes),
+        ));
+    }
+    Some(line)
+}
+
+/// A size a human can compare to `du -sh` without arithmetic.
+///
+/// The app's **own** copy of `tasks::verify_dir::humanize_bytes`: this crate
+/// depends on `tasks-client`, not on `tasks`, and pulling the server crate in
+/// for one formatter would be the wrong trade. What keeps the two sentences in
+/// step is the unit test below — decimal units, because the budget is written
+/// in GB and the number has to read against the `du -sh` somebody ran.
+fn humanize_bytes(bytes: u64) -> String {
+    const KB: u64 = 1_000;
+    const MB: u64 = 1_000_000;
+    const GB: u64 = 1_000_000_000;
+    match bytes {
+        b if b >= GB => format!("{:.1} GB", b as f64 / GB as f64),
+        b if b >= MB => format!("{:.1} MB", b as f64 / MB as f64),
+        b if b >= KB => format!("{:.1} kB", b as f64 / KB as f64),
+        b => format!("{b} B"),
+    }
+}
+
 /// Work a restart would destroy, with ages — the thing you are about to
 /// interrupt, named.
 fn in_flight_lines(status: &ServerStatus) -> String {
@@ -981,6 +1052,7 @@ mod tests {
             pool: None,
             broker: None,
             runtime: None,
+            verify_dir: None,
         }
     }
 
@@ -1032,6 +1104,65 @@ mod tests {
             line.contains("nothing is charged an attempt"),
             "the reader's next question is whether work is being lost: {line}"
         );
+    }
+
+    /// The one row here that is not an exception report — it appears whenever
+    /// there is a reading, because a size that only surfaced once it was over
+    /// its ceiling is #1010 (51 GB found by a human hunting for disk).
+    ///
+    /// And its own `humanize_bytes`: this crate depends on `tasks-client`, not
+    /// on `tasks`, so the two copies are kept in step by this test rather than
+    /// by the compiler.
+    #[test]
+    fn the_verification_build_directory_is_a_row_even_when_it_is_fine() {
+        use tasks_client::api::http::{VerifyDirReclaim, VerifyDirUsage};
+
+        let mut status = status();
+        assert_eq!(verify_dir_line(&status), None, "nothing measured, no row");
+
+        let usage = VerifyDirUsage {
+            path: "/state/verify-target".into(),
+            bytes: 12_300_000_000,
+            files: 213_628,
+            measured_at: Utc::now() - chrono::Duration::minutes(5),
+            budget_bytes: Some(20_000_000_000),
+            over_budget: false,
+            last_reclaim: None,
+        };
+        status.verify_dir = Some(usage.clone());
+        let line = verify_dir_line(&status).expect("a reading is always a row");
+        assert!(line.contains("12.3 GB of 20.0 GB"), "{line}");
+
+        status.verify_dir = Some(VerifyDirUsage {
+            bytes: 51_000_000_000,
+            over_budget: true,
+            last_reclaim: Some(VerifyDirReclaim {
+                at: Utc::now() - chrono::Duration::minutes(3),
+                tier: VerifyDirTier::Wholesale,
+                before_bytes: 51_000_000_000,
+                after_bytes: 0,
+            }),
+            ..usage
+        });
+        let line = verify_dir_line(&status).unwrap();
+        assert!(line.contains("OVER its 20.0 GB ceiling"), "{line}");
+        assert!(line.contains("51.0 GB -> 0 B"), "{line}");
+        assert!(
+            line.contains("COLD"),
+            "a wholesale reclaim names what it cost: {line}"
+        );
+    }
+
+    /// The same cases `tasks::verify_dir::humanize_bytes` pins, so the two
+    /// copies say the same thing. Decimal units: the budget is written in GB
+    /// and the number has to read against the `du -sh` somebody ran.
+    #[test]
+    fn sizes_read_the_way_du_prints_them() {
+        assert_eq!(humanize_bytes(0), "0 B");
+        assert_eq!(humanize_bytes(999), "999 B");
+        assert_eq!(humanize_bytes(1_500), "1.5 kB");
+        assert_eq!(humanize_bytes(2_500_000), "2.5 MB");
+        assert_eq!(humanize_bytes(51_000_000_000), "51.0 GB");
     }
 
     #[test]

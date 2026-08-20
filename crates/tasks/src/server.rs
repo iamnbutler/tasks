@@ -214,6 +214,12 @@ pub struct Services {
     /// The container-runtime record the two dispatchers write and read.
     /// Absent on the same terms as the two above it.
     pub runtime_health: Option<Arc<crate::runtime_health::RuntimeHealth>>,
+    /// The orchestrator's verification build directory, measured on a cadence
+    /// by the orchestrator loop. Absent when there is no orchestrator behind
+    /// this router, or when its workdir is not a checkout and so nothing ever
+    /// builds there — reported as no reading, which is the honest answer and
+    /// not a zero.
+    pub verify_dir: Option<Arc<crate::verify_dir::VerifyDir>>,
     /// Who the server's own GitHub credential is, remembered for a while.
     ///
     /// **The only non-`Option` field here**, and deliberately: every other
@@ -282,6 +288,12 @@ impl FromRef<AppState> for Option<Arc<crate::broker_health::BrokerHealth>> {
 impl FromRef<AppState> for Option<Arc<crate::runtime_health::RuntimeHealth>> {
     fn from_ref(state: &AppState) -> Self {
         state.services.runtime_health.clone()
+    }
+}
+
+impl FromRef<AppState> for Option<Arc<crate::verify_dir::VerifyDir>> {
+    fn from_ref(state: &AppState) -> Self {
+        state.services.verify_dir.clone()
     }
 }
 
@@ -3743,6 +3755,7 @@ async fn get_status(
     State(pool_health): State<Option<Arc<crate::pool_health::PoolHealth>>>,
     State(broker_health): State<Option<Arc<crate::broker_health::BrokerHealth>>>,
     State(runtime_health): State<Option<Arc<crate::runtime_health::RuntimeHealth>>>,
+    State(verify_dir): State<Option<Arc<crate::verify_dir::VerifyDir>>>,
 ) -> ApiResult<Json<ServerStatus>> {
     // Through the same watch the dispatchers consult, so `/status` cannot
     // claim a hold they are not honouring.
@@ -3793,6 +3806,13 @@ async fn get_status(
         runtime: runtime_health
             .and_then(|health| health.hold(Utc::now()))
             .map(|run| run.to_hold()),
+        // Not a hold and so **not silent when things are fine**: this is a
+        // quantity that grows silently, and a row that only appeared once it
+        // was over its ceiling would reproduce #1010 exactly. Like the pool
+        // above it, nothing is measured here — the walk is hundreds of
+        // thousands of files and happens on the orchestrator loop's cadence;
+        // `measured_at` is what keeps that honest.
+        verify_dir: verify_dir.and_then(|dir| dir.usage()),
     }))
 }
 

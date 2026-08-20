@@ -388,10 +388,22 @@ check-quiesced: server
 VERIFY_DATA_DIR := $(if $(strip $(TASKS_DATA_DIR)),$(TASKS_DATA_DIR),$(HOME)/.local/state/tasks-v2)
 VERIFY_TARGET_DIR := $(if $(strip $(ORCHESTRATOR_TARGET_DIR)),$(ORCHESTRATOR_TARGET_DIR),$(VERIFY_DATA_DIR)/verify-target)
 
+# The three cargo settings beside it are `orchestrator::VERIFICATION_ENV`, and
+# they must be set HERE AND ON THE CHILD OR NEITHER: toggling either one
+# invalidates every workspace artifact, so a Makefile and a server that
+# disagreed would rebuild the whole workspace on every alternation between them
+# — costing far more than the disk they save. `verification_env_matches_the_makefile`
+# fails the suite if these drift apart. Measured 2026-08-20: this build is
+# 6.26 GB at the default debuginfo and 3.16 GB at line-tables-only, which still
+# names a file and a line in every backtrace frame.
 verify-warm:
-	@echo "warming $(VERIFY_TARGET_DIR) (expect ~7.5 GB once built; nothing prunes it, by design)"
+	@echo "warming $(VERIFY_TARGET_DIR) (bounded by ORCHESTRATOR_TARGET_BUDGET_GB, default 20 GB; size is on \`tasks status\`)"
 	@mkdir -p $(VERIFY_TARGET_DIR)
-	CARGO_TARGET_DIR=$(VERIFY_TARGET_DIR) cargo test --workspace --no-run
+	CARGO_TARGET_DIR=$(VERIFY_TARGET_DIR) \
+		CARGO_INCREMENTAL=0 \
+		CARGO_PROFILE_DEV_DEBUG=line-tables-only \
+		CARGO_PROFILE_TEST_DEBUG=line-tables-only \
+		cargo test --workspace --no-run
 
 # A new migration, named for this UTC instant:
 #

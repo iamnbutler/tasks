@@ -57,6 +57,7 @@ pub mod store;
 mod teardown;
 pub mod transcript;
 pub mod updates;
+pub mod verify_dir;
 pub mod version;
 pub mod viewer;
 

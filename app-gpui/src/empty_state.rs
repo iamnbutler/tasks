@@ -1062,6 +1062,9 @@ mod tests {
                 address: "192.168.64.1:4801".into(),
                 error: "it accepted the connection and then it returned no bytes at all".into(),
             }),
+            // Not a hold: the build directory's size is never a reason the
+            // pipeline is idle, which is what this fixture is about.
+            verify_dir: None,
         }
     }
 

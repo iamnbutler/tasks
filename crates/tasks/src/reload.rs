@@ -1368,6 +1368,7 @@ pub fn render_status(
             out.push_str(&render_pool_hold(status, now));
             out.push_str(&render_broker_hold(status, now));
             out.push_str(&render_runtime_hold(status, now));
+            out.push_str(&render_verify_dir(status, now));
             out.push_str(&render_images(status));
             out.push_str(&render_in_flight(&status.in_flight, now));
         }
@@ -1491,6 +1492,64 @@ pub fn render_runtime_hold(status: &ServerStatus, now: DateTime<Utc>) -> String 
         humanize(now - hold.last_seen),
         hold.error
     )
+}
+
+/// How big the orchestrator's verification build directory is.
+///
+/// **Not silent when things are fine**, which is the one way this differs from
+/// the three hold lines above it. A hold is an exception and a standing "all
+/// clear" is a line a reader learns to skip; this is a quantity that grows
+/// silently, and a row that only appeared once it was over its ceiling would
+/// reproduce #1010 exactly — 51 GB found by a human hunting for disk on a
+/// filesystem with 74 GiB free.
+///
+/// Silent only when there is nothing to say: no orchestrator checkout to build
+/// in, or no walk yet this boot.
+///
+/// A reclaim is reported for the rest of the boot, and the wholesale tier names
+/// its cost, because "the next verification is cold" is what sends the next
+/// batch to a human and nothing else would say why.
+pub fn render_verify_dir(status: &ServerStatus, now: DateTime<Utc>) -> String {
+    let Some(usage) = &status.verify_dir else {
+        return String::new();
+    };
+    let bound = match usage.budget_bytes {
+        Some(budget) if usage.over_budget => format!(
+            "over its {} ceiling",
+            crate::verify_dir::humanize_bytes(budget)
+        ),
+        Some(budget) => format!("of {}", crate::verify_dir::humanize_bytes(budget)),
+        None => "unbounded — ORCHESTRATOR_TARGET_BUDGET_GB=0, report only".to_string(),
+    };
+    let mut out = format!(
+        "verify   {} {} in {} files, measured {} ago
+         {}
+",
+        crate::verify_dir::humanize_bytes(usage.bytes),
+        bound,
+        usage.files,
+        humanize(now - usage.measured_at),
+        usage.path,
+    );
+    if let Some(reclaim) = &usage.last_reclaim {
+        let what = match reclaim.tier {
+            tasks_api::http::VerifyDirTier::Incremental => {
+                "the incremental caches went (no warmth lost)"
+            }
+            tasks_api::http::VerifyDirTier::Wholesale => {
+                "the whole directory went — the next verification is COLD"
+            }
+        };
+        out.push_str(&format!(
+            "         reclaimed {} ago: {} -> {}, {}
+",
+            humanize(now - reclaim.at),
+            crate::verify_dir::humanize_bytes(reclaim.before_bytes),
+            crate::verify_dir::humanize_bytes(reclaim.after_bytes),
+            what,
+        ));
+    }
+    out
 }
 
 /// What the VM images are running, and whether that is a problem.
@@ -1652,6 +1711,7 @@ mod tests {
             pool: None,
             broker: None,
             runtime: None,
+            verify_dir: None,
         }
     }
 
@@ -1777,6 +1837,75 @@ mod tests {
             .contains("0 of 6"),
             "part of the report, not a function nobody calls"
         );
+    }
+
+    /// The one report here that is **not** an exception: it prints whenever
+    /// there is a reading. A row that appeared only once it was over its
+    /// ceiling would reproduce #1010 exactly — 51 GB found by a human hunting
+    /// for disk on a filesystem with 74 GiB free.
+    #[test]
+    fn the_verification_build_directory_is_reported_whether_or_not_it_is_a_problem() {
+        use tasks_api::http::{VerifyDirReclaim, VerifyDirTier, VerifyDirUsage};
+
+        let mut status = status_with(InFlight::default());
+        assert_eq!(
+            render_verify_dir(&status, ts("2026-08-15T13:00:00Z")),
+            "",
+            "nothing measured is silent — it is not a zero"
+        );
+
+        let usage = VerifyDirUsage {
+            path: "/state/verify-target".into(),
+            bytes: 12_300_000_000,
+            files: 213_628,
+            measured_at: ts("2026-08-15T12:55:00Z"),
+            budget_bytes: Some(20_000_000_000),
+            over_budget: false,
+            last_reclaim: None,
+        };
+        status.verify_dir = Some(usage.clone());
+        let line = render_verify_dir(&status, ts("2026-08-15T13:00:00Z"));
+        assert!(line.contains("12.3 GB of 20.0 GB"), "{line}");
+        assert!(line.contains("213628 files"), "{line}");
+        assert!(line.contains("/state/verify-target"), "{line}");
+        assert!(line.contains("5m00s"), "how old the reading is: {line}");
+        assert!(
+            render_status(
+                Some(&pidfile_at(4800)),
+                Some(&status),
+                ts("2026-08-15T13:00:00Z")
+            )
+            .contains("12.3 GB"),
+            "part of the report, not a function nobody calls"
+        );
+
+        // Over the ceiling, and a wholesale reclaim that has to name its cost:
+        // a cold verification is what routes the next batch to a human.
+        status.verify_dir = Some(VerifyDirUsage {
+            bytes: 51_000_000_000,
+            over_budget: true,
+            last_reclaim: Some(VerifyDirReclaim {
+                at: ts("2026-08-15T12:57:00Z"),
+                tier: VerifyDirTier::Wholesale,
+                before_bytes: 51_000_000_000,
+                after_bytes: 0,
+            }),
+            ..usage.clone()
+        });
+        let line = render_verify_dir(&status, ts("2026-08-15T13:00:00Z"));
+        assert!(line.contains("over its 20.0 GB ceiling"), "{line}");
+        assert!(line.contains("51.0 GB -> 0 B"), "{line}");
+        assert!(line.contains("COLD"), "{line}");
+
+        // And with the reclaim switched off, the report stays — that half is
+        // deliberately not switchable.
+        status.verify_dir = Some(VerifyDirUsage {
+            budget_bytes: None,
+            ..usage
+        });
+        let line = render_verify_dir(&status, ts("2026-08-15T13:00:00Z"));
+        assert!(line.contains("ORCHESTRATOR_TARGET_BUDGET_GB=0"), "{line}");
+        assert!(line.contains("12.3 GB"), "{line}");
     }
 
     /// Two readings that must not be confused. Nothing polls an image, so an
