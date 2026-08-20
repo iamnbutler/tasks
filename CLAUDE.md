@@ -697,24 +697,28 @@ implementation.
   forbidden in general — an orchestrator deliberately pointed at the checkout
   to run as a full dev agent takes it, and the `ORCHESTRATOR_WORKDIR` row
   below says so; it is forbidden where the restriction *is* the design.
-  **The quoting is the load-bearing half, and the one no longer recoverable by
-  reading the tree**: `Bash(git log:*)` contains a space, so a command string
-  split on whitespace shatters it into `Bash(git` and `log:*)`, and the agent
-  comes up holding two permissions that match nothing while default-deny
-  refuses every call they were meant to allow. A restrictive multi-tool
-  allowlist therefore needs a quoting-aware split, and **`orchestrator.rs` is
-  not the template to copy**: the orchestrator's *default* command
-  (`DEFAULT_ORCHESTRATOR_CMD`, `crates/tasks/src/run.rs:96`) has an allowlist
-  of one space-free token, `Bash(curl:*)`, so `invoke`'s `split_whitespace`
-  (`orchestrator.rs:311`) has never been wrong there and *cannot* express a
-  multi-tool read-only allowlist — reaching for that spawn path is the named
-  mistake. Both halves survive in git, in two different files, and it takes
-  both: `git show 63a1fb6^:crates/tasks/src/run.rs` holds the command and the
-  doc comment giving its reasons (`DEFAULT_BRIEFING_CMD`, `:102`), while
-  `git show 63a1fb6^:crates/tasks/src/briefing.rs` holds the splitter that
-  makes it expressible (`split_command`, `:392`, with its test
-  `split_command_groups_quoted_permissions` at `:439`) and no occurrence of
-  the command at all.
+  **The quoting is the load-bearing half**: `Bash(git log:*)` contains a space,
+  so a command string split on whitespace shatters it into `Bash(git` and
+  `log:*)`, and the agent comes up holding two permissions that match nothing
+  while default-deny refuses every call they were meant to allow. A restrictive
+  multi-tool allowlist therefore needs a quoting-aware split, and
+  `orchestrator.rs` now **is** the template — `split_command` lives there and
+  `invoke` spawns through it (#976). It did not until 2026-08-20, and the way
+  that stayed invisible is the part worth keeping: the orchestrator's *default*
+  command (`DEFAULT_ORCHESTRATOR_CMD`, `crates/tasks/src/run.rs`) has an
+  allowlist of one space-free token, `Bash(curl:*)`, so `split_whitespace` was
+  never observably wrong there — and the one shape the env table invites an
+  operator to write was the one shape the variable could not carry. It fails
+  **closed**, the fragments matching nothing, which is why this was a bug and
+  not an incident, and also why it would have been met the confusing way: by
+  someone tightening permissions and watching the agent lose a capability
+  instead of gaining one. `an_unquoted_command_splits_exactly_as_whitespace_did`
+  pins that the change is inert for every command without quotes in it. The
+  splitter is deliberately not a shell — grouping only, no escapes and no
+  expansion, since an agent under a static allowlist cannot expand `$VAR`
+  anyway. The worked example the tree lost with `crates/tasks/src/briefing.rs`
+  (#933) is still only in git: `git show 63a1fb6^:crates/tasks/src/run.rs` holds
+  `DEFAULT_BRIEFING_CMD` and the doc comment giving its reasons.
 - **A dead API connection is resumed in the supervisor, never re-dispatched
   from the host.** Agent processes die intermittently at ~380s elapsed (#845)
   when the connection drops mid-response — below the agent, in the VM's network
@@ -1805,7 +1809,7 @@ is what sent a curl-only agent reaching for `python3` and `Write`.
 | `TASKS_BROKER_ADVERTISE` | `192.168.64.1` | the broker's address as VMs see it (apple/container's bridge gateway) |
 | `TASKS_BROKER_ANTHROPIC_UPSTREAM` | `https://api.anthropic.com` | where Anthropic traffic forwards — override for tests only |
 | `TASKS_SECRETS_KEY_FILE` | — | unseal-key file, outranking the credential-store item the store header names. The Linux/test path — and **first-class on macOS too, not a fallback**: an access list is granted to an *application*, so an unsigned dev build is a different one on every `cargo build` and a natively-stored key re-prompts each time, which a launchd-started server has no window server to answer |
-| `ORCHESTRATOR_CMD` | `claude --print … --allowedTools Bash(curl:*)` | orchestrator agent command; its permission flags decide what the orchestrator may do |
+| `ORCHESTRATOR_CMD` | `claude --print … --allowedTools Bash(curl:*)` | orchestrator agent command; its permission flags decide what the orchestrator may do. Split shell-style, so quotes group — `--allowedTools "Bash(git log:*)"` survives as one argument, which is the only way a prefix-matched allowlist can be written in verbs (#976) |
 | `ORCHESTRATOR_WORKDIR` | `<data dir>/orchestrator` | orchestrator cwd; point at the repo checkout (with `--dangerously-skip-permissions` in the cmd) to run it as a full dev agent |
 | `ORCHESTRATOR_TIMEOUT_SECS` | 900 | budget per orchestrator tick, measured on both clocks (see *Budgets and a host that sleeps*). Claude Code's per-command ceiling is derived as **half** of it (`orchestrator::command_budget`, floor 60s) and set on the child as `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS` — so whatever a command spent, at least that much turn is left to report it in. Bounded above by `OBLIGATION_REMINDER` (30 min) |
 | `ORCHESTRATOR_TARGET_DIR` | `<data dir>/verify-target` | `CARGO_TARGET_DIR` for the orchestrator's own verification, set on that child process and nowhere else. Shared and long-lived — the warmth is the value; expect ~7.5 GB and nothing prunes it. `make verify-warm` primes it. There is no `off`: every value here is a path, so `ORCHESTRATOR_TARGET_DIR=<checkout>/target` is the escape hatch |
