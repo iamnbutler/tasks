@@ -279,9 +279,10 @@ implementation.
   already holds the duplicate, and a failed migration is a boot failure in a
   process that has already taken the port.
 - **What the orchestrator may do lives in `orchestrator_charter`, never in a
-  prompt.** Nine independently switchable capabilities (`capture_work`,
+  prompt.** Ten independently switchable capabilities (`capture_work`,
   `curate_work`, `comment_on_work`, `retire_work`, `queue_tasks`,
-  `dispatch_builds`, `cancel_runs`, `auto_review_specs`, `land_builds`), each
+  `dispatch_builds`, `cancel_runs`, `auto_review_specs`, `land_builds`,
+  `enroll_agents`), each
   `off` | `shadow` | `live`, human-writable only. The system prompt's
   authority section is *generated* from those rows every turn and the server
   enforces the same rows on the endpoints — one statement of authority, and
@@ -289,7 +290,7 @@ implementation.
   two edits, not one: the enum variant alone grants nothing, because
   `Store::charter_entry` reads a missing row as `off` — the migration's
   `INSERT` is what makes it real, and without it the refusal looks like a bug
-  in `authorize`. **All nine ship `live`
+  in `authorize`. **All ten ship `live`
   and uncapped** — the charter is a kill switch, not a promotion ladder, and
   the point of the system is that work moves without being asked. What makes
   that safe is the `decisions` ledger under every write: audit and recourse
@@ -312,6 +313,40 @@ implementation.
   cannot expand `$VAR`), or the agent's workdir (a repo checkout it commits
   from). An `X-Tasks-Actor` that is present but does not verify is a 403, not
   a demotion to human.
+- **An external agent gets a voice by enrollment, and a failed claim is
+  refused, never demoted to the human.** The orchestrator conversation has
+  three speakers, and headers decide which one a `POST /orchestrator/messages`
+  is: no `X-Tasks-Agent` is the human (never gated, as ever), a *valid* code
+  in it is that agent — the turn lands as `ChatRole::Event` under a
+  server-written `[agent <name>]` heading, beside `[pipeline]` and
+  unmistakable from both — and an invalid, expired or revoked one is a 403
+  with the message **discarded**, the `X-Tasks-Actor` rule again, because
+  quietly becoming the human is the one direction attribution must never
+  fail. The code is the device-code flow one level up from the broker lease
+  and holds its custody: `POST /agents` mints 256 random bits returned
+  exactly once, `agent_enrollments` keeps only the SHA-256, and the row —
+  never deleted, it is the audit trail for turns already spoken — carries the
+  name, the expiry (default 4h, bounds refused rather than clamped: a
+  credential silently granted a different lifetime is a different grant) and
+  `revoked_at`. The **name is chosen by the minter, never the agent**, is
+  validated in the store (`require_rationale`'s backstop argument), and can
+  never be another speaker — reserved words refused, one active enrollment
+  per name — because the name is what the words are attributed to. What an
+  enrollment conveys is a **voice, not authority**: an agent turn is input
+  the orchestrator is prompted to read as a peer's unverified leads, never a
+  gated write, which is why `enroll_agents` (the tenth capability) can ship
+  `live` — the convenient flow is asking the orchestrator in chat for a code,
+  and its mints and revokes are ledgered with a required rationale
+  (`enroll_agent` / `revoke_agent`, both store-only, `applied` by
+  construction). The prompt tells the orchestrator to relay a minted code to
+  the human verbatim and nowhere else — a persisted transcript holding a
+  short-lived message code is the accepted cost of having no other channel to
+  the human, bounded by the TTL and by what the code can do. The coverage
+  claim, stated exactly: enrollment does not authenticate the human — any
+  local process can still omit the header and speak as the human, and the
+  loopback bind plus who runs on the machine remain that boundary. What it
+  buys is the cooperative case: an honest label the orchestrator can weigh,
+  and a bounded, revocable credential instead of ambient human standing.
 - **A bind address is not access control against a browser, so the API refuses
   the two shapes only a browser sends.** The other half of the attribution
   rule: a request with no `X-Tasks-Actor` is read as the human's, and the human

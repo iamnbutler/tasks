@@ -757,6 +757,23 @@ pub struct OrchestratorMessage {
     pub created_at: DateTime<Utc>,
 }
 
+/// An enrolled external agent: a name the human (or the orchestrator, under
+/// `enroll_agents`) handed a short-lived code to, so its messages land in the
+/// orchestrator conversation under that name instead of as the human's.
+///
+/// The code itself is never here — it is returned exactly once at mint time
+/// and stored only as a SHA-256 hash, the same custody a broker lease gets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEnrollment {
+    pub id: i64,
+    pub name: String,
+    pub minted_by: Actor,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatRole {
@@ -1185,6 +1202,15 @@ decision_actions! {
     /// different actor, about a first one. Not charter-gated: see
     /// `POST /decisions/{seq}/settle`.
     SettleDecision => "settle_decision", None;
+    /// An enrollment code was minted: an external agent may now message the
+    /// orchestrator under the enrolled name until the code expires. Recorded
+    /// because it shapes who has a voice in the conversation — the rationale
+    /// is where "which agent, and why" lives.
+    EnrollAgent => "enroll_agent", Some(Capability::EnrollAgents);
+    /// An enrollment was revoked before its expiry — the recourse for a mint
+    /// that was wrong, and the reason `enroll_agents` can be trusted with
+    /// `live`.
+    RevokeAgent => "revoke_agent", Some(Capability::EnrollAgents);
 }
 
 /// What became of the effect a decision authorized.
@@ -1279,12 +1305,26 @@ pub enum Capability {
     /// away — and a human who wants one without the other has to be able to
     /// say so.
     CancelRuns,
+    /// Mint (and revoke) short-lived enrollment codes that let an external
+    /// agent send messages into the orchestrator conversation under its own
+    /// name.
+    ///
+    /// A capability rather than human-only, because the convenient flow is
+    /// asking the orchestrator in chat for a code and pasting its reply into
+    /// the other agent — no app UI in the loop. What makes that safe to
+    /// grant: an enrollment conveys a *voice*, not authority (an agent turn
+    /// is input the orchestrator weighs, never a gated write), every mint is
+    /// a ledger row with a rationale, and the code names its holder — so the
+    /// recourse for a bad mint is `POST /agents/{id}/revoke`, which this same
+    /// capability covers for the same reason `reopen_work` lives under
+    /// `retire_work`: an act and its undo belong to one switch.
+    EnrollAgents,
 }
 
 impl Capability {
     /// Every capability, in the order the charter is meant to be flipped:
     /// additive and trivially reversible first, irreversible-ish last.
-    pub const ALL: [Capability; 9] = [
+    pub const ALL: [Capability; 10] = [
         Capability::CaptureWork,
         Capability::CommentOnWork,
         Capability::RetireWork,
@@ -1294,6 +1334,7 @@ impl Capability {
         Capability::AutoReviewSpecs,
         Capability::LandBuilds,
         Capability::CurateWork,
+        Capability::EnrollAgents,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -1307,6 +1348,7 @@ impl Capability {
             Capability::LandBuilds => "land_builds",
             Capability::CurateWork => "curate_work",
             Capability::CancelRuns => "cancel_runs",
+            Capability::EnrollAgents => "enroll_agents",
         }
     }
 
@@ -1321,6 +1363,7 @@ impl Capability {
             "land_builds" => Some(Capability::LandBuilds),
             "curate_work" => Some(Capability::CurateWork),
             "cancel_runs" => Some(Capability::CancelRuns),
+            "enroll_agents" => Some(Capability::EnrollAgents),
             _ => None,
         }
     }
@@ -1337,6 +1380,10 @@ impl Capability {
             Capability::LandBuilds => "merge a Builder's pull request, or close it unmerged",
             Capability::CurateWork => "revise an issue you filed: its body, its labels",
             Capability::CancelRuns => "stop a scout or a build that is already running",
+            Capability::EnrollAgents => {
+                "enroll an external agent: mint a short-lived code that lets it \
+                 message you (POST /agents), or revoke one"
+            }
         }
     }
 }

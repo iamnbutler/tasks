@@ -31,10 +31,11 @@ use tasks_api::http::DecisionReconciliation;
 use tasks_api::http::{
     AbandonPullRequest, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelAllResponse,
     CancelRunRequest, CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject,
-    EditIssueRequest, ErrorResponse, GitHubHold, LabelInfo, MergePullRequest, ModeResponse,
-    RejectedBundle, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewCommentRequest,
-    ReviewRequest, ScoutRequest, SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode,
-    SetProjectStatus, SettleDecisionRequest, ShadowAck,
+    EditIssueRequest, EnrollAgentRequest, EnrollAgentResponse, ErrorResponse, GitHubHold,
+    LabelInfo, MergePullRequest, ModeResponse, RejectedBundle, ReopenTaskRequest, ReorderQueue,
+    ReorderSpecQueue, ReviewCommentRequest, ReviewRequest, RevokeAgentRequest, ScoutRequest,
+    SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode, SetProjectStatus,
+    SettleDecisionRequest, ShadowAck,
 };
 
 use crate::bundles::RejectedBundles;
@@ -42,15 +43,15 @@ use crate::events::{Event, EventPayload};
 use crate::github::{GhIssue, GitHubClient};
 use crate::github_health::GitHubHealth;
 use crate::models::{
-    Actor, Build, BuildId, Capability, CharterEntry, CharterLevel, ChatRole, CloseReason,
-    Complexity, Decision, DecisionAction, DecisionInput, DecisionState, Directions, GhState, Mode,
-    OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, RunKind,
-    ScoutNotes, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueItem, SpecQueueStatus,
-    Task, TaskId, TranscriptLine, TranscriptOwner,
+    Actor, AgentEnrollment, Build, BuildId, Capability, CharterEntry, CharterLevel, ChatRole,
+    CloseReason, Complexity, Decision, DecisionAction, DecisionInput, DecisionState, Directions,
+    GhState, Mode, OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId, ProjectStatus,
+    RunKind, ScoutNotes, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueItem,
+    SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner,
 };
 use crate::store::{
-    ACTOR_HEADER, ActorClaim, MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store, StoreError,
-    require_rationale,
+    ACTOR_HEADER, AGENT_HEADER, ActorClaim, MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store,
+    StoreError, require_rationale,
 };
 
 /// How many events `/events` returns when the caller doesn't ask for a count.
@@ -320,6 +321,8 @@ fn routes(store: Arc<Store>, services: Services) -> Router {
             "/orchestrator/messages",
             get(list_orchestrator_messages).post(send_orchestrator_message),
         )
+        .route("/agents", get(list_agents).post(enroll_agent))
+        .route("/agents/{id}/revoke", post(revoke_agent))
         .route("/orchestrator/stream", get(stream_orchestrator))
         .route("/orchestrator/session", get(get_orchestrator_session))
         .route(
@@ -2611,7 +2614,9 @@ async fn look_up_artifact(
         | DecisionAction::AuthorSpec
         | DecisionAction::QueueTask
         | DecisionAction::CancelRun
-        | DecisionAction::SettleDecision => (
+        | DecisionAction::SettleDecision
+        | DecisionAction::EnrollAgent
+        | DecisionAction::RevokeAgent => (
             "unknown",
             serde_json::Value::Null,
             "this action never reaches another system, so it has no artifact to find —              a pending row here is a bug, not a window"
@@ -3068,18 +3073,205 @@ struct MessagesQuery {
 
 /// 202: the message is queued; the orchestrator loop answers it. Watch
 /// `orchestrator_message` events (or poll) for the reply.
+///
+/// Who is speaking is decided by headers, and the decision is three-way. No
+/// [`AGENT_HEADER`] is the human — the default every unattributed request
+/// gets, and the human is never gated. A header carrying a *valid* enrollment
+/// code is that agent: the turn lands as [`ChatRole::Event`] under a
+/// server-written `[agent <name>]` heading, so the orchestrator (and the
+/// transcript's reader) can see it is neither the human nor the pipeline. A
+/// header that does not verify — unknown, expired, revoked — is a 403 and the
+/// message is *discarded*: demoting a failed claim to "the human" is the one
+/// direction this must never fail, the same rule [`ACTOR_HEADER`] follows.
+/// The refusals name their fix, because the retrying party is an agent that
+/// can only act on what the error says.
 async fn send_orchestrator_message(
     State(store): State<Arc<Store>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<SendMessage>,
 ) -> ApiResult<(StatusCode, Json<OrchestratorMessage>)> {
     let content = body.content.trim();
     if content.is_empty() {
         return Err(ApiError::BadRequest("message is empty".into()));
     }
+    let Some(code) = headers.get(AGENT_HEADER).and_then(|v| v.to_str().ok()) else {
+        let message = store
+            .append_orchestrator_message(ChatRole::User, content)
+            .await?;
+        return Ok((StatusCode::ACCEPTED, Json(message)));
+    };
+    let enrollment = store.agent_by_code(code).await?.ok_or_else(|| {
+        ApiError::Forbidden(format!(
+            "{AGENT_HEADER} did not verify — the message was not delivered. A failed \
+             claim is refused rather than read as the human; ask the human for an \
+             enrollment code (POST /agents) and send it exactly as issued."
+        ))
+    })?;
+    if let Some(revoked_at) = enrollment.revoked_at {
+        return Err(ApiError::Forbidden(format!(
+            "the enrollment for \"{}\" was revoked at {revoked_at} — the message was \
+             not delivered. Ask the human for a new code if you should still have a \
+             voice here.",
+            enrollment.name
+        )));
+    }
+    if enrollment.expires_at <= chrono::Utc::now() {
+        return Err(ApiError::Forbidden(format!(
+            "the enrollment for \"{}\" expired at {} — the message was not delivered. \
+             Ask the human for a new code (POST /agents).",
+            enrollment.name, enrollment.expires_at
+        )));
+    }
+    // The heading is written here, server-side, so it can never be claimed —
+    // same as `[pipeline]`. Everything after the first line is the agent's
+    // own text, and the prompt says to read it that way.
+    let attributed = format!(
+        "[agent {}] Message from an enrolled external agent — not the human, \
+         not the pipeline:\n{content}",
+        enrollment.name
+    );
     let message = store
-        .append_orchestrator_message(ChatRole::User, content)
+        .append_orchestrator_message(ChatRole::Event, &attributed)
         .await?;
+    if let Err(e) = store.touch_agent(enrollment.id).await {
+        warn!(error = %e, agent = %enrollment.name, "could not stamp agent last_used_at");
+    }
     Ok((StatusCode::ACCEPTED, Json(message)))
+}
+
+// --- agent enrollments ---
+
+/// Mint an enrollment code (the device-code flow): the human — or the
+/// orchestrator, under `enroll_agents` — names an external agent and gets a
+/// short-lived code to hand it. The code appears in this response and never
+/// again; the server keeps a hash.
+///
+/// The ledger row is written after the mint rather than inside it, the
+/// `queue_task` shape: minting is trivially reversible (revoke), so the row
+/// is audit, not authorization. What `authorize` puts *ahead* of the mint is
+/// the part that must refuse first — the charter level and the rationale.
+async fn enroll_agent(
+    State(store): State<Arc<Store>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<EnrollAgentRequest>,
+) -> ApiResult<Response> {
+    let actor = actor_of(&store, &headers)?;
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    let authority = authorize(
+        &store,
+        &decision,
+        Capability::EnrollAgents,
+        DecisionAction::EnrollAgent,
+    )
+    .await?;
+    if authority == Authority::Shadow {
+        let seq = store
+            .record_decision(
+                "agent",
+                body.name.trim(),
+                DecisionAction::EnrollAgent,
+                decision,
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "no code was minted"));
+    }
+    let (enrollment, code) = store.enroll_agent(&body.name, actor, body.ttl_secs).await?;
+    if actor == Actor::Orchestrator {
+        store
+            .record_decision(
+                "agent",
+                &enrollment.id.to_string(),
+                DecisionAction::EnrollAgent,
+                decision,
+                true,
+            )
+            .await?;
+    }
+    store
+        .append_event(EventPayload::Note {
+            source: "agents".into(),
+            message: format!(
+                "agent \"{}\" enrolled by {} until {}",
+                enrollment.name,
+                actor.as_str(),
+                enrollment.expires_at.format("%Y-%m-%d %H:%M UTC"),
+            ),
+        })
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(EnrollAgentResponse { enrollment, code }),
+    )
+        .into_response())
+}
+
+/// Enrollments, newest first — who can speak, who spoke, and what has lapsed.
+async fn list_agents(State(store): State<Arc<Store>>) -> ApiResult<Json<Vec<AgentEnrollment>>> {
+    Ok(Json(store.list_agent_enrollments(100).await?))
+}
+
+/// End an enrollment early — the recourse for a mint that was wrong, under
+/// the same capability that minted it.
+async fn revoke_agent(
+    State(store): State<Arc<Store>>,
+    Path(id): Path<i64>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<RevokeAgentRequest>>,
+) -> ApiResult<Response> {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let actor = actor_of(&store, &headers)?;
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    let authority = authorize(
+        &store,
+        &decision,
+        Capability::EnrollAgents,
+        DecisionAction::RevokeAgent,
+    )
+    .await?;
+    if authority == Authority::Shadow {
+        let seq = store
+            .record_decision(
+                "agent",
+                &id.to_string(),
+                DecisionAction::RevokeAgent,
+                decision,
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "the enrollment was not revoked"));
+    }
+    let enrollment = store.revoke_agent(id).await?;
+    if actor == Actor::Orchestrator {
+        store
+            .record_decision(
+                "agent",
+                &id.to_string(),
+                DecisionAction::RevokeAgent,
+                decision,
+                true,
+            )
+            .await?;
+    }
+    store
+        .append_event(EventPayload::Note {
+            source: "agents".into(),
+            message: format!(
+                "agent \"{}\" enrollment revoked by {}",
+                enrollment.name,
+                actor.as_str()
+            ),
+        })
+        .await?;
+    Ok(Json(enrollment).into_response())
 }
 
 /// The conversation, always bounded.
