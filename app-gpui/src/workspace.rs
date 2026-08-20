@@ -65,12 +65,6 @@ pub(crate) const FONT: &str = "Menlo";
 /// wrap at a comfortable measure instead of spanning a wide window.
 const CHAT_MAX_WIDTH: gpui::Pixels = px(768.);
 
-/// The chip's microphone, inline as SVG bytes: the radix set gpuikit ships
-/// has no mic, and `Image::from_bytes(Svg, …)` renders without an asset
-/// source. Stroke is gruvbox's muted gray, hardcoded because an `img` does
-/// not take the text color — acceptable for a control that ships disabled.
-const MIC_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#928374" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>"##;
-
 actions!(
     workspace,
     [
@@ -1912,10 +1906,14 @@ impl Workspace {
             )
     }
 
-    /// The chip at the chat's top-right, per the design: the mic (voice mode
-    /// with the orchestrator, later — shipped disabled so the slot exists),
-    /// a divider, and the signed-in human's avatar, which opens their GitHub
-    /// profile.
+    /// The chip at the chat's top-right: the signed-in human's avatar, which
+    /// opens their GitHub profile.
+    ///
+    /// It used to carry a permanently-disabled microphone beside it — the one
+    /// control in the app that shipped disabled, promising a feature that does
+    /// not exist. It is gone, along with the only hardcoded gruvbox colour in
+    /// the tree (the SVG's stroke, defended by a comment that evaporated with
+    /// the control). Nothing here now promises anything the app cannot do.
     ///
     /// Who that is comes from `GET /viewer` — the server's own credential —
     /// and is **inert in every state but the one with a real identity behind
@@ -1924,10 +1922,6 @@ impl Workspace {
     fn render_chat_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let identity = crate::identity::chip_identity(self.app_state.read(cx).viewer.as_ref());
-        let mic = std::sync::Arc::new(gpui::Image::from_bytes(
-            gpui::ImageFormat::Svg,
-            MIC_SVG.to_vec(),
-        ));
 
         let avatar: gpui::AnyElement = match self.avatar.clone() {
             Some(image) => gpui::img(image)
@@ -1954,24 +1948,13 @@ impl Workspace {
             .flex_row()
             .items_center()
             .gap(px(8.))
-            .pl(px(10.))
-            .pr(px(8.))
+            // Symmetric now there is one child: the asymmetry existed to sit
+            // the mic off the rounded corner, and with the mic gone it read as
+            // an off-centre avatar.
+            .px(px(8.))
             .py(px(5.))
             .rounded_bl(px(14.))
             .bg(theme.surface_secondary())
-            .child(
-                div()
-                    .id("voice-mode")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .size(px(20.))
-                    .opacity(0.45)
-                    .cursor_not_allowed()
-                    .tooltip(tooltip("Voice mode — coming soon"))
-                    .child(gpui::img(mic).size(px(15.))),
-            )
-            .child(div().w(px(1.)).h(px(14.)).bg(theme.border_secondary()))
             .child(
                 div()
                     .id("github-profile")

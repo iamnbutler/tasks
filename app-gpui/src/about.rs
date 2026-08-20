@@ -5,7 +5,20 @@
 //! a monospaced commit line. Both are stamped by `build.rs`; `0.1.0` with
 //! `commit unknown` means the binary was built without git in reach.
 //!
-//! Beneath them, [`crate::disclaimer`]. This is the window a stranger opens
+//! Beneath them, [`crate::disclaimer`] and one link to the repository. The
+//! disclaimer already sends the reader to "README.md, under Read this first",
+//! and this is the one window in the app with no checkout behind it — so that
+//! pointer named a file the reader had nothing to open. One link and not a row
+//! of them: a footer of links is the marketing register the paragraph below
+//! rules out.
+//!
+//! **The icon half of #998 is deliberately not done.** There is no icon in the
+//! repository — no `.icns`, no `CFBundleIconFile` in `Info.plist.in`, nothing
+//! copied by `app-install` — and drawing a placeholder mark would be the
+//! microphone one window over. When a real icon lands it goes above the name
+//! here, and the bundle wants it at the same time.
+//!
+//! This is the window a stranger opens
 //! before pointing the pipeline at their repositories, so it is where the
 //! plain statement belongs. Left-aligned and width-bounded on purpose:
 //! centred prose past one line reads as a splash screen, which is the
@@ -24,6 +37,9 @@ use crate::disclaimer;
 pub const VERSION: &str = env!("TASKS_GPUI_VERSION");
 /// Short SHA (`-dirty` when the tree had uncommitted changes), or `unknown`.
 pub const COMMIT: &str = env!("TASKS_GPUI_COMMIT");
+/// Where the source lives — what [`crate::disclaimer::README_POINTER`] sends
+/// the reader to, made openable.
+pub const REPOSITORY: &str = "https://github.com/iamnbutler/tasks";
 
 /// The About window is a singleton: a second "About Tasks" raises the one
 /// that's already open rather than stacking another.
@@ -57,7 +73,9 @@ pub fn open(cx: &mut App) {
         }),
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
-            size(px(380.), px(300.)),
+            // 330 rather than 300 for the repository row: `is_resizable` is
+            // false, so this will not self-correct.
+            size(px(380.), px(330.)),
             cx,
         ))),
         is_resizable: false,
@@ -124,6 +142,20 @@ impl Render for About {
                     .text_color(theme.fg_muted())
                     .child(disclaimer::README_POINTER),
             )
+            .child(
+                div()
+                    .id("about-repository")
+                    .mt(px(4.))
+                    .text_xs()
+                    .text_color(theme.fg_muted())
+                    .cursor_pointer()
+                    .hover({
+                        let fg = theme.fg();
+                        move |el| el.text_color(fg)
+                    })
+                    .on_click(|_event, _window, cx| cx.open_url(REPOSITORY))
+                    .child(REPOSITORY),
+            )
     }
 }
 
@@ -137,5 +169,29 @@ mod tests {
     fn the_build_stamp_says_something() {
         assert!(!VERSION.is_empty());
         assert!(!COMMIT.is_empty());
+    }
+
+    /// The link has to be openable, which means a real absolute GitHub URL —
+    /// and no trailing slash, because it is rendered as the label too.
+    #[test]
+    fn the_repository_link_is_a_real_url() {
+        assert!(
+            REPOSITORY.starts_with("https://github.com/"),
+            "{REPOSITORY}"
+        );
+        assert!(!REPOSITORY.ends_with('/'), "{REPOSITORY}");
+        assert_eq!(REPOSITORY.matches('/').count(), 4, "owner/repo, no deeper");
+    }
+
+    /// The link exists to serve the disclaimer's pointer. If that sentence
+    /// ever stops naming the README, this row's reason for being here has
+    /// changed and somebody should say so on purpose.
+    #[test]
+    fn the_pointer_this_link_serves_still_names_the_readme() {
+        assert!(
+            disclaimer::README_POINTER.contains("README.md"),
+            "{}",
+            disclaimer::README_POINTER
+        );
     }
 }

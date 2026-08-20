@@ -2,7 +2,8 @@
 //! Swift app: colored text on the same color at 15% opacity.
 
 use gpui::prelude::*;
-use gpui::{div, hsla, px, Hsla};
+use gpui::{div, hsla, px, Hsla, SharedString};
+use gpuikit::elements::tooltip::tooltip;
 use tasks_client::api::models::TaskState;
 
 fn color(hue_degrees: f32, saturation: f32, lightness: f32) -> Hsla {
@@ -39,9 +40,30 @@ pub fn title_case(wire: &str) -> String {
         .join(" ")
 }
 
-/// A capsule badge: `label` in `color` on a 15%-opacity wash of it.
-pub fn status_badge(label: impl Into<String>, color: Hsla) -> impl IntoElement {
+/// A capsule badge: `label` in `color` on a 15%-opacity wash of it, with
+/// `gloss` on a hover tooltip.
+///
+/// **The gloss is a required parameter, not a builder step.** The badge that
+/// showed `Awaiting Merge` and explained it nowhere is now one nobody can
+/// write — the precedent is `Check::fail` taking its fix by value in `tasks
+/// doctor`, where a convention is what the next call site quietly skips. The
+/// old no-tooltip `status_badge` is gone rather than kept beside this one,
+/// which is what makes the guarantee structural; [`crate::vocabulary`] is
+/// where every gloss comes from.
+///
+/// `id` is needed because gpui's `.tooltip()` only exists on `Stateful<Div>`.
+/// Ids must be unique among siblings, and gpui treats a repeated id across
+/// frames as the same node — so a badge rendered per row keys off the row's
+/// task, never off a constant, or the tooltip follows the wrong row after a
+/// reorder.
+pub fn status_badge(
+    id: impl Into<SharedString>,
+    label: impl Into<String>,
+    gloss: &'static str,
+    color: Hsla,
+) -> impl IntoElement {
     div()
+        .id(id.into())
         .px(px(7.))
         .py(px(1.))
         .rounded_full()
@@ -49,5 +71,6 @@ pub fn status_badge(label: impl Into<String>, color: Hsla) -> impl IntoElement {
         .text_color(color)
         .text_xs()
         .flex_none()
+        .tooltip(tooltip(gloss))
         .child(label.into())
 }

@@ -17,7 +17,7 @@ use gpuikit::elements::tooltip::tooltip;
 use gpuikit::theme::{ActiveTheme, Themeable};
 use tasks_client::api::models::{Task, TaskId, TaskState};
 
-use crate::components::{status_badge, task_state_color, title_case};
+use crate::components::{status_badge, task_state_color};
 use crate::projects::{self, ProjectFilter};
 use crate::time;
 use crate::workspace::Workspace;
@@ -254,7 +254,18 @@ impl Workspace {
                                         .child(repo)
                                 }))
                                 .when(task_state != TaskState::Backlog, |el| {
-                                    el.child(status_badge(title_case(task_state.as_str()), color))
+                                    // Keyed by task and never by a constant:
+                                    // gpui treats a repeated id across frames
+                                    // as the same node, so a constant here
+                                    // makes the tooltip follow the wrong row
+                                    // after a reorder.
+                                    let term = crate::vocabulary::task_state(task_state);
+                                    el.child(status_badge(
+                                        SharedString::from(format!("row-state-{id}")),
+                                        term.label,
+                                        term.gloss,
+                                        color,
+                                    ))
                                 })
                                 .child(
                                     div()

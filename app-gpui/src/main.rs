@@ -22,6 +22,7 @@ mod server;
 mod server_window;
 mod state;
 mod time;
+mod vocabulary;
 mod workspace;
 
 use gpui::{
