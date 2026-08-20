@@ -897,7 +897,13 @@ async fn a_stacked_pr_whose_base_already_landed_wants_retargeting() {
             .unwrap(),
     );
     assert!(text.contains("ALREADY reached main"), "{text}");
-    assert!(text.contains("retargeting"), "{text}");
+    // #1027: the arm has an act behind it now, so the fact names the endpoint
+    // rather than the wish. A brief that says a merge is refused and does not
+    // say what to do instead is a dead end.
+    assert!(
+        text.contains("/pull-requests/903/retarget"),
+        "names the act, with this PR's number in it: {text}"
+    );
 }
 
 /// #1035: a pull request a human retargeted at the trunk is **not** stacked,

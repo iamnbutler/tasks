@@ -1269,6 +1269,15 @@ decision_actions! {
     MergeBuild => "merge_build", Some(Capability::LandBuilds);
     /// A pull request was closed unmerged — the branch is not going to land.
     AbandonBuild => "abandon_build", Some(Capability::LandBuilds);
+    /// A pull request was pointed at a different base branch — ordinarily the
+    /// trunk, once the base it was stacked on has already reached it.
+    ///
+    /// Under `land_builds` with `MergeBuild` rather than its own capability,
+    /// because it is the same judgment about the same artifact and the merge is
+    /// what it exists to make possible. It is also the reversible one: calling
+    /// it again points the pull request somewhere else, where a merge cannot be
+    /// unmerged and a merged pull request can never be retargeted at all.
+    RetargetBuild => "retarget_build", Some(Capability::LandBuilds);
     /// A comment pinned to a line of a pull request's diff. Separate from
     /// `CommentOnWork` because it points at code rather than at the thread,
     /// and because it can be wrong about a line that no longer exists.

@@ -1088,7 +1088,11 @@ pub async fn format_obligations(
              your call under the charter, and the facts beneath each build say what \
              GitHub reports about the merge, what the build claimed about its own \
              test run, and how much of it nothing here could have checked. Not \
-             merging one is a decision too — say which of those three is why."
+             merging one is a decision too — say which of those three is why. \
+             One case has an act rather than an answer behind it: where the \
+             facts say a PR's base has ALREADY reached the trunk, the merge \
+             route refuses it, and what resolves it is POST \
+             /pull-requests/{{number}}/retarget."
         ));
     }
 
@@ -1806,6 +1810,13 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
            time: it refuses on a failing required check or a conflict, so do \
            not pre-screen from anything stored here. Rationale is mandatory; \
            this is the one write whose recourse is a revert\n\
+         - POST /pull-requests/{{number}}/retarget \
+           {{\"base\",\"rationale\"}} — point a PR at a different base \
+           branch. What a stacked build needs when its base landed FIRST: \
+           merging it there would add a commit to a branch nothing picks up, \
+           so the merge route refuses that case outright and this is the way \
+           through. Reversible, unlike the merge — and impossible after one, \
+           since GitHub will not edit a merged pull request\n\
          - POST /pull-requests/{{number}}/close {{\"rationale\"}} — close a PR \
            unmerged. Say why on the PR first, with a comment; the close itself \
            carries no reason GitHub will show\n\

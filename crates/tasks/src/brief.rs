@@ -688,10 +688,20 @@ impl<'a> Brief<'a> {
                      nothing until {} itself lands",
                     pr_base, self.base_branch, pr_base
                 ),
+                // The one arm with an act rather than a wait behind it, and
+                // the reason the act exists (#1027). The diagnosis was exact
+                // long before there was a verb for it, so the standing "merge
+                // it this turn" instruction pointed at the one move that
+                // cannot be walked back — a merged pull request can never be
+                // retargeted, so the merge deletes its own fix. The merge
+                // route now refuses this arm outright; naming the endpoint
+                // here is what keeps the refusal from reading as a dead end.
                 (false, true) => format!(
                     "its base {} has ALREADY reached {}, so merging this PR now only \
-                     adds a commit to a branch nothing will pick up — it wants \
-                     retargeting at {} first",
+                     adds a commit to a branch nothing will pick up — and the merge \
+                     endpoint refuses it for that reason. The act that resolves this \
+                     is POST /pull-requests/{number}/retarget with {{\"base\": \"{}\"}} \
+                     and a rationale; merge it once that lands",
                     pr_base, self.base_branch, self.base_branch
                 ),
             }),

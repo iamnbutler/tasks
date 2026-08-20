@@ -184,6 +184,28 @@ pub struct CommentRequest {
     pub evidence: Option<serde_json::Value>,
 }
 
+/// Body of `POST /pull-requests/{number}/retarget`.
+///
+/// The verb a stacked pull request needs once its base has already landed
+/// (#1027). Until it existed, that state was diagnosed precisely by the brief
+/// and had no act behind it: merging adds a commit to a branch nothing will
+/// pick up, and a merged pull request can never be retargeted afterwards — so
+/// the instructed default was the irreversible one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetargetPullRequest {
+    #[serde(default)]
+    pub project_id: Option<ProjectId>,
+    /// The branch this pull request should merge into instead — ordinarily the
+    /// trunk, once the base it was stacked on has reached it.
+    pub base: String,
+    /// Why. Required of the orchestrator like every other write here; unlike a
+    /// merge, this one is reversible by calling it again.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
 /// Body of `POST /pull-requests/{number}/merge`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MergePullRequest {

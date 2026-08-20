@@ -1075,6 +1075,46 @@ impl GitHubClient {
             .ok_or_else(|| GhError::Shape("merge response missing `sha`".into()))
     }
 
+    /// Point a pull request at a different base branch (#1027).
+    ///
+    /// The verb the pipeline lacked. A build stacked on another build's branch
+    /// is opened against that branch, and when the base lands *first* the
+    /// dependent is left pointing at a branch nothing will pick up: merging it
+    /// ships nothing, and it can never be retargeted afterwards, because GitHub
+    /// refuses to edit a merged pull request. So the diagnosis had no act
+    /// behind it and the instructed default was the irreversible one.
+    ///
+    /// REST rather than GraphQL for the reason PR creation is: the field is on
+    /// `PATCH /repos/{o}/{r}/pulls/{n}`, and GitHub refuses the edit itself
+    /// when the new base does not exist or the pull request is already merged —
+    /// which is the check we want, asked at the moment of asking.
+    pub async fn retarget_pull_request(
+        &self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        base: &str,
+    ) -> Result<String, GhError> {
+        let url = format!("{}/repos/{owner}/{name}/pulls/{number}", self.rest_base_url);
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(self.token().expose())
+            .header("Accept", "application/vnd.github+json")
+            .json(&serde_json::json!({ "base": base }))
+            .send()
+            .await?;
+        let body = rest_ok(resp, &format!("retarget pull request {number}")).await?;
+        // Read the base back rather than echoing the request: GitHub is the
+        // only thing that knows whether the edit took, and a caller told what
+        // it asked for has learned nothing.
+        body.get("base")
+            .and_then(|b| b.get("ref"))
+            .and_then(|r| r.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| GhError::Shape("retarget response missing `base.ref`".into()))
+    }
+
     /// Close a pull request without merging it.
     ///
     /// Distinct from [`GitHubClient::close_issue`] because PRs live under

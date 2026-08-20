@@ -39,6 +39,14 @@ struct Seen {
     /// Open pull requests the fake reports as based on the branch under test —
     /// what a squash of it would strand (#1044). Empty is the ordinary case.
     stacked_on_head: Vec<u64>,
+    /// The base branch the fake reports for the pull request under test.
+    /// `None` is the ordinary case and reads as the trunk; naming another
+    /// branch makes the PR stacked (#1027).
+    pr_base: Option<String>,
+    /// What `compare/{trunk}...{base}` reports — `identical`/`behind` mean the
+    /// base has already reached the trunk, which is the arm a merge is refused
+    /// on. `None` is `ahead`: ordinary stacking, and the merge is allowed.
+    base_reached_trunk: bool,
 }
 
 impl Seen {
@@ -54,6 +62,12 @@ impl Seen {
             && self.labels_set.is_empty()
             && self.merged.is_empty()
             && self.prs_patched.is_empty()
+    }
+
+    /// Stacked on `base`, which has already landed — the #1027 shape.
+    fn stacked_on_a_landed_base(&mut self, base: &str) {
+        self.pr_base = Some(base.into());
+        self.base_reached_trunk = true;
     }
 }
 
@@ -146,11 +160,15 @@ async fn spawn_fake_github(issue_number: u64) -> (String, Arc<Mutex<Seen>>) {
         .route(
             "/repos/{owner}/{repo}/pulls/{number}",
             axum::routing::get(
-                move |AxumPath((_owner, _repo, number)): AxumPath<(String, String, u64)>| async move {
+                move |State(s): State<Arc<Mutex<Seen>>>,
+                      AxumPath((_owner, _repo, number)): AxumPath<(String, String, u64)>| async move {
+                    let base = s.lock().unwrap().pr_base.clone().unwrap_or_else(|| "main".into());
                     AxumJson(json!({
                         "number": number,
+                        "state": "open",
+                        "merged": false,
                         "head": { "sha": "abc123", "ref": "build/under_test" },
-                        "base": { "ref": "main" },
+                        "base": { "ref": base },
                     }))
                 },
             )
@@ -158,10 +176,29 @@ async fn spawn_fake_github(issue_number: u64) -> (String, Arc<Mutex<Seen>>) {
                 move |State(s): State<Arc<Mutex<Seen>>>,
                       AxumPath((_owner, _repo, number)): AxumPath<(String, String, u64)>,
                       AxumJson(body): AxumJson<Value>| async move {
+                    // One PATCH route, two verbs: a close sends `state` and a
+                    // retarget sends `base`, exactly as GitHub takes them. The
+                    // response echoes the base back because that is what
+                    // `retarget_pull_request` reads its answer out of — a
+                    // caller told what it asked for has learned nothing.
+                    let base = body.get("base").cloned();
                     s.lock().unwrap().prs_patched.push((number, body));
-                    AxumJson(json!({ "number": number, "state": "closed" }))
+                    AxumJson(json!({
+                        "number": number,
+                        "state": "closed",
+                        "base": { "ref": base.unwrap_or(json!("main")) },
+                    }))
                 },
             ),
+        )
+        .route(
+            // A wildcard: the spec is `trunk...branch`, and a branch name has slashes
+            // in it (`build/build_…`), so a single-segment capture never matches.
+            "/repos/{owner}/{repo}/compare/{*spec}",
+            axum::routing::get(move |State(s): State<Arc<Mutex<Seen>>>| async move {
+                let reached = s.lock().unwrap().base_reached_trunk;
+                AxumJson(json!({ "status": if reached { "behind" } else { "ahead" } }))
+            }),
         )
         .route(
             "/repos/{owner}/{repo}/pulls",
@@ -684,6 +721,142 @@ async fn a_squash_refuses_when_what_is_stacked_cannot_be_read() {
     );
 }
 
+/// #1027: a stacked pull request whose base has ALREADY reached the trunk is
+/// refused, because merging it would add a commit to a branch nothing will pick
+/// up — and would delete the only cheap fix in the same act, since GitHub will
+/// not retarget a merged pull request.
+#[tokio::test]
+async fn a_merge_whose_base_already_landed_is_refused_and_names_the_retarget() {
+    let h = harness(true).await;
+    h.seen
+        .lock()
+        .unwrap()
+        .stacked_on_a_landed_base("build/build_639333ce");
+
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/pull-requests/837/merge", h.base)))
+        .json(&json!({ "rationale": "approved spec, green run" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let message = resp.text().await.unwrap();
+    assert!(
+        message.contains("build/build_639333ce") && message.contains("main"),
+        "names the base and the trunk: {message}"
+    );
+    assert!(
+        message.contains("/pull-requests/837/retarget"),
+        "names the act that resolves it, or the refusal is a dead end: {message}"
+    );
+    assert!(
+        h.seen.lock().unwrap().merged.is_empty(),
+        "refused before the write"
+    );
+
+    // And the way through works, which is what makes this a redirection: the
+    // retarget lands, and the merge that follows it is allowed.
+    let resp = h
+        .as_orchestrator(
+            h.http
+                .post(format!("{}/pull-requests/837/retarget", h.base)),
+        )
+        .json(&json!({ "base": "main", "rationale": "its base has already reached main" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let patched = h.seen.lock().unwrap().prs_patched.clone();
+    assert_eq!(patched.len(), 1);
+    assert_eq!(patched[0].0, 837);
+    assert_eq!(patched[0].1["base"], "main");
+
+    h.seen.lock().unwrap().pr_base = None;
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/pull-requests/837/merge", h.base)))
+        .json(&json!({ "rationale": "retargeted at main, green run" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(h.seen.lock().unwrap().merged.len(), 1);
+}
+
+/// The other half of the arm, and the one a blunter check would break: a pull
+/// request stacked on a base that has **not** landed yet merges normally. That
+/// is ordinary stacking — its work ships when the base does — and refusing it
+/// would stop the pipeline from draining a queue at all.
+#[tokio::test]
+async fn a_merge_onto_a_base_that_has_not_landed_is_ordinary_stacking() {
+    let h = harness(true).await;
+    h.seen.lock().unwrap().pr_base = Some("build/build_639333ce".into());
+
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/pull-requests/837/merge", h.base)))
+        .json(&json!({ "rationale": "approved spec, green run, base still open" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(h.seen.lock().unwrap().merged.len(), 1);
+}
+
+/// The asymmetry again, and the same inversion the squash check makes: a
+/// GitHub that will not say where this pull request points refuses the merge.
+/// Refusing a good merge costs a retry; allowing this one costs the work and
+/// the fix together.
+#[tokio::test]
+async fn a_merge_refuses_when_the_base_cannot_be_read() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let h = harness_against(url).await;
+
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/pull-requests/837/merge", h.base)))
+        .json(&json!({ "rationale": "approved spec, green run" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let message = resp.text().await.unwrap();
+    assert!(message.contains("unknown"), "{message}");
+    assert!(
+        h.seen.lock().unwrap().is_untouched(),
+        "nothing reached GitHub on an unreadable answer"
+    );
+}
+
+/// A retarget is an ordinary ledgered write: attributed, explained, and
+/// recorded — and the response reports the base GitHub read back rather than
+/// the one that was asked for.
+#[tokio::test]
+async fn a_retarget_is_ledgered_like_every_other_github_write() {
+    let h = harness(true).await;
+
+    let resp = h
+        .as_orchestrator(
+            h.http
+                .post(format!("{}/pull-requests/837/retarget", h.base)),
+        )
+        .json(&json!({
+            "base": "main",
+            "rationale": "its base reached main first, so this ships nothing where it points",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["base"], "main");
+
+    let decisions = h.store.decisions(None, 10).await.unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].action.as_str(), "retarget_build");
+    assert_eq!(decisions[0].actor, Actor::Orchestrator);
+    assert_eq!(decisions[0].state, DecisionState::Applied);
+}
+
 /// Merging is the one write whose recourse is a revert rather than an edit, so
 /// the ledger row has to be worth reading on its own. An autonomous merge with
 /// no stated reason is refused before anything reaches GitHub.
@@ -1160,9 +1333,29 @@ async fn spawn_silent_github(store: Arc<Store>) -> String {
             )
             .patch(unavailable),
         )
+        // The GET answers, and only the GET: `merge_pull_request` reads the
+        // pull request before it writes, to refuse a stacked one whose base
+        // already landed (#1027), and a refusal is a no-op — it would leave no
+        // pending row and this test would be asserting nothing about the merge
+        // route. Every *write* here still never answers, which is the property.
         .route(
             "/repos/{owner}/{repo}/pulls/{number}",
-            axum::routing::get(unavailable).patch(unavailable),
+            axum::routing::get(
+                move |AxumPath((_o, _r, number)): AxumPath<(String, String, u64)>| async move {
+                    AxumJson(json!({
+                        "number": number,
+                        "state": "open",
+                        "merged": false,
+                        "base": { "ref": "main" },
+                        // `sha` too: `create_review_comment` pins its comment
+                        // to the head commit, so a GET that answers without one
+                        // fails the *shape* rather than the call, which is not
+                        // the never-answered case this test is about.
+                        "head": { "ref": "build/whatever", "sha": "abc123" },
+                    }))
+                },
+            )
+            .patch(unavailable),
         )
         .fallback(unavailable)
         .with_state(store);
@@ -1232,6 +1425,10 @@ fn write_route(action: DecisionAction, task: &Task) -> Option<(String, Value)> {
         DecisionAction::AbandonBuild => Some((
             "/pull-requests/812/close".into(),
             json!({ "rationale": "the branch will not land" }),
+        )),
+        DecisionAction::RetargetBuild => Some((
+            "/pull-requests/812/retarget".into(),
+            json!({ "base": "main", "rationale": "its base has already reached the trunk" }),
         )),
         // No effect in anybody else's system: these commit in the same
         // transaction as the state they authorize, so there is no window to
@@ -1314,7 +1511,7 @@ async fn no_write_route_reaches_github_without_recording_first() {
         );
     }
 
-    assert_eq!(driven, 9, "nine routes reach GitHub today");
+    assert_eq!(driven, 10, "ten routes reach GitHub today");
     assert_eq!(
         h.store.pending_decisions().await.unwrap().len(),
         driven,

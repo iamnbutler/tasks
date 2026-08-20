@@ -960,6 +960,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         store,
         server::Services {
             github: config.github_client().map(Arc::new),
+            trunk: server::Trunk(config.scout_base_branch.clone()),
             bundles: Some(Arc::new(RejectedBundles::under(
                 builder_config(&config, None).scratch_root,
             ))),

@@ -249,6 +249,42 @@ implementation.
   minutes, and it would cost a GitHub read per parked PR per tick rather than
   one per obligation actually surfaced. Mergeability is never cached — that is
   persisting a GitHub-owned fact with a timestamp on it.
+- **The one arm where the default is not to merge has a verb of its own,
+  because merging there ships nothing and is irreversible.** This pipeline
+  stacks builds, so a build is routinely opened against another build's branch;
+  when that base lands **first**, the dependent is left pointing at a branch
+  nothing will pick up. `Brief::live_landing_facts` has diagnosed exactly that
+  since it started reading `base_ref` — the `(false, true)` arm of
+  `merge_reached_trunk` — and the diagnosis had **no act behind it**:
+  `github.rs`'s entire pull-request surface was create, merge, close. So the
+  only move available to an agent following the standing "merge it this turn"
+  instruction was the one that cannot be walked back, and GitHub will not edit a
+  *merged* pull request — the merge deletes its own fix, and the work reaches the
+  trunk never (#1027). Both halves ship together and neither is sufficient.
+  `POST /pull-requests/{number}/retarget` is the verb: REST `PATCH
+  /repos/{o}/{r}/pulls/{n}`, ledgered like every other GitHub write, under
+  `land_builds` rather than a capability of its own — it is the same judgment
+  about the same artifact as the merge it exists to make possible, and it is the
+  **reversible** half, since calling it again points the pull request somewhere
+  else where nothing here can un-merge one. It reports the base GitHub read
+  back rather than the one that was asked for, because a caller told what it
+  asked for has learned nothing. And `merge_pull_request` **refuses** that arm
+  rather than warning about it, on the #1044 precedent one shelf over: the check
+  runs after `authorize` and before the effect, and **every unreadable answer
+  refuses** — the deliberate inversion of the standing "unknown never blocks"
+  rule, because refusing a good merge costs one retry while allowing this one
+  costs the work *and* the retarget together, in the same instant. A missing
+  `base_ref` refuses for the same reason: absence is not "unstacked". What is
+  deliberately *not* refused is the other arm — a base that has **not** reached
+  the trunk yet is ordinary stacking and merges normally, which is how a queue
+  drains at all — and that pair is what the tests pin. The cost is one
+  `pull_request_state` per merge and no compare at all when `base_ref` is
+  already the trunk; the squash check now shares that read instead of making its
+  own. The prompt half is load-bearing too: a refusal that does not name the act
+  is a dead end, so the obligation header names the retarget and the brief's own
+  arm text names it with the number filled in — the brief and not the header,
+  because which arm holds is a per-pull-request fact the header cannot know.
+
 - **A Builder cannot return untested work, because the supervisor runs the
   suite and the agent does not — and a green run covers the branch against its
   own base, never the composition.** `SUMMARY.md`'s

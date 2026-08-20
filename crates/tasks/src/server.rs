@@ -33,9 +33,9 @@ use tasks_api::http::{
     CancelRunRequest, CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject,
     EditIssueRequest, EnrollAgentRequest, EnrollAgentResponse, ErrorResponse, GitHubHold,
     LabelInfo, MergePullRequest, ModeResponse, RejectedBundle, ReopenTaskRequest, ReorderQueue,
-    ReorderSpecQueue, ReviewCommentRequest, ReviewRequest, RevokeAgentRequest, ScoutRequest,
-    SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode, SetProjectStatus,
-    SettleDecisionRequest, ShadowAck, Viewer,
+    ReorderSpecQueue, RetargetPullRequest, ReviewCommentRequest, ReviewRequest, RevokeAgentRequest,
+    ScoutRequest, SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode,
+    SetProjectStatus, SettleDecisionRequest, ShadowAck, Viewer,
 };
 
 use crate::bundles::RejectedBundles;
@@ -169,9 +169,30 @@ type ApiResult<T> = Result<T, ApiError>;
 /// a bundle service `GET /bundles` answers 503 — never `[]`, because "nothing
 /// was preserved" is the one wrong answer to give about a directory nobody
 /// looked in.
+/// The branch that ships, as this router knows it
+/// ([`crate::run::Config::scout_base_branch`]).
+///
+/// A newtype rather than a bare `String` so the `FromRef` extraction says what
+/// it is extracting, and so [`Services`] keeps its `Default` — which here
+/// defaults to the same `main` the config does, because a router built without
+/// one (tests, embedded uses) is answering about a repository that almost
+/// certainly has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trunk(pub String);
+
+impl Default for Trunk {
+    fn default() -> Self {
+        Self("main".into())
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Services {
     pub github: Option<Arc<GitHubClient>>,
+    /// The branch a merge has to reach to have shipped anything. Read by the
+    /// merge route, which refuses a pull request whose base has already
+    /// reached it (#1027).
+    pub trunk: Trunk,
     pub bundles: Option<Arc<RejectedBundles>>,
     /// The record the poller writes and the two dispatchers read. Absent means
     /// this router has no dispatchers behind it, which `GET /status` reports as
@@ -219,6 +240,12 @@ impl FromRef<AppState> for Arc<Store> {
 impl FromRef<AppState> for Option<Arc<GitHubClient>> {
     fn from_ref(state: &AppState) -> Self {
         state.services.github.clone()
+    }
+}
+
+impl FromRef<AppState> for Trunk {
+    fn from_ref(state: &AppState) -> Self {
+        state.services.trunk.clone()
     }
 }
 
@@ -316,6 +343,10 @@ fn routes(store: Arc<Store>, services: Services) -> Router {
             post(create_review_comment),
         )
         .route("/pull-requests/{number}/merge", post(merge_pull_request))
+        .route(
+            "/pull-requests/{number}/retarget",
+            post(retarget_pull_request),
+        )
         .route("/pull-requests/{number}/close", post(abandon_pull_request))
         .route("/sessions", get(list_sessions))
         .route("/sessions/{session_id}", get(get_session))
@@ -1179,6 +1210,7 @@ async fn comment_on_work(
 async fn merge_pull_request(
     State(store): State<Arc<Store>>,
     State(github): State<Option<Arc<GitHubClient>>>,
+    State(Trunk(trunk)): State<Trunk>,
     Path(number): Path<u64>,
     headers: axum::http::HeaderMap,
     Json(body): Json<MergePullRequest>,
@@ -1240,8 +1272,48 @@ async fn merge_pull_request(
     // retargetable (replaying it at the trunk would replay the base's own
     // commits), recoverable only by a rebase or a rebuild, and nothing in this
     // pipeline can perform either.
+    // Read once, for both checks below. A merge pays one call and a squash
+    // pays two; before #1027 a merge paid none and a squash paid this same one
+    // inside `squash_would_strand`.
+    let pr = github
+        .pull_request_state(&project.repo_owner, &project.repo_name, number)
+        .await
+        .map_err(|e| {
+            ApiError::BadRequest(format!(
+                "PR #{number} could not be read ({e}), so whether merging it would ship \
+                 anything is unknown. That is a refusal rather than a shrug for the reason \
+                 the squash check below is: a merge cannot be undone, and the edit that \
+                 fixes the case this would have caught stops being possible the instant it \
+                 lands. Retry."
+            ))
+        })?;
+
+    // A merge that ships nothing and forecloses the fix is refused (#1027).
+    //
+    // A build stacked on another build's branch is opened against that branch.
+    // When the base lands *first*, the dependent is left pointing at a branch
+    // nothing will pick up: merging it adds a commit there and reaches the
+    // trunk never. The brief has diagnosed exactly this since it could read
+    // `base_ref` — and the diagnosis had no act behind it, so an agent
+    // following the standing "merge it this turn" instruction performed the
+    // one move that cannot be walked back. GitHub refuses to edit a merged
+    // pull request, so the merge deletes the retarget that would have fixed it.
+    //
+    // Only this arm. A base that has *not* reached the trunk is ordinary
+    // stacking and merges normally — that PR ships when its base does.
+    if let Some(base) = stacked_base_already_landed(&github, &project, number, &trunk, &pr).await? {
+        return Err(ApiError::BadRequest(format!(
+            "PR #{number} is based on {base}, and {base} has ALREADY reached {trunk} — so \
+             merging it now would add a commit to a branch nothing will pick up, and the \
+             work would reach {trunk} never. Retarget it first: POST \
+             /pull-requests/{number}/retarget with {{\"base\": \"{trunk}\"}}, then merge. \
+             This is refused rather than warned about because a merged pull request can no \
+             longer be retargeted — the merge is what deletes the fix"
+        )));
+    }
+
     if method == "squash" {
-        let stranded = squash_would_strand(&github, &project, number).await?;
+        let stranded = squash_would_strand(&github, &project, number, &pr).await?;
         if !stranded.is_empty() {
             let list: Vec<String> = stranded.iter().map(|n| format!("#{n}")).collect();
             return Err(ApiError::BadRequest(format!(
@@ -1298,9 +1370,10 @@ async fn merge_pull_request(
 /// The still-open pull requests a squash of `number` would strand, or an error
 /// if that could not be established (#1044).
 ///
-/// Two reads, and both only ever happen for an explicit `squash`: the pull
-/// request itself, for its head branch, and the open pull requests based on
-/// that branch. A merge is the default and never pays either.
+/// One read, and only ever for an explicit `squash`: the open pull requests
+/// based on this one's head branch. The pull request itself is read by the
+/// caller either way now, because the base check every merge makes needs it
+/// (#1027).
 ///
 /// Every failure to *establish* the answer is returned as a refusal rather than
 /// as an empty list. "GitHub did not say" is not "nothing is stacked", and the
@@ -1309,6 +1382,7 @@ async fn squash_would_strand(
     github: &GitHubClient,
     project: &Project,
     number: u64,
+    pr: &crate::github::PrState,
 ) -> Result<Vec<u64>, ApiError> {
     let unreadable = |what: &str, e: &dyn std::fmt::Display| {
         ApiError::BadRequest(format!(
@@ -1317,10 +1391,6 @@ async fn squash_would_strand(
              strand whatever is. Merge it with \"method\": \"merge\" instead"
         ))
     };
-    let pr = github
-        .pull_request_state(&project.repo_owner, &project.repo_name, number)
-        .await
-        .map_err(|e| unreadable("the pull request", &e))?;
     let head = pr
         .head_ref
         .as_deref()
@@ -1329,6 +1399,142 @@ async fn squash_would_strand(
         .open_pull_requests_based_on(&project.repo_owner, &project.repo_name, head)
         .await
         .map_err(|e| unreadable("the pull requests based on it", &e))
+}
+
+/// The base branch a merge of `number` would ship nothing into, if there is
+/// one (#1027).
+///
+/// `Some(base)` is the refusal: this pull request is stacked, and the branch it
+/// is stacked on has already reached the trunk, so merging adds a commit to a
+/// branch nothing will pick up. `None` is every other shape, including
+/// ordinary stacking on a base that has not landed yet — that merge is normal
+/// and its work ships when the base does.
+///
+/// Two questions and at most one extra call. `base_ref == trunk` is the
+/// unstacked case and short-circuits, exactly as `run::shipped` does, so the
+/// ordinary merge costs nothing beyond the read its caller already made.
+///
+/// **Every unreadable answer refuses**, which inverts this codebase's standing
+/// "unknown never blocks" rule and does so deliberately, on the same asymmetry
+/// [`squash_would_strand`] states. Refusing a good merge costs one retry.
+/// Allowing this one costs the work: it reaches the trunk never, and the
+/// retarget that would have fixed it stops existing at the same instant,
+/// because GitHub will not edit a merged pull request. A missing `base_ref` is
+/// refused for that same reason — absence is not "unstacked", it is unknown.
+async fn stacked_base_already_landed(
+    github: &GitHubClient,
+    project: &Project,
+    number: u64,
+    trunk: &str,
+    pr: &crate::github::PrState,
+) -> Result<Option<String>, ApiError> {
+    let unreadable = |what: String| {
+        ApiError::BadRequest(format!(
+            "PR #{number} cannot be merged safely because {what}: whether merging it \
+             would ship anything into {trunk} is unknown, and a merge cannot be undone. \
+             Retry, or retarget it at {trunk} first"
+        ))
+    };
+    let Some(base) = pr.base_ref.clone() else {
+        return Err(unreadable("GitHub reported no base branch for it".into()));
+    };
+    if base == trunk {
+        return Ok(None);
+    }
+    // `trunk...base`: reachable reads as `identical` or `behind`, and
+    // reversing the operands inverts the verdict.
+    match github
+        .merge_reached_trunk(&project.repo_owner, &project.repo_name, trunk, &base)
+        .await
+    {
+        Ok(true) => Ok(Some(base)),
+        Ok(false) => Ok(None),
+        Err(e) => Err(unreadable(format!(
+            "whether its base {base} has reached {trunk} could not be read ({e})"
+        ))),
+    }
+}
+
+/// Point a pull request at a different base branch.
+///
+/// The act that resolves a stacked build whose base landed first (#1027).
+/// Until this existed the pipeline could diagnose that state precisely — the
+/// brief has said "it wants retargeting" since it could read `base_ref` — and
+/// had no verb for it, so the only move an agent could make was the
+/// irreversible one [`merge_pull_request`] now refuses.
+///
+/// Under `land_builds` rather than a capability of its own: it is the same
+/// judgment about the same artifact as the merge it exists to make possible,
+/// and it is the reversible half of it. Calling it again points the pull
+/// request somewhere else; nothing here can un-merge one.
+///
+/// No precondition read. The merge route pays one because the mistake it
+/// prevents is permanent; this one is an edit GitHub itself refuses when the
+/// base does not exist or the pull request is already merged, and a refusal
+/// costs a retry.
+async fn retarget_pull_request(
+    State(store): State<Arc<Store>>,
+    State(github): State<Option<Arc<GitHubClient>>>,
+    Path(number): Path<u64>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<RetargetPullRequest>,
+) -> ApiResult<Response> {
+    let github = github.ok_or_else(|| {
+        ApiError::Unavailable("no GITHUB_TOKEN: the server cannot retarget pull requests".into())
+    })?;
+    let base = body.base.trim().to_string();
+    if base.is_empty() {
+        return Err(ApiError::BadRequest(
+            "a retarget must name the branch to merge into".into(),
+        ));
+    }
+    let actor = actor_of(&store, &headers)?;
+    let project = resolve_project(&store, body.project_id).await?;
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    if authorize(
+        &store,
+        &decision,
+        Capability::LandBuilds,
+        DecisionAction::RetargetBuild,
+    )
+    .await?
+        == Authority::Shadow
+    {
+        let seq = store
+            .record_decision(
+                "gh",
+                &number.to_string(),
+                DecisionAction::RetargetBuild,
+                decision,
+                false,
+            )
+            .await?;
+        return Ok(shadowed(
+            seq,
+            "the pull request still points at its old base",
+        ));
+    }
+
+    let (seq, landed_on) = ledgered(
+        &store,
+        "gh",
+        &number.to_string(),
+        DecisionAction::RetargetBuild,
+        &decision,
+        serde_json::json!({
+            "repo": format!("{}/{}", project.repo_owner, project.repo_name),
+            "number": number,
+            "base": base,
+        }),
+        "retargeting failed",
+        || github.retarget_pull_request(&project.repo_owner, &project.repo_name, number, &base),
+    )
+    .await?;
+    Ok(Json(serde_json::json!({ "base": landed_on, "decision_seq": seq })).into_response())
 }
 
 /// Close a pull request without merging it.
@@ -2711,6 +2917,28 @@ async fn look_up_artifact(
                     "PR #{number} is {} and merged = {}",
                     pr.state.as_str(),
                     pr.merged
+                ),
+            )
+        }
+        DecisionAction::RetargetBuild => {
+            let Some(number) = number else {
+                return Ok(unaddressed());
+            };
+            let wanted = text("base");
+            let pr = github.pull_request_state(owner, name, number).await?;
+            // The intent names the branch that was asked for, so the artifact
+            // is readable directly: either the pull request points there now or
+            // the edit never landed. Unlike a merge, the answer is not
+            // monotone — a later retarget can move it again — which is why the
+            // reconciliation says what it saw rather than only a verdict.
+            let base = pr.base_ref.clone().unwrap_or_default();
+            let done = !wanted.is_empty() && base == wanted;
+            (
+                if done { "applied" } else { "annulled" },
+                serde_json::json!({ "number": number, "base": pr.base_ref, "wanted": wanted }),
+                format!(
+                    "PR #{number} is based on {} and the decision asked for {wanted}",
+                    if base.is_empty() { "nothing GitHub reported" } else { &base },
                 ),
             )
         }
