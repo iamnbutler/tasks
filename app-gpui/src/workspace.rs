@@ -39,7 +39,7 @@ use tasks_client::api::models::{
 use crate::chat_log::{ChatEntryId, ChatRowKey, ChatRowKind};
 use crate::commands::WORKSPACE_CONTEXT;
 use crate::components::{
-    markdown_block, pane_header, sidebar, MarkdownCache, SidebarSide, SidebarState,
+    markdown_block, pane_header, sidebar, MarkdownCache, SidebarSide, SidebarState, SwallowPress,
 };
 use crate::context_gauge::{self, Band, Gauge};
 use crate::empty_state::{self, Action as EmptyStateAction, Explanation, Reachability};
@@ -1557,6 +1557,9 @@ impl Workspace {
             .absolute()
             .top_0()
             .right_0()
+            // Floats over the conversation, so a press here must not anchor a
+            // selection in the markdown underneath. See `components/press.rs`.
+            .swallow_press()
             .flex()
             .flex_row()
             .items_center()
@@ -1831,7 +1834,12 @@ impl Workspace {
                 .text_xs()
                 .text_color(theme.fg_muted())
                 .child(div().flex_none().child("●").opacity(0.5))
-                .child(div().flex_1().child(content.clone()))
+                // Wraps rather than overflowing — see the headline row in
+                // `sections/detail.rs` for why a `flex_1` text child in a
+                // `flex_row` needs this. Server-written `[worker <job>]` /
+                // `[pipeline]` / `[agent <name>]` turns are long by
+                // construction.
+                .child(div().flex_1().min_w(px(0.)).child(content.clone()))
                 .into_any_element(),
             // A session seam. The conversation reads as continuous here but
             // the orchestrator's memory does not, so it renders as a divider
@@ -1856,6 +1864,15 @@ impl Workspace {
                 .absolute()
                 .top(px(-6.))
                 .right(px(4.))
+                // The reported bug: without this, copying a message also
+                // anchors a text selection in the reply underneath. On the
+                // container rather than the button, and on the press rather
+                // than the click — see `components/press.rs` for both.
+                //
+                // The row is pinned at `top(-6.)`, so a ~6px sliver of it hangs
+                // over the message above and a press there is swallowed too.
+                // Pre-existing geometry, noted so it is not rediscovered.
+                .swallow_press()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -2008,7 +2025,14 @@ impl Workspace {
                             .child(messages.size_full().py(px(8.)))
                             .when(show_jump_to_newest, |el| {
                                 el.child(
-                                    div().absolute().bottom(px(10.)).right(px(16.)).child(
+                                    div()
+                                        .absolute()
+                                        .bottom(px(10.))
+                                        .right(px(16.))
+                                        // Floats over the last message — see
+                                        // `components/press.rs`.
+                                        .swallow_press()
+                                        .child(
                                         icon_button("jump-to-newest", Icons::pin_bottom())
                                             .width(px(28.))
                                             .height(px(28.))
@@ -2690,7 +2714,10 @@ impl Workspace {
                     .text_xs()
                     .text_color(theme.fg_muted())
                     .child(div().flex_none().child("●").opacity(0.5))
-                    .child(div().flex_1().child(text))
+                    // Wraps rather than overflowing — see the headline row in
+                    // `sections/detail.rs`. Feed notes carry long server-written
+                    // text (the target-directory reclaim line, the hold reasons).
+                    .child(div().flex_1().min_w(px(0.)).child(text))
                     .into_any_element(),
             )
             .into_any_element(),

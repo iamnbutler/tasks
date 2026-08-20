@@ -300,7 +300,20 @@ impl ServerWindow {
                     .text_color(theme.fg_muted())
                     .child(label),
             )
-            .child(div().flex_1().text_color(theme.fg()).child(value))
+            // Wraps rather than overflowing — see the headline row in
+            // `sections/detail.rs`. These thirteen callers render the longest
+            // server-written strings in the app: the GitHub hold sentence, each
+            // update-hold reason (which names its own discharge command), the
+            // broker/vm-pool/runtime hold text, the verify-directory reclaim
+            // line and the data-dir path. `items_start()` above is already what
+            // you write when you expect a value to wrap.
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_color(theme.fg())
+                    .child(value),
+            )
     }
 
     // --- the operations ---

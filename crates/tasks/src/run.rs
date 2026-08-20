@@ -1065,6 +1065,13 @@ pub async fn run(config: Config) -> Result<(), RunError> {
             bundles: Some(Arc::new(RejectedBundles::under(
                 builder_config(&config, None).scratch_root,
             ))),
+            // The *same* live handle the poller and the broker read through,
+            // so what `GET /secrets` reports serving a name cannot disagree
+            // with what the pipeline actually spends.
+            secrets: Some(Arc::new(crate::secrets::Custody::new(
+                config.data_dir.clone(),
+                config.secrets.clone(),
+            ))),
             github_health: Some(health.clone()),
             updates: Some(updates.clone()),
             pool_health: Some(pool_health.clone()),

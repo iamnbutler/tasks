@@ -908,7 +908,31 @@ implementation.
   command, a `warn!` is the only prompt, and the real benefit arrives with a
   signed application identity (#988, undecided). `keychain_read` and
   `keychain_write` are the whole custody boundary and a second key-store path
-  is never the answer — an API route that auto-initialises a store calls them. Raw values cross module
+  is never the answer — an API route that auto-initialises a store calls them. The same three acts are on the loopback API —
+  `GET /secrets` (names, `set_at`, the key-source line, and what is *currently*
+  serving each name), `POST /secrets/{name}` (write-only: no type in the wire
+  vocabulary can carry a value **outbound**, which makes that structural rather
+  than a rule somebody remembers, so there is no read-one route and never a
+  value in a response) and `DELETE /secrets/{name}` — with no second
+  implementation of custody behind them: auto-init goes through `secrets::init`
+  itself, so a paste-created store cannot pick a different key source than a
+  terminal-created one. All three are **human-only on the `build-now`
+  precedent** rather than charter-gated: the charter governs units of work
+  *inside* the pipeline, and these change what the pipeline **authenticates
+  as**. What enforces that is the **worker allowlist**, not the check — a
+  worker is a local child with no `X-Tasks-Actor`, so it is attributed as the
+  human and is never gated, and `DEFAULT_WORKER_CMD` carrying no `Bash(curl:*)`
+  is the whole of what stands between the orchestrator and a route that writes
+  a **credential**. Anyone who ever adds `curl` to a worker command is adding
+  that, not a convenience. Two answers are shaped by the machinery rather than
+  by taste: `keychain_write` is `set_password` and therefore
+  find-then-modify-*in-place*, so a data dir with no store on a host that still
+  holds a `tasks-v2-secrets` item would auto-init and strand *that* store —
+  `unseal_key_present()` refuses it instead; and `refresh_if_changed`'s late
+  unlock is one-shot per process, so a write this process cannot read back
+  answers **200 with a named outcome and never a 5xx** — the ciphertext *is* on
+  disk, and a 5xx renders as "your paste did not work", whose obvious response
+  is to paste again, forever. Raw values cross module
   boundaries only as `redact::Secret` (no `Display` at all — interpolating
   one is a compile error, not a silent `<redacted>`; constant-time equality;
   zeroized on drop). Two carve-outs are named: a non-http(s)
@@ -1607,49 +1631,69 @@ implementation.
   `TASKS_UPDATE_HOLD=off` keeps the report and drops the gate; anything else
   non-`on` refuses to boot. The hold sits beside `github_hold` at the same two
   gates, ahead of the claim, for the same claim-then-refuse reason.
-- **The two host acts get a drain, and its deliverable is a hold that
-  outlives the command.** The hold-new-work half of #961 is `UpdateWatch` above
-  and the kill-active-work half is `POST /runs/cancel-all`; the middle — waiting
-  for what is already running to *land* — is `tasks drain`, and it exists
-  because `tasks reload` is the only one of the three ways this pipeline gets
-  upgraded that could ever afford to be ungated. A reload re-attaches to every
-  live VM (`resume_in_flight`), and has had a gate since it was written anyway.
-  Restarting **vm-pool** on the same socket has no such recovery — the successor
-  stops its predecessor's containers off the orphan ledger, which is #961's three
-  orphans — and **`make images`** has none either. What a `container build` does
-  to a container that is already running is **not established here and is
-  deliberately not written down as though it were**; the checkable reason the
-  rebuild is gated is the other one: a scout dispatched while the rebuild is in
-  flight starts in the **old** image, which is exactly the #909 staleness
-  `UpdateWatch` exists to prevent and the one case it cannot see, since the
-  identity it reads is only ever observed from a run that has already started.
-  So: pause dispatch, wait for the drain point, and **keep holding** until
-  `tasks resume`. Four things are load-bearing. **Mode `pause` is the hold** —
-  no fourth thing to keep in step beside `github_hold` and `update_hold`, and
-  #961 §2's own instruction to extend the existing drain rather than stand a
-  parallel one beside it; `reload.rs` splits `drain` into `pause_dispatch` +
-  `wait_for_drain_point` so there is still one wait loop and one pause rule in
-  the binary, with `--cancel-scouts`' cancels in the gap between them (cancel
-  first and the dispatcher starts a replacement within the tick). **It pauses an
-  idle pipeline too**, the deliberate inversion of `stop --when-idle`, which
-  returns early without touching the mode: an idle pipeline nobody holds starts
-  a scout on the next tick, into the pool that is about to go down. **`--check`
-  refuses a *playing* pipeline, not only a busy one**, for that same reason —
-  it is what `make images` gates on, and passing an idle-but-playing server
-  would let the rebuild race the next tick; nothing serving passes untouched,
-  because no dispatcher means nothing that can start a container, and `FORCE=1`
-  is the escape hatch. And **the edge goes on the feed**: what a drain leaves
-  behind is a `pause` byte-identical to a human's, so `POST /mode` takes an
-  optional `note` and the drain, its timeout unwind and `tasks resume` each
-  append one. There is deliberately **nothing between the edge and the mode** —
-  no persisted "held for maintenance" field, which would be the fourth hold
-  again. Two limits are stated rather than implied: a drain never signals the
-  server (the API keeps serving, which is what makes it usable *before* a pool
-  restart), and `--cancel-scouts` cannot guarantee the drain point — a cancel
-  is a durable row the *dispatcher following the run* concludes, so a run
-  nothing is following runs the wait out to the timeout, which is why the
-  output repeats the server's own `CancelAck.concluded` rather than flattening
-  "asked" and "stopped" into one word.
+- **A run in flight is not a reason to refuse host work.** The three ways this
+  pipeline gets upgraded were gated as though they were one act, and they are
+  not. `tasks reload` re-attaches to every live VM (`resume_in_flight`), so a
+  swap costs at most one `Orphaned` write-off, which charges no attempt — it
+  now **reports** what is in flight and swaps, with `--when-idle` kept as the
+  opt-in for someone who would rather not spend even that, and `--force`
+  demoted to its *other* job (a server that is alive and will not answer
+  `/status`). What `make images` can actually spoil is narrower still: a run
+  **dispatched into it** starts in the old image — the #909 staleness
+  `UpdateWatch` structurally cannot see, since the identity it reads comes only
+  from a run that has already started — while a run that started earlier is
+  simply not that case. So the rebuild is wrapped rather than gated:
+  `tasks hold [--label TEXT] -- <command>` pauses dispatch, runs the command as
+  **its own child**, and puts the mode back the instant that child exits —
+  success, failure or signal — exiting with the child's status, so a recipe is
+  unchanged by the wrapper. It waits for nothing and cancels nothing. What a
+  `container build` does to an already-running container is **not established
+  here and the argument deliberately does not rest on it**: if it does disturb
+  one, that run dies `Transport`/`Orphaned`, charges no attempt and is
+  re-dispatched, which is an outcome this already accepts. Do not "improve"
+  this by asserting the container is safe — the point is that it does not need
+  to be. Four things hold the hold's shape. **It is a parent process and not
+  two recipe lines**: a `tasks hold` before and a `tasks resume` after would
+  reintroduce exactly the failure being removed, since a `make` that dies in
+  between leaves the pipeline paused with nothing left running that knows to
+  undo it — which is why `images-rebuild` exists as its own target, one command
+  for `hold` to be the parent of. **A SIGINT or SIGTERM of the hold itself
+  restores too**, and forwards the signal on so the rebuild actually stops;
+  Ctrl-C during a multi-minute rebuild is ordinary behaviour, not an edge case.
+  A **SIGKILL** of it is the one case that strands a pause, named rather than
+  papered over, with `tasks resume` as the undo. **The restore is gated on
+  whether *this* call installed the pause** (`pause_dispatch` answers that), so
+  a pipeline already `pause`d or `stop`ped is never *promoted* to `play` in the
+  name of having held something — `Stop` is tighter than `Pause`. And if a
+  human moves the mode while the command runs, the restore **re-reads and
+  leaves it as found**: the window is the command's own duration and the human
+  wins it, which is the same direction of error the pause end already refuses.
+  The one honest arm of the old refusal is **inverted rather than deleted**: a
+  live server that will not answer `/status` used to refuse, because "quiesced"
+  about a server you cannot see into is the wrong direction to be wrong in —
+  right while the promise was quiescence, and not the promise now. It runs the
+  command unheld and says so, the cost being at most one run starting in the
+  old image (which reports itself through `ImageFreshness` the moment it does)
+  against a rebuild that does not happen at all. `stop --when-idle`'s pause
+  turns out **never to have been a debt**: `apply_startup_mode` overwrites the
+  stored mode from `TASKS_DEFAULT_MODE` before the next listener binds, and
+  between the SIGTERM and that boot nothing reads the column — so the fix there
+  was the sentence, not the behaviour. It still cannot be put back *before* the
+  SIGTERM (that hands the dispatcher a window for one last scout) and nothing
+  in `reload.rs` may open the store to do it after. `tasks drain` / `tasks
+  resume` stay, narrowed to the one host act with **no** recovery: restarting
+  vm-pool on the same socket, where the successor stops its predecessor's
+  containers off the orphan ledger. Mode `pause` is still the hold — no fourth
+  thing to keep in step beside `github_hold` and `update_hold` — and
+  `drain --check` survives **demoted from a gate to a diagnostic**, with
+  nothing in the repo refusing on it. `tasks hold` is deliberately general
+  (`-- <any command>`) rather than an `images`-shaped flag: the same shape is
+  the honest answer for any future host act that can only be spoiled by a
+  *new* dispatch. If a seventh server-side dispatch hold is ever wanted (a real
+  `maintenance_hold` with a TTL beside `github_hold`/`update_hold`), **this is
+  the change to revisit** — it would remove the mode juggling entirely, and it
+  was rejected here for the reason above: mode `pause` *is* the hold, and a
+  parallel one is a fourth thing to keep in step.
 
 - **A diagnostic reports and never fixes, and the one check worth writing is
   the one every other check is blind to.** `tasks doctor` asks every
@@ -1780,8 +1824,9 @@ make restart RELOAD=--when-idle        # ...but wait out in-flight scouts first
 make status / make stop
 make stop STOP=--when-idle             # ...but wait out in-flight scouts first
 make drain                             # quiesce the pipeline and HOLD it, for
-                                       #   host work (a vm-pool restart,
-                                       #   `make images`); undo with make resume
+                                       #   the one host act with no recovery
+                                       #   (restarting vm-pool on the same
+                                       #   socket); undo with make resume
 make drain DRAIN=--cancel-scouts       # ...stopping running scouts rather than
                                        #   waiting them out
 make resume                            # release that hold
@@ -1820,8 +1865,11 @@ tasks doctor --probe-images            # ...and boot each image to read its
                                        #   --version, as `make images-check` does
 make migration NAME=lower_snake_case   # new migration, stamped with the UTC now
 make images                            # rebuild the Scout/Builder VM images
-                                       #   (gated on `tasks drain --check`;
-                                       #   FORCE=1 skips the gate)
+                                       #   (wrapped in `tasks hold`, which
+                                       #   pauses dispatch for exactly as long
+                                       #   as the rebuild runs)
+tasks hold [--label T] -- CMD          # that wrapper on its own: pause, run
+                                       #   CMD as a child, restore on its exit
 make images-check                      # boot each image, read `--version` back
 make site-check                        # the landing page's publish gate: the
                                        #   disclaimer matches the README's and
@@ -1835,10 +1883,11 @@ make test                              # see Tests below
 
 `make images` is the whole deployment step for anything inside a VM — a
 supervisor fix reaches nothing until someone runs it on a Mac with
-apple/container and the cross toolchain. It now runs `tasks drain --check`
-first (`make check-quiesced`), because a scout dispatched into the middle of a
-rebuild starts in the *old* image: the workflow is `make drain` → `make images`
-→ `make resume`, and `FORCE=1 make images` is for someone who knows better. `images-check` (which `images` ends by
+apple/container and the cross toolchain. It asks nobody's permission: the
+rebuild runs inside `tasks hold`, which pauses dispatch for exactly as long as
+the rebuild takes and restores the mode when it exits, however it exits. A
+scout dispatched into the middle of a rebuild would start in the *old* image,
+and that — not a run already in flight — is what the hold prevents. `images-check` (which `images` ends by
 invoking) is the only reading available in the window between a rebuild and the
 first run in the new image; everywhere else, the identity is observed from the
 runs themselves. Until the images are rebuilt, `unstamped` / "PREDATES

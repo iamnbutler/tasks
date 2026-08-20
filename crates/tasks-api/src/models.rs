@@ -1873,6 +1873,61 @@ pub enum OrchestratorFeedEvent {
     Done,
 }
 
+/// A credential the pipeline spends, by name.
+///
+/// One definition rather than a wire copy beside a store copy: the sealed
+/// store's JSON key, the `tasks secrets` argument and the `/secrets/{name}`
+/// path segment are the same string by construction. A divergence would make
+/// a CLI-written store silently unaddressable by the route, for one name only,
+/// which is why `the_wire_spelling_is_the_store_spelling` pins the two
+/// against each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecretName {
+    AnthropicApiKey,
+    GithubToken,
+}
+
+impl SecretName {
+    pub const ALL: [SecretName; 2] = [SecretName::AnthropicApiKey, SecretName::GithubToken];
+
+    /// The store-file / CLI / URL spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SecretName::AnthropicApiKey => "anthropic-api-key",
+            SecretName::GithubToken => "github-token",
+        }
+    }
+
+    /// The environment variable this entry supersedes.
+    pub fn env_var(self) -> &'static str {
+        match self {
+            SecretName::AnthropicApiKey => "ANTHROPIC_API_KEY",
+            SecretName::GithubToken => "GITHUB_TOKEN",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|n| n.as_str() == raw)
+    }
+
+    /// The closed set, rendered from one place so every refusal names the
+    /// same list.
+    pub fn names() -> String {
+        Self::ALL
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for SecretName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1937,5 +1992,24 @@ mod tests {
         assert!(!TaskState::AwaitingMerge.is_terminal());
         assert!(TaskState::Done.is_terminal());
         assert!(TaskState::Rejected.is_terminal());
+    }
+}
+
+#[cfg(test)]
+mod secret_name_tests {
+    use super::SecretName;
+
+    /// The serde spelling and `as_str` are the same string, for every name.
+    /// They are the URL path segment and the sealed store's JSON key
+    /// respectively, so a divergence is a store the route cannot address.
+    #[test]
+    fn the_wire_spelling_is_the_store_spelling() {
+        for name in SecretName::ALL {
+            let wire = serde_json::to_string(&name).unwrap();
+            assert_eq!(wire, format!("\"{}\"", name.as_str()));
+            assert_eq!(SecretName::parse(name.as_str()), Some(name));
+        }
+        assert_eq!(SecretName::parse("nope"), None);
+        assert!(SecretName::names().contains("github-token"));
     }
 }

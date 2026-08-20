@@ -194,6 +194,10 @@ pub struct Services {
     /// reached it (#1027).
     pub trunk: Trunk,
     pub bundles: Option<Arc<RejectedBundles>>,
+    /// The custody service behind `/secrets`. Absent means this router cannot
+    /// reach a sealed store, which is a 503 and never an empty answer — the
+    /// `bundles` shape, for the `bundles` reason.
+    pub secrets: Option<Arc<crate::secrets::Custody>>,
     /// The record the poller writes and the two dispatchers read. Absent means
     /// this router has no dispatchers behind it, which `GET /status` reports as
     /// no hold — honest, because a router with nothing to dispatch is not
@@ -258,6 +262,12 @@ impl FromRef<AppState> for Trunk {
 impl FromRef<AppState> for Option<Arc<RejectedBundles>> {
     fn from_ref(state: &AppState) -> Self {
         state.services.bundles.clone()
+    }
+}
+
+impl FromRef<AppState> for Option<Arc<crate::secrets::Custody>> {
+    fn from_ref(state: &AppState) -> Self {
+        state.services.secrets.clone()
     }
 }
 
@@ -343,6 +353,8 @@ fn routes(store: Arc<Store>, services: Services) -> Router {
         .route("/tasks/{task_id}/dequeue", post(dequeue_task))
         .route("/tasks/{task_id}/scout", post(scout_task_now))
         .route("/tasks/{task_id}/build-now", post(build_task_now))
+        .route("/secrets", get(secrets_status))
+        .route("/secrets/{name}", post(set_secret).delete(delete_secret))
         .route("/tasks/{task_id}/close", post(close_task))
         .route("/tasks/{task_id}/reopen", post(reopen_task))
         .route("/issues", post(capture_issue))
@@ -4233,6 +4245,176 @@ async fn stream_events(
         }
     });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+}
+
+// --- custody (`/secrets`) ---
+
+/// The 403 all three custody routes answer with, and they call it **first** —
+/// before the service lookup, the name parse and the body. So a refused caller
+/// learns nothing about how the host is configured, and "nothing was written"
+/// holds structurally rather than by reading down the function.
+///
+/// Human-only on the `build-now` precedent, and not charter-gated: the charter
+/// governs units of work *inside* the pipeline, and these change what the
+/// pipeline **authenticates as**. The `GET` is refused too — it carries no
+/// value, so this is not a leak being closed, it is the surface not being
+/// advertised: it names the key source and the store path, which is a map of
+/// what an agent would have to reach to take custody.
+///
+/// What actually enforces this is the **worker allowlist**, not the check
+/// alone: a worker is a local child with no `X-Tasks-Actor`, so it is
+/// attributed as the human and is never gated. `DEFAULT_WORKER_CMD` carrying
+/// no `Bash(curl:*)` is the whole of what stands between the orchestrator and
+/// this route.
+async fn require_human_for_custody(
+    store: &Store,
+    headers: &axum::http::HeaderMap,
+) -> ApiResult<()> {
+    if actor_of(store, headers)? != Actor::Human {
+        return Err(ApiError::Forbidden(
+            "custody of the upstream credentials is the human's alone: these routes change \
+             what the pipeline authenticates as, which no charter capability covers. Ask the \
+             human to paste it, or run `tasks secrets set <name>` at a terminal."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The custody service, or a 503 that says what is missing — the `bundle_service`
+/// shape, and for its reason: a server that cannot reach a sealed store has
+/// not looked in it.
+fn custody_service(
+    secrets: &Option<Arc<crate::secrets::Custody>>,
+) -> ApiResult<&Arc<crate::secrets::Custody>> {
+    secrets.as_ref().ok_or_else(|| {
+        ApiError::Unavailable(
+            "this server has no custody service configured, so it cannot say what is sealed \
+             — which is not the same as nothing being sealed"
+                .into(),
+        )
+    })
+}
+
+/// A 400 naming the closed set, rather than `Path<SecretName>`, whose axum
+/// rejection is a serde message about an enum.
+fn parse_secret_name(raw: &str) -> ApiResult<crate::secrets::SecretName> {
+    crate::secrets::SecretName::parse(raw).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "unknown secret `{raw}`; this system holds exactly: {}",
+            crate::secrets::SecretName::names()
+        ))
+    })
+}
+
+/// `Key` is a **503** and everything else a 500: no unseal key, a locked
+/// keychain or no Keychain on this platform is not something going wrong, it
+/// is a capability that is not configured — and the message says so, because
+/// 503 conventionally means "try again shortly" and this one means "configure
+/// a key source".
+fn custody_error(err: crate::secrets::SecretsError) -> ApiError {
+    match err {
+        crate::secrets::SecretsError::Key(detail) => ApiError::Unavailable(format!(
+            "no usable unseal key: {detail}. This will not clear on its own — set \
+             TASKS_SECRETS_KEY_FILE, or run `tasks secrets init` at a terminal"
+        )),
+        other => ApiError::Internal(other.to_string()),
+    }
+}
+
+/// `GET /secrets` — names, `set_at`, the key-source line, and per name what is
+/// *currently* serving it. Never a value, and deliberately no read-one route.
+async fn secrets_status(
+    State(store): State<Arc<Store>>,
+    State(secrets): State<Option<Arc<crate::secrets::Custody>>>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Json<tasks_api::http::SecretsStatus>> {
+    require_human_for_custody(&store, &headers).await?;
+    let custody = custody_service(&secrets)?;
+    custody.status().map(Json).map_err(custody_error)
+}
+
+/// `POST /secrets/{name}` — write-only. 204 ordinarily, 201 when this call
+/// created the store, 200 when the write landed and this process cannot read
+/// it back until a restart.
+async fn set_secret(
+    State(store): State<Arc<Store>>,
+    State(secrets): State<Option<Arc<crate::secrets::Custody>>>,
+    Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<tasks_api::http::SetSecret>,
+) -> ApiResult<Response> {
+    require_human_for_custody(&store, &headers).await?;
+    let custody = custody_service(&secrets)?;
+    let name = parse_secret_name(&name)?;
+
+    // Wrapped at the moment of extraction, and trimmed and refused empty
+    // exactly as the CLI does. `Secret` has no `Display` at all, so
+    // interpolating it below would be a compile error rather than a silent
+    // `<redacted>`.
+    let value = crate::redact::Secret::new(body.value.trim().to_string());
+    if value.expose().is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "an empty value is not a credential; to remove one, DELETE /secrets/{name}"
+        )));
+    }
+
+    let (into, outcome) = custody.seal(name, &value).map_err(custody_error)?;
+
+    // The breadcrumb carries the **name only**. A `Note` rather than a typed
+    // variant because it needs no exhaustive-match churn and, more to the
+    // point, `Note` is not `nudge_worthy`: a key rotation must not spend an
+    // orchestrator turn telling the one actor that is refused this route.
+    store
+        .append_event(crate::events::EventPayload::Note {
+            source: "secrets".into(),
+            message: format!("`{name}` was sealed over the API"),
+        })
+        .await?;
+
+    Ok(match (into, outcome) {
+        (_, crate::secrets::SealOutcome::NeedsRestart) => (
+            StatusCode::OK,
+            Json(tasks_api::http::SecretNeedsRestart {
+                name,
+                detail: "sealed; this process cannot read it back until a restart (its one \
+                         late unlock attempt has already been spent). The value is safe on \
+                         disk — do not paste it again"
+                    .into(),
+            }),
+        )
+            .into_response(),
+        (crate::secrets::SealedInto::NewStore { path, key_source }, _) => (
+            StatusCode::CREATED,
+            Json(tasks_api::http::SecretsInitialized {
+                store_path: path.display().to_string(),
+                key_source,
+            }),
+        )
+            .into_response(),
+        (crate::secrets::SealedInto::ExistingStore, _) => StatusCode::NO_CONTENT.into_response(),
+    })
+}
+
+/// `DELETE /secrets/{name}` — 204 whether or not anything was there.
+async fn delete_secret(
+    State(store): State<Arc<Store>>,
+    State(secrets): State<Option<Arc<crate::secrets::Custody>>>,
+    Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Response> {
+    require_human_for_custody(&store, &headers).await?;
+    let custody = custody_service(&secrets)?;
+    let name = parse_secret_name(&name)?;
+    if custody.unseal(name).map_err(custody_error)? {
+        store
+            .append_event(crate::events::EventPayload::Note {
+                source: "secrets".into(),
+                message: format!("`{name}` was removed from the sealed store over the API"),
+            })
+            .await?;
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 #[cfg(test)]
