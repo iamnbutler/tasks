@@ -974,7 +974,21 @@ implementation.
   `the_holds_are_read_after_the_scan_not_before_it` (every hold live, the one
   task `Backlog`: the answer must be `Drained`). `dispatch_held_answers_from_live_state_every_time`
   stays deliberately — it is the narrower statement and the one that fails
-  first if the predicate itself breaks rather than its call site.
+  first if the predicate itself breaks rather than its call site. **The serial
+  build lane calls `dispatch_held` too**, since #965. It kept four inline
+  copies for a while, on an argument that was correct as far as it went — the
+  lane claims at most one build per pass, so it already re-read every gate for
+  every container it started and never had `top_up`'s bug, while sharing meant
+  restructuring the match guard the copies lived in, a guard being exactly what
+  cannot `await`. What the argument does not cover is the property the function
+  exists for: with two implementations a *fifth* reason reaches scouts and not
+  builds unless somebody remembers both, and the guard is gone, so it does not
+  have to be remembered. `pool_hold` is **private again** — it was `pub(crate)`
+  for those copies — which is the `Cleared` argument one level down: leaving it
+  reachable would leave a route by which a caller assembles three of the four
+  checks and goes green. `a_full_pool_never_claims_a_build` is what that buys,
+  and it is the test that goes red if the lane is ever swapped back to a
+  partial copy.
 - **A full pool is a property of the moment, so it costs no strike and starts
   no retry loop — and those are two mechanisms, not one.** A Scout refused a VM
   used to be charged a dispatch attempt *and* left in `Scouting`: `dispatch`

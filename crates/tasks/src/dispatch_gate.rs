@@ -120,10 +120,11 @@ pub async fn next_scout(
 /// Whether new scouts must wait: the four standing reasons, asked together.
 ///
 /// One function rather than four inline checks so a fifth reason cannot be
-/// added at one call site and forgotten at the other — [`crate::run::top_up`]
-/// asks once before its loop (for cost) and [`next_scout`] once per dispatch
-/// (for freshness), and a new hold belongs here as one more early
-/// `return Ok(true)` rather than at either call site.
+/// added at one call site and forgotten at another — [`crate::run::top_up`]
+/// asks once before its loop (for cost), [`next_scout`] once per dispatch (for
+/// freshness), and [`crate::run::build_loop`] once per tick ahead of its claim.
+/// A new hold belongs here as one more early `return Ok(true)` rather than at
+/// any of the three call sites.
 ///
 /// Silent by design, like the checks it replaces: a pause is the human's own
 /// act, the GitHub edge is announced by the poller, the update edge by the
@@ -131,12 +132,15 @@ pub async fn next_scout(
 /// whoever asks later. A 500 ms loop that logged its refusals is what trains a
 /// reader to ignore them.
 ///
-/// The build lane asks the same four questions in its own match guard (see
-/// [`crate::run::build_loop`]) and deliberately does **not** call this: it
-/// claims at most one build per pass, so it already re-reads them for every
-/// container it starts, and sharing this would mean restructuring a match guard
-/// around an `await`. The comment there points back here, so whichever site is
-/// edited names the other.
+/// The serial build lane ([`crate::run::build_loop`]) calls this too, since
+/// #965. It kept its own inline copies for a while and the reason was good —
+/// it claims at most one build per pass, so it already re-read every gate for
+/// every container it started and never had `top_up`'s bug, while sharing this
+/// meant restructuring the match guard the copies lived in (a guard cannot
+/// await, which is what forced them apart in the first place). What that
+/// argument does not cover is the one this function exists for: with two
+/// implementations, a *fifth* reason reaches scouts and not builds unless
+/// somebody remembers both. There is now one.
 pub async fn dispatch_held(
     store: &Store,
     health: &GitHubHealth,
@@ -185,9 +189,11 @@ pub async fn dispatch_held(
 /// signal for a refusal-driven record is a successful allocation, which is the
 /// one thing a hold prevents.
 ///
-/// `pub(crate)` for the build lane, which reads the holds in a match guard of
-/// its own rather than through [`dispatch_held`].
-pub(crate) async fn pool_hold(
+/// Private, and that is the same argument [`next_scout`] makes with
+/// [`Cleared`]: it was `pub(crate)` for the build lane's inline copy of the
+/// gates, and leaving it reachable after #965 would leave a route by which a
+/// caller could assemble three of the four checks and go green.
+async fn pool_hold(
     pool_health: &crate::pool_health::PoolHealth,
     handle: &ClientHandle<TasksProtocol>,
     store: &Store,

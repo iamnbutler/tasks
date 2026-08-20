@@ -3267,86 +3267,85 @@ pub async fn build_loop(
         );
 
         loop {
-            // Computed ahead of the guard only because a match guard cannot
-            // await; it is the same hold-before-claim rule as the GitHub one
-            // below.
-            let update_hold = updates.hold(&store).await;
-            // Same, and for the same reason — plus one of its own: this is the
-            // hold that makes #967's requeue safe, so claiming a build and then
-            // refusing it would flip the build `queued -> running` and drag its
-            // batch to `building` on every tick of a full pool. It is evaluated
-            // before the mode check because a match guard cannot await; the
-            // cost of probing while paused is one local round trip every five
-            // seconds, shared with the scout loop.
-            let pool_hold = dispatch_gate::pool_hold(&pool_health, &handle, &store).await;
-            match store.get_mode().await {
-                // A build this process inherited is `running` in the store, so
-                // `claim_next_queued_build` already refuses to start another.
-                // The counter says the same thing in the loop's own terms,
-                // where it can be read without a round trip.
-                //
-                // The holds are in the guard, **ahead of the claim**, for the
-                // same reason the project-status check lives inside the claim's
-                // transaction: claiming moves the build to `running` and drags
-                // its batch's tasks to `building`, so a claim-then-refuse would
-                // flip that state on every tick of the outage.
-                //
-                // These are the same four questions
-                // [`crate::dispatch_gate::dispatch_held`] asks for scouts, and
-                // the duplication is deliberate: this lane claims at most one
-                // build per pass, so it already re-reads them for every
-                // container it starts and never had `top_up`'s stale-snapshot
-                // bug (#948) — while sharing the function would mean
-                // restructuring this match guard around an `await`. A fifth
-                // reason to hold new work belongs in both places: add it to
-                // `dispatch_gate::dispatch_held` and here.
-                Ok(Mode::Play)
-                    if in_flight.builds() == 0
-                        && !github_hold(&health)
-                        && !update_hold
-                        && !pool_hold =>
+            // The lane's own scan comes first, and the four standing holds
+            // after it — the ordering [`crate::dispatch_gate::next_scout`]
+            // states and for the same reason: whatever the scan sees was
+            // committed before the holds were read, so a hold landing in
+            // between still stops this pass.
+            //
+            // A build this process inherited is `running` in the store, so
+            // `claim_next_queued_build` already refuses to start another. The
+            // counter says the same thing in the loop's own terms, where it
+            // can be read without a round trip.
+            //
+            // The holds are read **ahead of the claim**, for the same reason
+            // the project-status check lives inside the claim's transaction:
+            // claiming moves the build to `running` and drags its batch's
+            // tasks to `building`, so a claim-then-refuse would flip that
+            // state on every tick of an outage.
+            //
+            // Through `dispatch_held` and no longer inline (#965). This lane
+            // never had `top_up`'s stale-snapshot bug — it claims at most one
+            // build per pass, so it already re-read every gate for every
+            // container it starts — so what the shared call buys is the
+            // property the function was extracted for: a *fifth* reason to
+            // hold new work cannot be added for scouts and forgotten here. The
+            // match guard the four checks used to live in is gone because a
+            // guard cannot await, which is what forced the copies apart.
+            let held = if in_flight.builds() > 0 {
+                true
+            } else {
+                match dispatch_gate::dispatch_held(&store, &health, &updates, &pool_health, &handle)
+                    .await
                 {
-                    match store.claim_next_queued_build().await {
-                        Ok(Some(build)) => {
-                            let project = match store.get_project(&build.project_id).await {
-                                Ok(Some(p)) => p,
-                                Ok(None) => {
-                                    warn!(build_id = %build.id, "build references a missing project");
-                                    let _ = store
-                                        .finalize_build_failed(&build.id, "project not found")
-                                        .await;
-                                    continue;
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "could not load the build's project");
-                                    continue;
-                                }
-                            };
-                            let source = clone_source(&config, &project);
-                            // Inline await = serial by construction.
-                            match builder.dispatch(build, &source).await {
-                                Ok(done) => {
-                                    info!(build_id = %done.id, pr = ?done.pr_number, "build succeeded");
-                                }
-                                Err(e) => {
-                                    // Already finalized inside dispatch; a dead
-                                    // socket additionally means reconnecting.
-                                    if matches!(
-                                        e,
-                                        BuilderError::Client(_) | BuilderError::StreamClosed
-                                    ) {
-                                        warn!(error = %e, "lost the vm-pool connection mid-build");
-                                        break;
-                                    }
+                    Ok(held) => held,
+                    // The old shape warned on an unreadable *mode* and skipped
+                    // the tick; the holds are read from the same store, so an
+                    // error here means the same thing and is treated the same
+                    // way — hold, and try again on the next tick.
+                    Err(e) => {
+                        warn!(error = %e, "could not read the dispatch holds; skipping build tick");
+                        true
+                    }
+                }
+            };
+            if !held {
+                match store.claim_next_queued_build().await {
+                    Ok(Some(build)) => {
+                        let project = match store.get_project(&build.project_id).await {
+                            Ok(Some(p)) => p,
+                            Ok(None) => {
+                                warn!(build_id = %build.id, "build references a missing project");
+                                let _ = store
+                                    .finalize_build_failed(&build.id, "project not found")
+                                    .await;
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "could not load the build's project");
+                                continue;
+                            }
+                        };
+                        let source = clone_source(&config, &project);
+                        // Inline await = serial by construction.
+                        match builder.dispatch(build, &source).await {
+                            Ok(done) => {
+                                info!(build_id = %done.id, pr = ?done.pr_number, "build succeeded");
+                            }
+                            Err(e) => {
+                                // Already finalized inside dispatch; a dead
+                                // socket additionally means reconnecting.
+                                if matches!(e, BuilderError::Client(_) | BuilderError::StreamClosed)
+                                {
+                                    warn!(error = %e, "lost the vm-pool connection mid-build");
+                                    break;
                                 }
                             }
                         }
-                        Ok(None) => {}
-                        Err(e) => warn!(error = %e, "could not read the build queue"),
                     }
+                    Ok(None) => {}
+                    Err(e) => warn!(error = %e, "could not read the build queue"),
                 }
-                Ok(_) => {}
-                Err(e) => warn!(error = %e, "could not read mode; skipping build tick"),
             }
 
             tokio::select! {

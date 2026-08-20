@@ -343,9 +343,9 @@ async fn a_github_hold_starts_no_scout_and_charges_nothing() {
 /// The serial build lane, which clones too — and where the bug was expensive:
 /// one outage charged a build attempt to every spec in the batch.
 ///
-/// The hold sits in the loop's match guard, *ahead* of the claim, so a held
-/// lane must leave the build `queued` rather than flipping it `running` (and
-/// its batch's tasks to `building`) on every tick of the outage.
+/// The hold is read *ahead* of the claim, so a held lane must leave the build
+/// `queued` rather than flipping it `running` (and its batch's tasks to
+/// `building`) on every tick of the outage.
 #[tokio::test]
 async fn a_github_hold_never_claims_a_build() {
     let (_tmp, store, mut config, _service) = dispatch_harness(1).await;
@@ -516,10 +516,16 @@ async fn a_full_pool_holds_scout_dispatch_and_releases_it_when_a_slot_returns() 
     );
 }
 
-/// The build half of the same gate. Like the GitHub hold above it, this sits
-/// in the match guard *ahead* of the claim: a claim-then-refuse would flip the
-/// build `queued -> running` and drag its batch's tasks to `building` on every
-/// tick of a full pool.
+/// The build half of the same gate. Like the GitHub hold above it, this is
+/// read *ahead* of the claim: a claim-then-refuse would flip the build
+/// `queued -> running` and drag its batch's tasks to `building` on every tick
+/// of a full pool.
+///
+/// Since #965 it also pins where the lane reads its holds. `pool_hold` was
+/// `pub(crate)` for the lane's own inline copy of the four gates and is
+/// private again now, so this can only pass through
+/// `dispatch_gate::dispatch_held` — swap the lane back to a partial copy and
+/// this is the test that goes red.
 #[tokio::test]
 async fn a_full_pool_never_claims_a_build() {
     let (_tmp, store, mut config, _service) = dispatch_harness(1).await;
