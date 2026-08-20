@@ -2759,7 +2759,11 @@ impl Workspace {
     /// situation needs something queued.
     pub(crate) fn pipeline(&self, cx: &App) -> empty_state::Pipeline {
         let reachability = self.reachability(cx);
-        let holds = empty_state::observe(self.server_control.read(cx).status.as_ref());
+        let control = self.server_control.read(cx);
+        let holds = empty_state::observe(control.status.as_ref());
+        // Read off the same probe as the holds, so the two cannot disagree
+        // about how fresh they are.
+        let credentials = control.secrets.clone();
         let state = self.app_state.read(cx);
         empty_state::Pipeline::count(
             reachability,
@@ -2769,6 +2773,7 @@ impl Workspace {
             &self.project_filter,
             state.mode,
             holds,
+            credentials.as_ref(),
         )
     }
 
@@ -2901,6 +2906,13 @@ impl Workspace {
             EmptyStateAction::AddRepo => self.open_repo_window(cx),
             EmptyStateAction::OpenAllTasks => self.navigate(MiddleView::AllTasks, cx),
             EmptyStateAction::Play => self.set_mode(Mode::Play, cx),
+            // The Server window is where the Credentials rows live today —
+            // one path, the same discipline as the two above: a button in an
+            // empty pane goes through an action the menus already dispatch
+            // rather than opening a surface of its own.
+            EmptyStateAction::ConfigureKeys => {
+                window.dispatch_action(Box::new(menus::ShowServerStatus), cx)
+            }
         }
     }
 

@@ -3944,8 +3944,16 @@ async fn get_status(
         // few seconds anyway — the staleness window is what keeps this honest
         // if they stop.
         pool: pool_health
+            .as_ref()
             .and_then(|health| health.hold(Utc::now()))
             .map(|run| run.to_hold()),
+        // Not a hold — the connection is the gate already — but the fact a
+        // reader needs when *nothing* is dispatching and the capacity record
+        // is silent because it could not be asked (#991). Written from the
+        // dispatch loops' own connects; nothing is probed here.
+        pool_unreachable: pool_health
+            .and_then(|health| health.unreachable(Utc::now()))
+            .map(|run| run.to_wire()),
         // The fourth, on the same terms — and *especially* not probed here: a
         // broker probe is a TCP round trip to the bridge gateway, so a status
         // request that made one would let any caller drive traffic at that

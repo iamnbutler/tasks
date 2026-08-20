@@ -41,13 +41,53 @@
 //! pool holds forever — correctly, and now visibly, rather than burning
 //! attempts.
 
+//! ## Capacity is not reachability, and only one of the two is a hold
+//!
+//! [`Exhaustion`] answers "does vm-pool have a slot", which is a question you
+//! can only ask **down a connection that exists** — so it is silent by
+//! construction while the pool is not there at all, and "the pool is dead" was
+//! left to be inferred from things not dispatching (#991). [`Unreachable`] is
+//! the second record in this module and answers the other question, written
+//! from the connect the two dispatch loops already make.
+//!
+//! It is a **report and not a seventh dispatch hold**, and that is the
+//! load-bearing decision. The six holds exist because dispatch would otherwise
+//! proceed and be *charged* an attempt for the failure; here the connection
+//! **is** the gate — a loop with no client cannot start anything — so a hold
+//! would be a second mechanism enforcing what the code's shape already
+//! enforces, and one that could disagree with it. What was missing was never
+//! enforcement; it was the report.
+//!
+//! The evidence is the **connect itself**, which leaves the module's standing
+//! rule intact: a connect is not prose to be classified, it either happened or
+//! it did not, so nothing here decides on message text. A failed `status`
+//! round trip on an established connection is a *different* observation and
+//! deliberately does not write this record — folding it in would put
+//! message-text classification back into a module whose doc comment forbids
+//! it, and would let a transient read error read as "the pool is gone". The
+//! circle the capacity record avoids does not exist here either: what clears
+//! this is a successful *connect*, which the loops retry every
+//! `run::VM_POOL_RETRY` unconditionally and which nothing in the record
+//! prevents.
+//!
+//! `resume_in_flight` also connects, at boot, and recording there was
+//! considered and **rejected**: it returns early when there is no resumable
+//! work, so the record's existence would depend on whether the last boot left
+//! work behind — an observation that exists sometimes is worse than one that
+//! arrives from the dispatch loop ten seconds later.
+//!
+//! The three standing rules hold in shape: nothing observed never reports (a
+//! router with no dispatchers says nothing), only a fresh successful connect
+//! clears it, and a record nobody refreshes expires.
+
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use vm_pool_client::{ClientError, PoolStatus};
 
-use tasks_api::http::PoolHold;
+use tasks_api::http::{PoolHold, PoolUnreachable};
 
 /// How often the record is refreshed. One local unix round trip, claimed by
 /// whichever gate asks first.
@@ -111,6 +151,70 @@ impl Exhaustion {
     }
 }
 
+/// A run of failed connects to vm-pool's socket, not yet ended by one that
+/// succeeded.
+///
+/// The sibling of [`Exhaustion`], and deliberately a separate type: "0 of 6
+/// slots free" and "nothing is listening on that socket" want different
+/// sentences and different fixes, and one struct with an `Option<total>` would
+/// let a renderer print both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreachable {
+    /// The first failed connect in this run. **Not** moved by later ones.
+    pub since: DateTime<Utc>,
+    /// The most recent failed connect, which is what keeps the record from
+    /// going stale under a live loop.
+    pub last: DateTime<Utc>,
+    /// How many connects have failed in this run.
+    pub attempts: u32,
+    /// The socket path, because the fix names it.
+    pub socket: String,
+    /// What the last connect said. Carried for the human, never matched on.
+    pub error: String,
+}
+
+impl Unreachable {
+    /// The sentence the event log and `/status` get.
+    ///
+    /// It says the server retries on its own, so what needs starting is
+    /// vm-pool and **not this** — otherwise the reader's next move is to
+    /// restart the server, which fixes nothing.
+    pub fn describe(&self) -> String {
+        format!(
+            "vm-pool is not answering at {} ({} since {}, {} attempt(s)). Nothing can be \
+             dispatched at all — not scouts, not builds. This server retries the socket \
+             on its own, so what needs starting is vm-pool (`tasks vm-pool`), not this",
+            self.socket,
+            self.error,
+            self.since.to_rfc3339(),
+            self.attempts
+        )
+    }
+
+    /// The wire shape `/status` reports.
+    pub fn to_wire(&self) -> PoolUnreachable {
+        PoolUnreachable {
+            since: self.since,
+            last_seen: self.last,
+            attempts: self.attempts,
+            socket: self.socket.clone(),
+            error: self.error.clone(),
+        }
+    }
+}
+
+/// What one *connect* did to the reachability record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reach {
+    /// Nothing an announcement would be about: a success while reachable, or a
+    /// further failure inside an outage already recorded.
+    Unchanged,
+    /// The pool just became unreachable.
+    Lost(Unreachable),
+    /// A run of failed connects just ended.
+    Restored(Unreachable),
+}
+
 /// What one observation did to the record — the edge, so a caller can announce
 /// it exactly once.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +241,7 @@ pub struct PoolHealth {
 #[derive(Debug, Default)]
 struct Inner {
     exhaustion: Option<Exhaustion>,
+    unreachable: Option<Unreachable>,
     /// When a probe was last *claimed* — not when it answered. Claiming is
     /// what makes two gates share one round trip.
     probed_at: Option<DateTime<Utc>>,
@@ -213,6 +318,58 @@ impl PoolHealth {
         }
     }
 
+    /// Fold one *connect* in, and say what edge it crossed.
+    ///
+    /// Generic over the success type so each site passes the `Result` it
+    /// already has — a `Client` at the dispatch loops, and nothing has to be
+    /// reshaped to be observed.
+    pub fn observe_connect<T>(
+        &self,
+        socket: &Path,
+        outcome: &Result<T, ClientError>,
+        now: DateTime<Utc>,
+    ) -> Reach {
+        let mut inner = self.inner.lock().expect("pool health lock");
+        match outcome {
+            Ok(_) => match inner.unreachable.take() {
+                Some(run) if reach_in_force(&run, now) => Reach::Restored(run),
+                _ => Reach::Unchanged,
+            },
+            Err(error) => match inner.unreachable.as_mut() {
+                Some(run) if reach_in_force(run, now) => {
+                    run.last = now;
+                    run.attempts += 1;
+                    run.error = error.to_string();
+                    Reach::Unchanged
+                }
+                // Nothing recorded, or what was recorded had already expired:
+                // a fresh edge either way, and `since` starts here.
+                _ => {
+                    let run = Unreachable {
+                        since: now,
+                        last: now,
+                        attempts: 1,
+                        socket: socket.display().to_string(),
+                        error: error.to_string(),
+                    };
+                    inner.unreachable = Some(run.clone());
+                    Reach::Lost(run)
+                }
+            },
+        }
+    }
+
+    /// The reachability outage in force right now, if any — the one predicate
+    /// `/status` and every renderer read.
+    pub fn unreachable(&self, now: DateTime<Utc>) -> Option<Unreachable> {
+        let inner = self.inner.lock().expect("pool health lock");
+        inner
+            .unreachable
+            .as_ref()
+            .filter(|run| reach_in_force(run, now))
+            .cloned()
+    }
+
     /// The hold in force right now, if any — the one predicate both gates and
     /// `/status` read.
     pub fn hold(&self, now: DateTime<Utc>) -> Option<Exhaustion> {
@@ -242,6 +399,21 @@ fn stale_after() -> chrono::Duration {
 fn in_force(run: &Exhaustion, now: DateTime<Utc>) -> bool {
     now - run.last <= stale_after()
 }
+
+/// The same window and the same signedness, for the reachability record. It
+/// reuses [`STALE_AFTER`] rather than growing a knob of its own: the
+/// relationship that has to hold is that the window outlasts several of the
+/// dispatch loops' reconnect attempts, which is `run::VM_POOL_RETRY`, pinned
+/// below.
+fn reach_in_force(run: &Unreachable, now: DateTime<Utc>) -> bool {
+    now - run.last <= stale_after()
+}
+
+/// The reachability record is refreshed by the dispatch loops' reconnects, so
+/// the window has to outlast several of them for the same reason
+/// [`PROBE_INTERVAL`]'s assertion exists — a relationship between two numbers,
+/// not two knobs.
+const _: () = assert!(STALE_AFTER.as_secs() >= 4 * crate::run::VM_POOL_RETRY.as_secs());
 
 #[cfg(test)]
 mod tests {
@@ -364,5 +536,123 @@ mod tests {
                 .is_none()
         );
         assert!(health.hold(at(0)).is_some(), "a backwards clock holds");
+    }
+
+    fn socket() -> &'static Path {
+        Path::new("/tmp/vm-pool.sock")
+    }
+
+    fn connected() -> Result<(), ClientError> {
+        Ok(())
+    }
+
+    fn refused() -> Result<(), ClientError> {
+        Err(ClientError::Closed)
+    }
+
+    /// Nothing observed never reports. A router with no dispatchers behind it,
+    /// or a boot before the first connect, says nothing at all — the same rule
+    /// the capacity record and the other five holds keep.
+    #[test]
+    fn nothing_connected_reports_no_outage() {
+        let health = PoolHealth::new();
+        assert!(health.unreachable(at(0)).is_none());
+    }
+
+    /// The edges, announced once each.
+    #[test]
+    fn a_failed_connect_reports_once_and_a_successful_one_clears_it_once() {
+        let health = PoolHealth::new();
+
+        let Reach::Lost(run) = health.observe_connect(socket(), &refused(), at(0)) else {
+            panic!("the first failed connect is the edge");
+        };
+        assert_eq!(run.since, at(0));
+        assert_eq!(run.attempts, 1);
+        assert!(run.socket.contains("vm-pool.sock"));
+        assert!(
+            run.describe().contains("not scouts, not builds"),
+            "{}",
+            run.describe()
+        );
+        assert!(
+            run.describe().contains("not this"),
+            "the fix is vm-pool, not a server restart: {}",
+            run.describe()
+        );
+
+        for (i, t) in [10, 20, 30].into_iter().enumerate() {
+            assert_eq!(
+                health.observe_connect(socket(), &refused(), at(t)),
+                Reach::Unchanged
+            );
+            let out = health.unreachable(at(t)).expect("still out");
+            assert_eq!(out.since, at(0), "`since` is when it went away");
+            assert_eq!(out.last, at(t));
+            assert_eq!(out.attempts as usize, i + 2);
+        }
+
+        let Reach::Restored(ended) = health.observe_connect(socket(), &connected(), at(40)) else {
+            panic!("the recovery is an edge too");
+        };
+        assert_eq!(ended.attempts, 4);
+        assert!(health.unreachable(at(40)).is_none());
+        assert_eq!(
+            health.observe_connect(socket(), &connected(), at(41)),
+            Reach::Unchanged,
+            "a second success says nothing"
+        );
+    }
+
+    /// The two records are about different questions and must not write each
+    /// other: a full pool is not an unreachable one, and a pool nobody can
+    /// reach says nothing about slots.
+    #[test]
+    fn capacity_and_reachability_do_not_write_each_other() {
+        let health = PoolHealth::new();
+
+        health.observe(&status(0, 6), at(0));
+        assert!(health.hold(at(0)).is_some());
+        assert!(
+            health.unreachable(at(0)).is_none(),
+            "a full pool is a reachable one"
+        );
+
+        health.observe_connect(socket(), &refused(), at(1));
+        assert!(health.unreachable(at(1)).is_some());
+        assert!(
+            health.hold(at(1)).is_some(),
+            "a failed connect neither sets nor clears the capacity record"
+        );
+    }
+
+    /// A record nobody refreshes expires, and a clock that stepped backwards
+    /// does not clear one — the signed comparison, same as the capacity
+    /// record's.
+    #[test]
+    fn an_unrefreshed_outage_expires_and_a_backwards_clock_does_not_clear_it() {
+        let health = PoolHealth::new();
+        health.observe_connect(socket(), &refused(), at(1_000));
+        let window = STALE_AFTER.as_secs() as i64;
+        assert!(health.unreachable(at(1_000 + window)).is_some());
+        assert!(health.unreachable(at(1_001 + window)).is_none());
+        assert!(
+            health.unreachable(at(0)).is_some(),
+            "a backwards clock reports"
+        );
+    }
+
+    /// A failed connect after the window has lapsed opens a **new** run rather
+    /// than resurrecting the old one's `since`.
+    #[test]
+    fn a_connect_after_the_window_opens_a_new_run() {
+        let health = PoolHealth::new();
+        health.observe_connect(socket(), &refused(), at(0));
+        let later = at(STALE_AFTER.as_secs() as i64 + 100);
+        let Reach::Lost(run) = health.observe_connect(socket(), &refused(), later) else {
+            panic!("a lapsed record is a fresh edge");
+        };
+        assert_eq!(run.since, later);
+        assert_eq!(run.attempts, 1);
     }
 }

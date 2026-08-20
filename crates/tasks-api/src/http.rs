@@ -588,6 +588,15 @@ pub struct ServerStatus {
     /// reason as the fields above.
     #[serde(default)]
     pub pool: Option<PoolHold>,
+    /// Set for as long as this server's dispatch loops cannot *connect* to
+    /// vm-pool at all — a report rather than a hold, and one that outranks
+    /// `pool` wherever both are rendered. `#[serde(default)]` for the same
+    /// reload-skew reason as the fields above: `reload` decodes the *older*
+    /// server's `/status` with the newer binary, so a required field would
+    /// fail every upgrade past this commit at exactly the step whose job is to
+    /// verify the upgrade.
+    #[serde(default)]
+    pub pool_unreachable: Option<PoolUnreachable>,
     /// Set for as long as scout and build dispatch is being held because the
     /// credential broker is not answering. `#[serde(default)]` for the same
     /// reload-skew reason as the fields above.
@@ -737,6 +746,37 @@ pub struct PoolHold {
     /// `VM_POOL_MAX_VMS` that can never dispatch — from `0 of 6`, which is work
     /// or a leak holding every slot.
     pub total: usize,
+}
+
+/// Why nothing is happening when vm-pool is not there at all.
+///
+/// [`PoolHold`]'s sibling and deliberately not a variant of it: capacity is
+/// only askable **down a connection that exists**, so the record above is
+/// silent by construction while the pool is missing, and "the pool is dead"
+/// was left to be inferred from things not dispatching (#991).
+///
+/// It is a *report*, not a seventh dispatch hold: the connection is the gate
+/// already — a dispatch loop with no client cannot start anything — so a hold
+/// would be a second mechanism enforcing what the code's shape enforces.
+///
+/// **Unreachable outranks exhausted, and they share one row wherever both are
+/// rendered.** A capacity record can only have been written down a connection,
+/// so with no connection it is stale by construction; printing both would tell
+/// a reader that a pool nobody can reach also has no free slots, and send them
+/// hunting a leaked VM instead of starting a daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolUnreachable {
+    /// The first failed connect in this run, which later ones do not move.
+    pub since: DateTime<Utc>,
+    /// The most recent failed connect — the gap to now separates an outage a
+    /// dispatch loop is still retrying from a record about to expire.
+    pub last_seen: DateTime<Utc>,
+    /// How many connects have failed since `since`.
+    pub attempts: u32,
+    /// The socket path, because the fix names it.
+    pub socket: String,
+    /// What the last connect said. For the human; nothing decides on it.
+    pub error: String,
 }
 
 /// Why new containers are waiting: an upgrade is half-applied.
@@ -1051,7 +1091,13 @@ pub struct LabelInfo {
 /// vocabulary at all, and it only ever travels **inbound**: there is no type
 /// here that can carry a value outbound, which is what makes the write-only
 /// property structural rather than a rule somebody remembers.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+///
+/// **No `Debug`, deliberately, and it is the one type here without one.** Most
+/// of this module derives it; a derived `Debug` on the one struct that carries
+/// a credential puts the value one `tracing` field from a log sink, which is
+/// #923 in the client rather than in a VM. Deleting the derive is what makes
+/// that a compile error instead of a review note.
+#[derive(Serialize, Deserialize, Clone)]
 pub struct SetSecret {
     pub value: String,
 }

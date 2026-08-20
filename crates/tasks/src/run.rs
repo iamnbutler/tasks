@@ -203,7 +203,7 @@ const STARTUP: &str = "startup";
 const DISPATCH_TICK: Duration = Duration::from_millis(500);
 
 /// How long to wait before retrying a vm-pool connection.
-const VM_POOL_RETRY: Duration = Duration::from_secs(10);
+pub(crate) const VM_POOL_RETRY: Duration = Duration::from_secs(10);
 
 /// How long in-flight scouts and builds get to finish after ctrl_c before we
 /// walk away.
@@ -1596,6 +1596,50 @@ impl<'a> GitHubWatch<'a> {
     }
 }
 
+/// Record what one vm-pool *connect* did, and say so **once** per edge.
+///
+/// The counterpart of [`GitHubWatch::observe`] and of `dispatch_gate`'s
+/// `announce_pool`, and a `Note` for the same reason both of those are one:
+/// what discharges this is starting a host process, which is not the
+/// orchestrator's to decide (the argument that keeps `ObligationKind::
+/// StaleImage` from existing). The per-attempt `warn!` beside it already
+/// existed and reaches only a terminal; the `Note` is what reaches somebody
+/// who arrives later.
+///
+/// The edge is computed under the record's own lock, so of the two loops that
+/// connect exactly one writes each note.
+pub(crate) async fn announce_pool_reach(store: &Store, reach: crate::pool_health::Reach) {
+    use crate::pool_health::Reach;
+    let message = match reach {
+        Reach::Unchanged => return,
+        Reach::Lost(run) => {
+            let message = run.describe();
+            warn!(socket = %run.socket, "{message}");
+            message
+        }
+        Reach::Restored(run) => {
+            let message = format!(
+                "vm-pool is answering again at {} (it was unreachable for {}s, \
+                 {} attempt(s)); dispatch resumes",
+                run.socket,
+                (run.last - run.since).num_seconds(),
+                run.attempts
+            );
+            info!("{message}");
+            message
+        }
+    };
+    if let Err(e) = store
+        .append_event(EventPayload::Note {
+            source: DISPATCHER.into(),
+            message,
+        })
+        .await
+    {
+        warn!(error = %e, "could not record vm-pool's reachability on the feed");
+    }
+}
+
 /// Whether new work must wait for GitHub.
 ///
 /// One predicate, read by both dispatchers and by `GET /status`, so they cannot
@@ -2334,7 +2378,15 @@ pub async fn dispatch_loop(
         if *shutdown.borrow() {
             return;
         }
-        let mut client = match Client::<TasksProtocol>::connect(&config.vm_pool_socket).await {
+        let connected = Client::<TasksProtocol>::connect(&config.vm_pool_socket).await;
+        // Before the branch, so a success clears a run this same loop opened
+        // moments ago rather than leaving it to expire.
+        announce_pool_reach(
+            &store,
+            pool_health.observe_connect(&config.vm_pool_socket, &connected, chrono::Utc::now()),
+        )
+        .await;
+        let mut client = match connected {
             Ok(client) => client,
             Err(e) => {
                 warn!(
@@ -3598,7 +3650,15 @@ pub async fn build_loop(
         if *shutdown.borrow() {
             return;
         }
-        let client = match Client::<TasksProtocol>::connect(&config.vm_pool_socket).await {
+        let connected = Client::<TasksProtocol>::connect(&config.vm_pool_socket).await;
+        // As in `dispatch_loop`: observed before the branch, and the record's
+        // own lock is what makes exactly one of the two loops write the note.
+        announce_pool_reach(
+            &store,
+            pool_health.observe_connect(&config.vm_pool_socket, &connected, chrono::Utc::now()),
+        )
+        .await;
+        let client = match connected {
             Ok(client) => client,
             Err(e) => {
                 warn!(
