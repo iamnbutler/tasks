@@ -11,11 +11,33 @@
 # The kill threshold is 12 x 5s = 60s, ~5x the slowest legitimate test.
 slow-timeout = { period = "5s", terminate-after = 12 }
 
-# Two tests leak a child process (a stray `sleep`) that keeps the output pipe
-# open after the test itself has finished. A period long enough to outlast it
-# would both cost that wall-clock time and silently reclassify a real leak as
-# a pass, so keep it short: 1s is 10x the nextest default (enough that a
-# benign late-closing child is not flagged) and leaves the known leaks visible.
+# Some tests leak a child process that keeps the output pipe open after the
+# test itself has finished. A period long enough to outlast it would both cost
+# that wall-clock time and silently reclassify a real leak as a pass, so keep
+# it short: 1s is 10x the nextest default (enough that a benign late-closing
+# child is not flagged) and leaves the known leaks visible.
+#
+# Visible *to whom, and against what* is the whole point of `result = "pass"`
+# here, so the known set is written out rather than counted. A count drifts
+# silently and a list does not: this comment said "two", CLAUDE.md said
+# "three", and the suite reported seven (#969). At that spread a genuinely new
+# leak is indistinguishable from the undocumented backlog — and every Builder
+# run in this pipeline is told what the expected leaks are so it does not
+# chase them or weaken an assertion to quiet one.
+#
+# All of them leak for one reason: the test points the supervisor at a stub
+# agent that runs `sleep 10`, and that child inherits the test binary's stderr,
+# so the pipe stays open after the run it belonged to has concluded. A test
+# that starts leaking for any *other* reason is new, and should be read as new
+# rather than filed under these.
+#
+#   tasks::builder a_vm_pool_that_goes_away_mid_build_costs_the_batch_no_attempt
+#   tasks::cancel  a_cancelled_build_returns_its_specs_without_a_strike
+#   tasks::cancel  a_cancelled_scout_concludes_and_returns_its_task_to_the_backlog
+#   tasks::cancel  a_cancelled_scout_keeps_its_salvage_and_stamps_the_reason
+#   tasks::run     a_hung_scout_times_out_and_frees_its_slot
+#   tasks::scout   a_scout_that_never_reports_back_times_out
+#   tasks::scout   a_timed_out_scout_keeps_the_checkpoint_it_had_already_streamed
 leak-timeout = { period = "1s", result = "pass" }
 
 # Name the slow tests at the end of every run.

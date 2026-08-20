@@ -651,15 +651,32 @@ async fn spawn_fake_github(
     (base, fake)
 }
 
+/// An open pull request based on the trunk.
+///
+/// The base is a **parameter** and not a constant, which is the falsifiability
+/// half of #1035: while this fixture hardcoded `main`, every stacked test here
+/// described a build cloned from `build/underneath` against a pull request
+/// GitHub said was based on `main` — so the suite stayed green against a brief
+/// that read `builds.base_branch` and would have stayed green against one that
+/// ignored `base_ref` entirely.
 fn open_pr(mergeable_state: &str) -> Value {
-    json!({
+    open_pr_based_on(mergeable_state, Some("main"))
+}
+
+/// [`open_pr`], stating the base GitHub reports. `None` omits the `base` object
+/// altogether — GitHub declining to say, which must never read as unstacked.
+fn open_pr_based_on(mergeable_state: &str, base: Option<&str>) -> Value {
+    let mut pr = json!({
         "state": "open",
         "merged": false,
         "mergeable": true,
         "mergeable_state": mergeable_state,
         "merge_commit_sha": "speculative",
-        "base": { "ref": "main" },
-    })
+    });
+    if let Some(base) = base {
+        pr["base"] = json!({ "ref": base });
+    }
+    pr
 }
 
 /// A succeeded build on `base`, carrying one spec, with `summary` and
@@ -829,7 +846,8 @@ async fn a_stacked_pr_reports_its_base_and_asks_the_compare_in_that_order() {
     )
     .await;
     // The base has not landed: `main...build/underneath` is `ahead`.
-    let (rest, fake) = spawn_fake_github(open_pr("clean"), "ahead").await;
+    let (rest, fake) =
+        spawn_fake_github(open_pr_based_on("clean", Some("build/underneath")), "ahead").await;
     let github = GitHubClient::new("token").with_rest_base_url(rest);
 
     let text = joined(
@@ -864,7 +882,11 @@ async fn a_stacked_pr_whose_base_already_landed_wants_retargeting() {
         &["crates/tasks/src/store.rs"],
     )
     .await;
-    let (rest, _fake) = spawn_fake_github(open_pr("clean"), "behind").await;
+    let (rest, _fake) = spawn_fake_github(
+        open_pr_based_on("clean", Some("build/underneath")),
+        "behind",
+    )
+    .await;
     let github = GitHubClient::new("token").with_rest_base_url(rest);
 
     let text = joined(
@@ -875,6 +897,105 @@ async fn a_stacked_pr_whose_base_already_landed_wants_retargeting() {
     );
     assert!(text.contains("ALREADY reached main"), "{text}");
     assert!(text.contains("retargeting"), "{text}");
+}
+
+/// #1035: a pull request a human retargeted at the trunk is **not** stacked,
+/// however it was built. `builds.base_branch` records what the build was cloned
+/// against and nothing updates it on a retarget, so reading it here leaves a
+/// retargeted PR stacked forever — and the failure direction is the bad one:
+/// the stacked paragraph argues *against* merging, so a stale base parks a pull
+/// request that is ready and instructs its reader to redo a retarget that has
+/// already happened.
+#[tokio::test]
+async fn a_retargeted_pr_reads_its_base_from_github_and_costs_no_compare() {
+    let store = Store::open_in_memory().await.unwrap();
+    let project = seed_project(&store).await;
+    let build = parked_build(
+        &store,
+        &project,
+        887,
+        // Cloned from another build's branch...
+        "build/underneath",
+        906,
+        Some("Did the thing."),
+        &["crates/tasks/src/brief.rs"],
+    )
+    .await;
+    // ...and since retargeted at the trunk, which is all GitHub reports.
+    let (rest, fake) = spawn_fake_github(open_pr_based_on("clean", Some("main")), "ahead").await;
+    let github = GitHubClient::new("token").with_rest_base_url(rest);
+
+    let text = joined(
+        &Brief::new(&store, Some(&github), "main")
+            .for_stranded_build(&build.id)
+            .await
+            .unwrap(),
+    );
+
+    assert!(
+        text.contains("its base IS the trunk (main)"),
+        "GitHub says main, so this PR ships the work: {text}"
+    );
+    assert!(
+        !text.contains("is NOT the trunk"),
+        "the stored base must not outvote GitHub's: {text}"
+    );
+    assert!(
+        !text.contains("wants retargeting") && !text.contains("retargeting at"),
+        "the retarget already happened; asking for it again is the #1035 defect: {text}"
+    );
+    // The retarget is worth naming rather than silently absorbing — the reader
+    // is being told the build's own record and GitHub's answer differ.
+    assert!(
+        text.contains("has been retargeted") && text.contains("build/underneath"),
+        "{text}"
+    );
+    // Unstacked is unstacked: `base_ref` answers it, so nothing is compared.
+    assert!(
+        fake.lock().unwrap().compares.is_empty(),
+        "a retargeted PR is unstacked and must cost no compare: {:?}",
+        fake.lock().unwrap().compares
+    );
+}
+
+/// Absence of evidence never clears. A pull request GitHub reports no base for
+/// is *unknown*, and must not fall through to the stored column or read as
+/// trunk-based — either would be the same wrong answer arrived at quietly.
+#[tokio::test]
+async fn a_pr_with_no_base_reported_is_unknown_rather_than_unstacked() {
+    let store = Store::open_in_memory().await.unwrap();
+    let project = seed_project(&store).await;
+    let build = parked_build(
+        &store,
+        &project,
+        888,
+        "main",
+        907,
+        Some("Did the thing."),
+        &["crates/tasks/src/brief.rs"],
+    )
+    .await;
+    let (rest, fake) = spawn_fake_github(open_pr_based_on("clean", None), "ahead").await;
+    let github = GitHubClient::new("token").with_rest_base_url(rest);
+
+    let text = joined(
+        &Brief::new(&store, Some(&github), "main")
+            .for_stranded_build(&build.id)
+            .await
+            .unwrap(),
+    );
+
+    assert!(text.contains("did not report this PR's base"), "{text}");
+    assert!(text.contains("unknown rather than fine"), "{text}");
+    assert!(
+        !text.contains("its base IS the trunk"),
+        "unknown must never read as a clearance: {text}"
+    );
+    assert!(
+        fake.lock().unwrap().compares.is_empty(),
+        "nothing is comparable against a base nobody named: {:?}",
+        fake.lock().unwrap().compares
+    );
 }
 
 /// Every batch parked before this check existed, and every one from a Builder

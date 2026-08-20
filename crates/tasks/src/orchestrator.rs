@@ -321,9 +321,9 @@ impl Orchestrator {
         extra_args: &[&str],
         prompt: &str,
     ) -> Result<(String, TurnUsage), OrchestratorError> {
-        let mut parts = self.config.command.split_whitespace();
-        let prog = parts.next().unwrap_or("claude").to_string();
-        let base_args: Vec<String> = parts.map(str::to_string).collect();
+        let mut parts = split_command(&self.config.command).into_iter();
+        let prog = parts.next().unwrap_or_else(|| "claude".to_string());
+        let base_args: Vec<String> = parts.collect();
 
         tokio::fs::create_dir_all(&self.config.workdir)
             .await
@@ -1912,9 +1912,115 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
     )
 }
 
+/// Shell-style word splitting for `ORCHESTRATOR_CMD`: whitespace separates,
+/// single or double quotes group.
+///
+/// `split_whitespace` was wrong here and could not be seen to be wrong, because
+/// the default command's allowlist is a single space-free token
+/// (`Bash(curl:*)`). Claude Code's `--allowedTools` is default-deny and
+/// **prefix-matched**, so a restrictive allowlist has to be written in verbs
+/// rather than tools — `Bash(git:*)` hands the agent `git push` along with the
+/// log, and the expressible form is `Bash(git log:*)`, which contains a space.
+/// Split on whitespace, that shatters into `Bash(git` and `log:*)`: two
+/// permissions matching nothing, and an agent that comes up quietly unable to
+/// do the thing its operator just allowed (#976).
+///
+/// It fails *closed*, which is why this was a bug and not an incident — and
+/// also why it would have been found the confusing way, by someone tightening
+/// permissions and watching the agent lose a capability instead of gaining one.
+///
+/// Deliberately not a full shell parser: no escapes, no variable expansion, no
+/// operators. An agent under a static allowlist cannot expand `$VAR` anyway,
+/// and a command string that needs more than grouping wants `sh -c`.
+fn split_command(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    for c in command.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            None if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            None => {
+                current.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(current);
+    }
+    words
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shape the repository's own documentation recommends for a read-only
+    /// agent is the one shape `ORCHESTRATOR_CMD` could not carry: a
+    /// prefix-matched allowlist written in verbs, whose permissions contain
+    /// spaces. Splitting on whitespace produced `Bash(git` and `log:*)`.
+    #[test]
+    fn a_quoted_permission_survives_the_split() {
+        assert_eq!(
+            split_command(
+                r#"claude --print --allowedTools "Bash(gh:*),Bash(git log:*),Bash(git diff:*)""#
+            ),
+            vec![
+                "claude",
+                "--print",
+                "--allowedTools",
+                "Bash(gh:*),Bash(git log:*),Bash(git diff:*)",
+            ]
+        );
+        assert_eq!(
+            split_command("sh -c 'cat > /dev/null; echo hi'"),
+            vec!["sh", "-c", "cat > /dev/null; echo hi"]
+        );
+    }
+
+    /// The default command has no quotes in it, so this change must be inert
+    /// for everyone who has not written a permission that needs it — including
+    /// for the empty and whitespace-only cases, where `invoke` falls back to
+    /// `claude` on an absent program name.
+    #[test]
+    fn an_unquoted_command_splits_exactly_as_whitespace_did() {
+        for command in [
+            crate::run::DEFAULT_ORCHESTRATOR_CMD,
+            "claude --print --allowedTools Bash(curl:*)",
+            "  spaced   out  ",
+            "",
+        ] {
+            assert_eq!(
+                split_command(command),
+                command.split_whitespace().collect::<Vec<_>>(),
+                "{command:?}"
+            );
+        }
+    }
+
+    /// Stated rather than discovered: an unterminated quote takes the rest of
+    /// the line as one word. That is what a shell does, and the alternative —
+    /// dropping the fragment — would silently shorten an argv, which is the
+    /// class of failure this function exists to end.
+    #[test]
+    fn an_unterminated_quote_keeps_the_rest_as_one_word() {
+        assert_eq!(
+            split_command(r#"claude --allowedTools "Bash(git log:*)"#),
+            vec!["claude", "--allowedTools", "Bash(git log:*)"]
+        );
+    }
 
     /// No strike hangs off a tick, so what a suspend buys here is only the
     /// sentence — but "the laptop closed its lid" is the answer to "why did the

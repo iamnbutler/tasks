@@ -93,7 +93,7 @@ const DEFAULT_BUILDER_TIMEOUT_SECS: u64 = 3600;
 /// what feeds `/orchestrator/stream`: text deltas and tool calls surface live
 /// instead of one opaque multi-minute wait. `--verbose` is mandatory with
 /// `--print --output-format stream-json` (see images/scout/Dockerfile).
-const DEFAULT_ORCHESTRATOR_CMD: &str = "claude --print --output-format stream-json --verbose \
+pub(crate) const DEFAULT_ORCHESTRATOR_CMD: &str = "claude --print --output-format stream-json --verbose \
      --include-partial-messages --allowedTools Bash(curl:*)";
 /// Budget for one orchestrator tick.
 ///
