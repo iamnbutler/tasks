@@ -1325,6 +1325,30 @@ impl Capability {
         }
     }
 
+    /// Every capability again, ordered by what it does to somebody's
+    /// repository — the sharpest first.
+    ///
+    /// A **second ordering**, not a re-sort of [`Self::ALL`] and not a
+    /// reversal of it. `ALL` is the order the charter is meant to be *flipped*
+    /// in, additive first and irreversible last, which puts `CurateWork` at
+    /// the tail — and reading that backwards would put "revise an issue you
+    /// filed" at the head of a list a person reads to find out what is about
+    /// to happen to their repository. Merging pull requests belongs there.
+    ///
+    /// Length is `ALL.len()`, so a tenth capability fails to compile here
+    /// rather than going quietly missing from whatever renders this.
+    pub const BY_CONSEQUENCE: [Capability; Capability::ALL.len()] = [
+        Capability::LandBuilds,
+        Capability::RetireWork,
+        Capability::CurateWork,
+        Capability::CaptureWork,
+        Capability::CommentOnWork,
+        Capability::DispatchBuilds,
+        Capability::QueueTasks,
+        Capability::AutoReviewSpecs,
+        Capability::CancelRuns,
+    ];
+
     /// One line for the generated authority section of the system prompt.
     pub fn describe(&self) -> &'static str {
         match self {
@@ -1337,6 +1361,90 @@ impl Capability {
             Capability::LandBuilds => "merge a Builder's pull request, or close it unmerged",
             Capability::CurateWork => "revise an issue you filed: its body, its labels",
             Capability::CancelRuns => "stop a scout or a build that is already running",
+        }
+    }
+
+    /// The same fact as [`Self::describe`], said to the person who owns the
+    /// repository rather than to the agent holding the permission.
+    ///
+    /// **Arms of a second exhaustive match over the same enum**, deliberately:
+    /// a tenth capability cannot answer one of these and not the other,
+    /// because it fails to compile. That is the whole guarantee, and it is why
+    /// this lives here rather than in whichever client renders it — a ninth
+    /// line in a client's table simply goes missing.
+    ///
+    /// `describe` says "file issues for work you discover", which is a job
+    /// description and reads as harmless; the person deciding whether to let
+    /// this loose is asking "what appears on my repository", and the honest
+    /// answer is "new issues, filed without asking". Same enforced row, same
+    /// structure, different audience.
+    pub fn consequence(&self) -> &'static str {
+        match self {
+            Capability::CaptureWork => "file new issues on your repositories",
+            Capability::RetireWork => "close your issues",
+            Capability::QueueTasks => "put work in the queue for an agent to pick up",
+            Capability::DispatchBuilds => "start builds that write code and open pull requests",
+            Capability::AutoReviewSpecs => "approve its own plans without you reading them",
+            Capability::CommentOnWork => "comment on your issues and pull requests",
+            Capability::LandBuilds => {
+                "merge its own pull requests into your default branch, or close them unmerged"
+            }
+            Capability::CurateWork => "rewrite the body and labels of issues it filed",
+            Capability::CancelRuns => "stop a scout or a build that is already running",
+        }
+    }
+
+    /// Changes something outside Tasks that the person cannot take back.
+    ///
+    /// **This means "cannot be undone", not "worth being told about"**, and
+    /// the difference matters when reading the `false` arms. Filing thirty
+    /// issues under `CaptureWork`, or commenting under `CommentOnWork`, is
+    /// among the most *visible* things this system can do to a public
+    /// repository — and both are deletable, so both are quiet here. Their
+    /// absence is a statement about reversibility and not a judgement that
+    /// nobody would mind. What carries the weight for a reader is the
+    /// unconditional list of what Play does at all; this only decides which
+    /// capabilities get named in the headline sentence.
+    ///
+    /// Exhaustive, so a new capability is classified rather than defaulting
+    /// into the quiet half.
+    pub fn is_sharp(&self) -> bool {
+        match self {
+            // Lands somebody else's code in a branch people build on, or
+            // closes a pull request the work is sitting in.
+            Capability::LandBuilds => true,
+            // Closing an issue upstream is a state change on the repository
+            // that the person did not make.
+            Capability::RetireWork => true,
+            // Rewrites rather than appends: a bad capture leaves a bad issue,
+            // a bad edit destroys a good one.
+            Capability::CurateWork => true,
+            // Reversible: delete the issue, delete the comment.
+            Capability::CaptureWork => false,
+            Capability::CommentOnWork => false,
+            // Local to the pipeline. They spend machine time and API credit —
+            // which the notice states unconditionally — but nothing outside
+            // Tasks changes, and nothing here is unrecoverable.
+            Capability::QueueTasks => false,
+            Capability::DispatchBuilds => false,
+            Capability::AutoReviewSpecs => false,
+            // Throws away a VM hour rather than making one.
+            Capability::CancelRuns => false,
+        }
+    }
+
+    /// The name a person reads. The slug stays the API's.
+    pub fn title(&self) -> &'static str {
+        match self {
+            Capability::CaptureWork => "File issues",
+            Capability::RetireWork => "Close issues",
+            Capability::QueueTasks => "Queue tasks",
+            Capability::DispatchBuilds => "Start builds",
+            Capability::AutoReviewSpecs => "Review specs",
+            Capability::CommentOnWork => "Comment",
+            Capability::LandBuilds => "Merge pull requests",
+            Capability::CurateWork => "Edit issues",
+            Capability::CancelRuns => "Cancel runs",
         }
     }
 }
@@ -1659,5 +1767,82 @@ mod tests {
         assert!(!TaskState::AwaitingMerge.is_terminal());
         assert!(TaskState::Done.is_terminal());
         assert!(TaskState::Rejected.is_terminal());
+    }
+
+    /// A second ordering, not a second *set*. The compiler pins the length;
+    /// this pins that nothing was dropped or doubled while reordering, which
+    /// a fixed-length array cannot catch on its own.
+    #[test]
+    fn by_consequence_is_a_permutation_of_all() {
+        let mut ordered = Capability::BY_CONSEQUENCE.to_vec();
+        let mut all = Capability::ALL.to_vec();
+        ordered.sort_by_key(|c| c.as_str());
+        all.sort_by_key(|c| c.as_str());
+        assert_eq!(ordered, all);
+    }
+
+    /// ...and it is genuinely a different order, not `ALL` copied. If someone
+    /// "tidies" it into a reversal of `ALL`, `curate_work` leads a list a
+    /// person reads to find out what is about to happen to their repository.
+    #[test]
+    fn by_consequence_leads_with_merging_rather_than_editing() {
+        assert_eq!(Capability::BY_CONSEQUENCE[0], Capability::LandBuilds);
+        assert_ne!(Capability::BY_CONSEQUENCE, Capability::ALL);
+        let reversed: Vec<_> = Capability::ALL.iter().rev().copied().collect();
+        assert_ne!(Capability::BY_CONSEQUENCE.to_vec(), reversed);
+    }
+
+    /// Every rendering is an arm of an exhaustive match, so this cannot fail
+    /// by omission — only by someone writing an empty string into one.
+    #[test]
+    fn every_capability_says_something_in_every_voice() {
+        for capability in Capability::ALL {
+            assert!(!capability.describe().trim().is_empty());
+            assert!(!capability.consequence().trim().is_empty());
+            assert!(!capability.title().trim().is_empty());
+        }
+    }
+
+    /// The two voices are the same fact, not the same sentence: `describe`
+    /// addresses the agent, `consequence` addresses the repository's owner.
+    /// If they ever collapse into one string the distinction has been lost by
+    /// edit rather than by decision.
+    #[test]
+    fn the_two_voices_are_not_the_same_words() {
+        let differing = Capability::ALL
+            .iter()
+            .filter(|c| c.describe() != c.consequence())
+            .count();
+        assert_eq!(differing, Capability::ALL.len() - 1);
+        // The one that legitimately coincides: stopping a run is the same act
+        // described to either audience, and inventing a difference would be
+        // worse than sharing the sentence.
+        assert_eq!(
+            Capability::CancelRuns.describe(),
+            Capability::CancelRuns.consequence()
+        );
+    }
+
+    /// Sharpness is about reversibility. Pinned per capability rather than by
+    /// counting, so a reclassification is a deliberate edit to this list.
+    #[test]
+    fn sharp_means_it_cannot_be_taken_back() {
+        for capability in [
+            Capability::LandBuilds,
+            Capability::RetireWork,
+            Capability::CurateWork,
+        ] {
+            assert!(capability.is_sharp(), "{}", capability.as_str());
+        }
+        for capability in [
+            Capability::CaptureWork,
+            Capability::CommentOnWork,
+            Capability::QueueTasks,
+            Capability::DispatchBuilds,
+            Capability::AutoReviewSpecs,
+            Capability::CancelRuns,
+        ] {
+            assert!(!capability.is_sharp(), "{}", capability.as_str());
+        }
     }
 }

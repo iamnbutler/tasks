@@ -406,3 +406,111 @@ async fn capabilities_are_independent() {
     assert_eq!(resp.status(), 202);
     assert_eq!(resp.json::<Value>().await.unwrap()["shadowed"], true);
 }
+
+// --- what unattended operation means (#993) ---
+
+/// The first acknowledgement is the one that stands.
+///
+/// Two surfaces can send this, and a client may fire it without reading
+/// first — so the second one must not rewrite "when was this person told"
+/// into a later, wronger answer. Not a gate: nothing here is refused because
+/// the row is empty, and nothing is permitted because it is full.
+#[tokio::test]
+async fn the_first_acknowledgement_is_the_one_that_stands() {
+    let h = harness().await;
+
+    let before: Value = h
+        .http
+        .get(format!("{}/autonomy-notice", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        before["acknowledged_at"].is_null(),
+        "a fresh install has told nobody: {before}"
+    );
+
+    let first: Value = h
+        .http
+        .post(format!("{}/autonomy-notice/ack", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let stamped = first["acknowledged_at"].as_str().unwrap().to_string();
+
+    // Far enough apart that a second write would be visible as a different
+    // instant rather than being hidden by clock resolution.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let second: Value = h
+        .http
+        .post(format!("{}/autonomy-notice/ack", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        second["acknowledged_at"].as_str().unwrap(),
+        stamped,
+        "the second acknowledgement moved the timestamp"
+    );
+
+    let read_back: Value = h
+        .http
+        .get(format!("{}/autonomy-notice", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(read_back["acknowledged_at"].as_str().unwrap(), stamped);
+}
+
+/// The orchestrator cannot acknowledge on the human's behalf — with every
+/// capability `live`, which is how the charter ships.
+///
+/// It is refused outright rather than charter-gated, on the `build-now`
+/// precedent: the row records that a *person* was shown this, so an agent
+/// writing it would be clicking through its own disclosure and the record
+/// would then claim a human had been informed when none had.
+///
+/// The refusal is proven to be a **no-op**: a 403 that had already written
+/// the row would be the whole failure, quietly.
+#[tokio::test]
+async fn the_orchestrator_cannot_acknowledge_the_notice_for_the_human() {
+    let h = harness().await;
+    for capability in Capability::ALL {
+        h.set(capability, CharterLevel::Live, None).await;
+    }
+
+    let resp = h
+        .as_orchestrator(h.http.post(format!("{}/autonomy-notice/ack", h.base)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    let after = h.store.autonomy_notice().await.unwrap();
+    assert!(
+        after.acknowledged_at.is_none(),
+        "the refusal wrote the row anyway: {after:?}"
+    );
+
+    // ...and reading it is still open to anyone, because a client that cannot
+    // read cannot decide whether to explain.
+    let resp = h
+        .as_orchestrator(h.http.get(format!("{}/autonomy-notice", h.base)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}

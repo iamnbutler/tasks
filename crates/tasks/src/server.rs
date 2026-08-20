@@ -29,12 +29,12 @@ use tracing::{error, info, warn};
 
 use tasks_api::http::DecisionReconciliation;
 use tasks_api::http::{
-    AbandonPullRequest, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelAllResponse,
-    CancelRunRequest, CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject,
-    EditIssueRequest, ErrorResponse, GitHubHold, LabelInfo, MergePullRequest, ModeResponse,
-    RejectedBundle, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewCommentRequest,
-    ReviewRequest, ScoutRequest, SendMessage, ServerStatus, SetCharter, SetLabelsRequest, SetMode,
-    SetProjectStatus, SettleDecisionRequest, ShadowAck, Viewer,
+    AbandonPullRequest, AutonomyNotice, BuildDetail, BuildNowRequest, BuildRequest, CancelAck,
+    CancelAllResponse, CancelRunRequest, CaptureIssue, CloseTaskRequest, CommentRequest,
+    CreateProject, EditIssueRequest, ErrorResponse, GitHubHold, LabelInfo, MergePullRequest,
+    ModeResponse, RejectedBundle, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue,
+    ReviewCommentRequest, ReviewRequest, ScoutRequest, SendMessage, ServerStatus, SetCharter,
+    SetLabelsRequest, SetMode, SetProjectStatus, SettleDecisionRequest, ShadowAck, Viewer,
 };
 
 use crate::bundles::RejectedBundles;
@@ -317,6 +317,8 @@ fn routes(store: Arc<Store>, services: Services) -> Router {
         .route("/decisions/{seq}/settle", post(settle_decision))
         .route("/charter", get(get_charter))
         .route("/charter/{capability}", post(set_charter))
+        .route("/autonomy-notice", get(get_autonomy_notice))
+        .route("/autonomy-notice/ack", post(acknowledge_autonomy_notice))
         .route("/builds/{build_id}", get(get_build))
         .route("/builds/{build_id}/cancel", post(cancel_build))
         .route("/runs/cancel-all", post(cancel_all_runs))
@@ -2343,6 +2345,45 @@ async fn set_charter(
             .set_charter(capability, level, body.daily_limit)
             .await?,
     ))
+}
+
+/// `GET /autonomy-notice` — has anyone ever been shown what unattended
+/// operation means? (#993)
+///
+/// **Readable by anyone, deliberately.** A client that cannot read this cannot
+/// decide whether to explain, and the failure it would fall into is explaining
+/// on every press — which is how a notice stops being read.
+///
+/// **This is not a gate.** No handler in this file consults the row before
+/// acting, and adding one would be a deliberate new reader rather than a
+/// refactor.
+async fn get_autonomy_notice(State(store): State<Arc<Store>>) -> ApiResult<Json<AutonomyNotice>> {
+    Ok(Json(store.autonomy_notice().await?))
+}
+
+/// `POST /autonomy-notice/ack` — record that a person was shown it.
+///
+/// **Human-only, and not charter-gated**, on the `build-now` precedent: the row
+/// records that a *person* was told, so an orchestrator able to write it would
+/// be clicking through its own disclosure — and the record would then say a
+/// human had been informed when none had. It is not a unit of work inside the
+/// pipeline and none of the nine capabilities describes it.
+///
+/// Idempotent: the store keeps the first acknowledgement, so a client may fire
+/// this without reading first and a second surface cannot move the timestamp.
+async fn acknowledge_autonomy_notice(
+    State(store): State<Arc<Store>>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Json<AutonomyNotice>> {
+    if actor_of(&store, &headers)? != Actor::Human {
+        return Err(ApiError::Forbidden(
+            "acknowledging what unattended operation means is the human's alone: the row records \
+             that a person was shown this, so an agent writing it would be clicking through its \
+             own disclosure. Nothing is gated on it either way."
+                .into(),
+        ));
+    }
+    Ok(Json(store.acknowledge_autonomy_notice().await?))
 }
 
 /// The decisions ledger. `?spec=` / `?build=` narrow to one subject; the

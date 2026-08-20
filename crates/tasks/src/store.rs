@@ -27,7 +27,7 @@ use crate::models::{
 };
 use crate::orchestrator::TurnUsage;
 use crate::protocol::{FailureClass, SupervisorBuild};
-use tasks_api::http::{AppliedMigration, InFlight, InFlightItem};
+use tasks_api::http::{AppliedMigration, AutonomyNotice, InFlight, InFlightItem};
 use tasks_api::version::{ImageFreshness, ImageIdentity, ImageRole};
 
 // --- column lists ---
@@ -4476,6 +4476,39 @@ impl Store {
     /// A capability missing from the table reads as `off`. That is the safe
     /// direction and it means adding a capability to the enum does not
     /// silently grant it before its migration lands.
+    /// Has anyone ever been shown what unattended operation means? (#993)
+    ///
+    /// **Nothing reads this to decide whether an action may happen** — see the
+    /// migration. It answers one question for a client: explain, or do not
+    /// explain again.
+    pub async fn autonomy_notice(&self) -> Result<AutonomyNotice, StoreError> {
+        let row = sqlx::query("SELECT acknowledged_at FROM autonomy_notice WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        let acknowledged_at = match row {
+            Some(row) => {
+                let raw: String = row.try_get("acknowledged_at")?;
+                Some(parse_ts(&raw, "acknowledged_at")?)
+            }
+            None => None,
+        };
+        Ok(AutonomyNotice { acknowledged_at })
+    }
+
+    /// Record that a person was shown it, and answer with what stands.
+    ///
+    /// `INSERT OR IGNORE`, so the **first** acknowledgement is the one kept: a
+    /// second click from another surface must not rewrite when this person was
+    /// told into a later, wronger answer. That also makes the call idempotent,
+    /// which is what lets a client fire it without reading first.
+    pub async fn acknowledge_autonomy_notice(&self) -> Result<AutonomyNotice, StoreError> {
+        sqlx::query("INSERT OR IGNORE INTO autonomy_notice (id, acknowledged_at) VALUES (1, ?)")
+            .bind(Utc::now().to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+        self.autonomy_notice().await
+    }
+
     pub async fn charter(&self) -> Result<Vec<CharterEntry>, StoreError> {
         let rows = sqlx::query("SELECT * FROM orchestrator_charter")
             .fetch_all(&self.pool)
