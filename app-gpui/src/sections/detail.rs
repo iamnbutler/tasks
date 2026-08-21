@@ -18,8 +18,9 @@ use tasks_client::api::models::{
     BuildId, Complexity, GhState, SpecId, SpecQueueStatus, TaskId, TaskState,
 };
 
-use crate::components::{byte_size, status_badge, task_state_color, title_case};
+use crate::components::{byte_size, status_badge, task_state_color};
 use crate::time;
+use crate::vocabulary;
 use crate::workspace::Workspace;
 
 /// Amber: this is not an error and not a success. The build failed, but the
@@ -206,17 +207,29 @@ impl Workspace {
                 .flex_row()
                 .items_center()
                 .gap(px(6.))
-                .child(status_badge(
-                    title_case(task.state.as_str()),
-                    task_state_color(task.state),
-                ))
-                .child(status_badge(
-                    task.gh_state.as_str().to_string(),
-                    match task.gh_state {
-                        GhState::Open => gpui::hsla(135. / 360., 0.55, 0.52, 1.),
-                        GhState::Closed => gpui::hsla(280. / 360., 0.70, 0.68, 1.),
-                    },
-                ))
+                .child({
+                    // A constant id is correct here: at most one Overview
+                    // header is on screen.
+                    let term = vocabulary::task_state(task.state);
+                    status_badge(
+                        "overview-task-state",
+                        term.label,
+                        term.gloss,
+                        task_state_color(task.state),
+                    )
+                })
+                .child({
+                    let term = vocabulary::gh_state(task.gh_state);
+                    status_badge(
+                        "overview-gh-state",
+                        term.label,
+                        term.gloss,
+                        match task.gh_state {
+                            GhState::Open => gpui::hsla(135. / 360., 0.55, 0.52, 1.),
+                            GhState::Closed => gpui::hsla(280. / 360., 0.70, 0.68, 1.),
+                        },
+                    )
+                })
                 .child(
                     div()
                         .text_xs()

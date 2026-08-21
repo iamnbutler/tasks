@@ -19,10 +19,12 @@ mod repo_composer;
 mod row_menu;
 mod sections;
 mod secrets;
+mod selection;
 mod server;
 mod server_window;
 mod state;
 mod time;
+mod vocabulary;
 mod workspace;
 
 use gpui::{
