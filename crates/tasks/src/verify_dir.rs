@@ -4,8 +4,8 @@
 //! `ORCHESTRATOR_TARGET_DIR` is a `CARGO_TARGET_DIR` the orchestrator builds
 //! and tests in, shared and long-lived because the warmth is the whole reason
 //! a merge decision can rest on a real test run rather than on a typecheck.
-//! It had no bound and — worse — no *report*: CLAUDE.md said "expect ~7.5 GB
-//! and nothing prunes it", and it was found at 39 GB by a human hunting for
+//! It had no bound and — worse — no *report*: the documentation said "expect
+//! ~7.5 GB and nothing prunes it", and it was found at 39 GB by a human hunting for
 //! disk (#1010), then measured at **51 GB** a week later, growing ~2 GB per
 //! verification.
 //!

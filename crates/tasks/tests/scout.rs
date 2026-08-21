@@ -823,7 +823,8 @@ async fn expire_the_budget(budget: Duration) {
 /// `tokio::time::timeout` drops it here.
 ///
 /// The error keeps its shape: a salvaged timeout is still `Timeout`, and
-/// `exit_reason` still says "timed out". CLAUDE.md and two other tests pin it.
+/// `exit_reason` still says "timed out". `tasks::deadline` and two other tests
+/// pin it.
 ///
 /// What this proves is a deadline firing against a run that is *already
 /// holding* a checkpoint. It does not exercise a deadline arriving naturally —

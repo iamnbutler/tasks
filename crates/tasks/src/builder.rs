@@ -126,7 +126,8 @@ impl BuilderError {
             // finished, whereas this one means the host stopped being able to
             // observe the run at all. It recurs for a structural reason —
             // vm-pool is a separate long-lived daemon, upgraded separately
-            // and, per CLAUDE.md, restarted *ahead* of this server — so every
+            // and, per `docs/operating.md`, restarted *ahead* of this server —
+            // so every
             // vm-pool restart that caught a build in flight used to charge
             // the whole batch, and three of them `blocked` specs that had
             // never failed to build.

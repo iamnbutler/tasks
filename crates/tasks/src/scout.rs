@@ -830,7 +830,7 @@ impl Scout {
                 // as one the supervisor handed over deliberately.
                 //
                 // The error is returned unchanged either way. `Timeout` in
-                // particular keeps its shape: CLAUDE.md and the timeout
+                // particular keeps its shape: [`crate::deadline`] and the timeout
                 // integration tests pin `exit_reason` containing "timed out",
                 // and a salvaged timeout is still a timeout. A `Suspended` run
                 // travels the same path and keeps the same salvage — the notes

@@ -8,8 +8,9 @@
 //! `build timed out after 3600s`. True in monotonic terms, and wrong in every
 //! term a human uses: it held the serial build lane for nearly nine hours and
 //! charged three specs a build attempt each for a closed lid, which CLAUDE.md's
-//! own rule forbids — a `Timeout` is charged precisely because it "had the
-//! entire budget", and this one had 38 minutes of it.
+//! rule forbids — a strike is charged for a verdict and for nothing else, and a
+//! `Timeout` counts as one precisely because the run had the entire budget.
+//! This one had 38 minutes of it.
 //!
 //! A [`Deadline`] is therefore anchored on *both* clocks and expires on
 //! whichever runs out first. Because both anchors are kept, the gap between

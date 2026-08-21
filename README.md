@@ -47,7 +47,7 @@ does.
   ordinary child process on the machine running the server, and what it may
   do is whatever `ORCHESTRATOR_CMD` allows. The default is `curl` and nothing
   else; pointing `ORCHESTRATOR_WORKDIR` at a checkout and adding
-  `--dangerously-skip-permissions`, which `CLAUDE.md` describes as a
+  `--dangerously-skip-permissions`, which `docs/operating.md` describes as a
   supported way to run it, makes it a full developer agent on your host.
 
 The server boots paused, so nothing moves until you say so. Point it at a
@@ -275,7 +275,10 @@ make resume       # ...then give dispatch back
 
 ## Reading further
 
-- `CLAUDE.md` — the load-bearing design rules, with the reasoning attached
+- `CLAUDE.md` — the rules that hold everywhere in this repo, and an index of
+  where the reasoning behind them lives
+- `docs/operating.md` — running a server: environment variables, pool capacity,
+  restart and drain semantics, running the tests
 - `docs/plans/` — implementation plans, including the v2 architecture and
   the v3 UI spec
 - `crates/vm-pool/CLAUDE.md` — vm-pool's own conventions
