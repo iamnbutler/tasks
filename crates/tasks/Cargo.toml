@@ -11,6 +11,7 @@ name = "tasks"
 path = "src/main.rs"
 
 [dependencies]
+libc.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 axum.workspace = true

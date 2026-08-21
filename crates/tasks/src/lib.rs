@@ -42,6 +42,10 @@ pub mod pidfile;
 /// Whether vm-pool has a slot to give, and whether dispatch should wait for
 /// one (#967).
 pub mod pool_health;
+/// Prompt prose shared by more than one agent — private, like
+/// `migrations`: no client needs it, and `pub` would make prompt text
+/// part of this crate's surface.
+mod prompt;
 pub mod reattach;
 pub mod redact;
 pub mod reload;

@@ -591,6 +591,62 @@ implementation.
   is retained is a dependency tree `make test` never builds — the steady-state
   size therefore depends on whether app builds share this directory, which
   nobody has decided.
+- **The orchestrator's turn has two live controls, and they are two acts because
+  they answer two questions.** Every other run in the system could be stopped
+  and every one of them held; the turn could be neither, so the honest answer to
+  "stop it, it is wedged on a cold build" was to wait it out. `POST
+  /orchestrator/interrupt` ends the turn in flight and `POST
+  /orchestrator/hold` / `/release` stop new ones starting — all three
+  **human-only and not charter-gated**, on the `build-now` precedent, because
+  they decide whether the judge convenes at all rather than doing a unit of work
+  inside the pipeline. The **interrupt is an in-process signal and not a
+  `cancellations` row**, and the reason is that row's own premise: *the process
+  taking the request need not be the one following the run*, which is true of a
+  scout or a build living in a VM and false of a turn, a local child of this one
+  server that dies with it and can never be reattached. A worker is a local
+  child too and does use a row, because a worker has a durable id; a turn has
+  none, `cancellations` is keyed `(run_kind, run_id)`, and the only id available
+  is the singleton's — so a request landing a moment late would sit on record and
+  stop a *later* turn nobody asked to stop. `TurnControl` is one slot taken while
+  a turn runs, so a request that arrives with nothing running finds no slot, is
+  answered honestly with a **200 and never a 4xx**, and is never stored: "it
+  cannot leak forward" is structural rather than careful, which an `AtomicBool`
+  plus a stored request would give back. `OrchestratorError::Interrupted` is the
+  **one** error that does not become an assistant turn — every other path writes
+  itself into the chat precisely because persisting a reply settles the tick
+  condition so a poison prompt is not retried forever, and settling it is exactly
+  what an interrupt must not do. The watermark moves only in
+  `append_orchestrator_reply`, which the interrupted path never reaches, so the
+  input survives and the next tick re-answers it; a `return` added through that
+  function "to record what happened" would silently eat the input the control
+  exists to preserve. The accounting goes on the feed as a `Note` instead,
+  written **by the turn and not by the route**, because the select is `biased`
+  with the work first (`cancel::bounded`'s rule) and a note written at the
+  request would sometimes claim a stop that never happened. The **hold is a
+  column** rather than a signal, and deliberately not the mode's shape:
+  `TASKS_DEFAULT_MODE` overwrites the stored mode at every boot precisely because
+  dispatch should come back quiet, whereas a hold is a standing decision about
+  the judge and a restart that silently resumed turns would leave a control that
+  looks applied and is not. Re-holding does not move "held since" — that is when
+  the lane went quiet, not when somebody last said so. Both reasons a turn may
+  not start are read through **one** predicate, `Store::orchestrator_lane`, and
+  `OrchestratorLane` is a **struct and not an enum**: the two are not
+  alternatives, a human can hold the lane *and* have the session checked out, and
+  an enum forces a precedence that silently discards one — leaving a reader to
+  release the wrong thing and find the lane still quiet. Two consequences are
+  easy to undo by accident. The **verify-directory reclaim keys on
+  `checked_out` alone, never on the lane**: held means that loop is precisely
+  what is *not* running, so a hold must not stop bounding a directory that
+  reached 51 GB unattended (#1010), while checked out is the one case the
+  "nothing else starts a process in here" argument does not cover. And the child
+  now runs in its **own process group**, swept on the interrupt path *and* on the
+  timeout path, because `kill_on_drop` takes the agent alone and its bash
+  children survive holding the pipes being read — `run_script`'s hazard one
+  surface over, same answer — so a timed-out turn cannot leave a `cargo` behind
+  in that same directory. Liveness between the two signals is
+  `crate::pidfile::pid_alive` (`ps -o state=`, a leading `Z` is dead) and not
+  `/proc`, which this deployment platform does not have, and not `kill(pid, 0)`,
+  which reports every unreaped corpse as alive.
 - **Bulk intake never auto-dispatches, and queue membership is explicit.**
   `tasks.manual_rank` is set only via the API; the GitHub poller must never
   write it. Ingested issues land in `backlog` and are never dispatched — only
@@ -983,6 +1039,48 @@ implementation.
   Safe with no leader election only because the pool refuses an occupied
   socket. Boot mode stays the quiet default; `tasks service install
   --default-mode play` is the explicit, crash-restart-inclusive opt-in.
+- **A release is one number, cut by a human, and its changelog is generated
+  from the commits rather than written per merge.** The number is
+  `0.1.<commit count>` — `build-stamp`'s identity, borrowed rather than a second
+  scheme — so the annotated tag, the DMG name, the CLI zip, the `CHANGELOG.md`
+  heading and `GET /version` all say the same thing;
+  `[workspace.package] version` is declared **inert** in `Cargo.toml`, because
+  nothing here publishes to crates.io and a second number is a second thing to
+  keep in step. `make publish` is the whole act and it is **human-only with no
+  API route at all** — the `build-now` / `POST /projects` category, deciding
+  what the project publishes rather than doing a unit of work inside the
+  pipeline. Three things hold its shape. **Nothing public happens until the
+  artifacts are verified**: build → sign → notarize → staple → verify, and only
+  then tag → push → upload, so a failed notarization retries with nothing to
+  un-tag; and `push` sends both refs with `git push --atomic`, so a `main`
+  rejected because someone merged under us leaves no orphaned tag. **The
+  version is `count + 1`, written in exactly one place** — the changelog commit
+  is inside its own release, so `scripts/changelog.sh --next-version` owns that
+  arithmetic and the Makefile calls it rather than repeating it, since two
+  copies of an off-by-one is how one of them gets fixed alone; every stage is a
+  **sub-make**, because `BUILD_VERSION :=` is expanded at parse time and would
+  be stale the moment `changelog` commits, and `tag` **refuses unless
+  `CHANGELOG.md`'s newest `## v` heading is the stamp it is about to tag**,
+  which catches that mistake in both directions rather than documenting it. And
+  **the walk is not `--first-parent`**: a build merged into another build's
+  branch rather than into the trunk is reachable from `main` and off its
+  first-parent chain, so a first-parent-only log drops it silently — this
+  pipeline stacks builds routinely, and `28c879e` (the Mac app) is the proof on
+  this repository's own history. The walk keeps a commit that is on the trunk
+  *or* is itself a pull-request merge by subject shape, which is also what puts
+  the housekeeping denylist to work; the denylist is **stated, never a
+  heuristic**, so a new kind of noise shows up in a section and gets added
+  deliberately instead of a cleverness quietly eating a real entry. The PR title
+  comes from the merge commit's **body**, where GitHub already put it, with `gh`
+  as the bounded fallback — free, offline, deterministic. What
+  `check-publish` cannot answer is stated rather than papered over: it reads
+  check runs for HEAD and `changelog` then commits on top, so the tagged commit
+  is one CI never saw. There is no fix — check runs for an unpushed commit are
+  unconditionally absent, so a re-read would refuse every release — and what
+  bounds it is that the commit is changelog-only and `make release` builds every
+  artifact locally from it. Its dirty-tree refusal is a **second copy** of
+  `release`'s `check-clean-tree` on purpose: this one has to refuse before the
+  changelog commit. Design: `docs/plans/2026-08-20-release-flow.md`.
 - **What never leaves this machine may be unsigned; what is downloaded is
   signed, notarized and stapled — and the chain refuses rather than
   degrades.** `make app` and `make dist` stay unsigned, and that is not an
@@ -1853,6 +1951,16 @@ make release SIGN_IDENTITY='Developer ID Application: … (TEAM)'
 make release-clean                     # rm -rf dist/ — the release staging
                                        #   directory only, never what `make
                                        #   dist` installed
+make publish HEADLINE="…"              # cut a release: refuse unless HEAD is a
+                                       #   green origin/main, generate the
+                                       #   CHANGELOG section, run `make
+                                       #   release`, then tag, push both refs
+                                       #   atomically, upload and re-download
+                                       #   the two assets. Human-only, and
+                                       #   there is no API route
+bash scripts/changelog.sh <from> <to>  # that section on its own, to stdout;
+                                       #   `--next-version` is the one place
+                                       #   0.1.<count + 1> is written
 tasks service install                  # THIS binary -> ~/.tasks/bin, one
                                        #   LaunchAgent (login + crash restart);
                                        #   idempotent, and also the upgrade

@@ -33,6 +33,21 @@ use gpuikit::theme::{ActiveTheme, Themeable};
 
 use crate::disclaimer;
 
+/// The app's mark, inline as SVG bytes — the same double diamond
+/// `app-gpui/AppIcon.icns` carries, generated from the same constants by
+/// `app-gpui/icon/appicon.py`. Two renderings of one set of numbers rather
+/// than two pictures somebody has to remember to update together.
+///
+/// The *tight* variant: `AppIcon.svg` is the full 1024 macOS grid with the
+/// field inset 100 on every side, which the `.icns` requires and which inline
+/// would leave the mark sitting optically small and misaligned against the
+/// text beside it. Same art, viewBox cropped to the field.
+///
+/// `include_bytes!` rather than an `AssetSource` entry: this app installs
+/// gpuikit's asset source and has none of its own, and inline art is the
+/// existing idiom — `workspace::MIC_SVG` is the pattern.
+const MARK_SVG: &[u8] = include_bytes!("../icon/AppIconMark.svg");
+
 /// `0.1.<commit count>`, or the crate version with no git in reach.
 pub const VERSION: &str = env!("TASKS_GPUI_VERSION");
 /// Short SHA (`-dirty` when the tree had uncommitted changes), or `unknown`.
@@ -96,6 +111,10 @@ pub fn open(cx: &mut App) {
 impl Render for About {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let mark = std::sync::Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Svg,
+            MARK_SVG.to_vec(),
+        ));
 
         div()
             .flex()
@@ -107,18 +126,36 @@ impl Render for About {
             .p(px(20.))
             .bg(theme.bg())
             .font_family(crate::workspace::FONT)
-            .child(div().text_color(theme.fg()).child("Tasks"))
+            // A row, not a stack: the window is a fixed 380x300 and is not
+            // resizable, so an icon *above* the name would push
+            // README_POINTER off the bottom. Beside them it costs the three
+            // text lines' own height and nothing more.
             .child(
                 div()
-                    .text_sm()
-                    .text_color(theme.fg_muted())
-                    .child(format!("Version {VERSION}")),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.fg_muted())
-                    .child(format!("commit {COMMIT}")),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(gpui::img(mark).size(px(56.)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().text_color(theme.fg()).child("Tasks"))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme.fg_muted())
+                                    .child(format!("Version {VERSION}")),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.fg_muted())
+                                    .child(format!("commit {COMMIT}")),
+                            ),
+                    ),
             )
             .child(
                 div()
@@ -193,5 +230,23 @@ mod tests {
             "{}",
             disclaimer::README_POINTER
         );
+    }
+
+    /// `include_bytes!` fails the build when the file is missing and says
+    /// nothing about whether what it found is art. This is the only test that
+    /// covers the mark actually reaching this window, and `.tasks/verify` does
+    /// not run it — `app-gpui` is not a workspace member, so `make app-test`
+    /// is what does.
+    ///
+    /// Structure only: no path count, no colour. The generator's constants are
+    /// the whole design surface, and a redesign must not have to come here —
+    /// the mark stays free to change and only stops being free to stop being
+    /// an SVG. `crates/tasks/tests/app_icon.rs` holds the rest.
+    #[test]
+    fn the_mark_is_an_svg() {
+        let mark = std::str::from_utf8(MARK_SVG).expect("the mark is UTF-8");
+        assert!(mark.starts_with("<svg "), "not an svg root: {mark:.40}");
+        assert!(mark.trim_end().ends_with("</svg>"), "truncated: {mark:.40}");
+        assert!(mark.contains("<path "), "the mark draws nothing");
     }
 }
