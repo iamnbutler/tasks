@@ -347,8 +347,8 @@ pub struct Config {
     /// vm-pool image builds run in (`BUILDER_IMAGE`).
     pub builder_image: String,
     /// Budget for one build (`BUILDER_TIMEOUT_SECS`), measured on both the
-    /// monotonic and the wall clock — see [`crate::deadline`], and CLAUDE.md's
-    /// *Budgets and a host that sleeps* for why a suspend is not a timeout.
+    /// monotonic and the wall clock — see [`crate::deadline`] for why a
+    /// suspend is not a timeout.
     pub builder_timeout: Duration,
     /// REST endpoint override (`GITHUB_REST_API_URL`) — PR creation only.
     pub github_rest_api_url: Option<String>,
@@ -2641,7 +2641,7 @@ pub(crate) const BUILD_LANE_SLOTS: usize = 1;
 /// never allocated — but it is very much memory, and on a small machine the
 /// memory ledger is the one that bites first.
 ///
-/// CLAUDE.md's *Pool capacity* arithmetic is this number's only calibration
+/// `docs/operating.md`'s *Pool capacity* arithmetic is this number's only calibration
 /// and it is a back-solve rather than a measurement: at the default shapes
 /// (`SCOUT_MAX_CONCURRENT` 2 × 6144 MB, a Builder at 8192 MB) the ≈22 GB it
 /// states leaves 2 GB for buildkit. A test pins the sum, so changing either
@@ -3882,7 +3882,7 @@ mod tests {
     /// The two ledgers are two ledgers. `buildkit` bills to host memory and
     /// **not** to a slot — the container runtime starts it to service
     /// `container build`, as an ordinary host process the pool never
-    /// allocated — and CLAUDE.md's *Pool capacity* arithmetic (3 scouts + a
+    /// allocated — and `docs/operating.md`'s *Pool capacity* arithmetic (3 scouts + a
     /// Builder + buildkit ≈ 22 GB at the default shapes) is what calibrates
     /// the reserve. Add buildkit to the slot count and the first assertion
     /// goes red; drop it from the memory sum and the second does.
@@ -3900,7 +3900,7 @@ mod tests {
         );
 
         // The memory sum is stated at the *default* concurrency, because that
-        // is the configuration CLAUDE.md's ≈22 GB describes.
+        // is the configuration `docs/operating.md`'s ≈22 GB describes.
         let reserve = memory_reserve_mb(
             DEFAULT_SCOUT_MAX_CONCURRENT,
             SCOUT_VM.default_memory_mb,
@@ -3915,7 +3915,7 @@ mod tests {
         assert_eq!(
             reserve / 1024,
             22,
-            "the memory ledger drifted from CLAUDE.md's ~22 GB: {reserve} MB"
+            "the memory ledger drifted from docs/operating.md's ~22 GB: {reserve} MB"
         );
     }
 

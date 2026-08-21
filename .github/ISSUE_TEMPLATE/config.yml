@@ -9,4 +9,4 @@ contact_links:
     about: Report privately. This repository's own pipeline reads its issue tracker.
   - name: How the system actually works
     url: https://github.com/iamnbutler/tasks/blob/main/CLAUDE.md
-    about: CLAUDE.md is the specification — every design rule, with the failure behind it.
+    about: CLAUDE.md holds the rules that hold everywhere, and indexes the module doc comments that carry the reasoning.

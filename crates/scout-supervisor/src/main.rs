@@ -420,8 +420,8 @@ const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 30;
 /// Salvage matters *most* for the runs that end badly and early, and those are
 /// exactly the runs inside the first interval: at the production 30s, a Scout
 /// that wrote notes at second 3 and died at second 25 streamed nothing, and
-/// CLAUDE.md's rule is that nothing collected at the end survives because the
-/// VM is destroyed at the deadline (#968).
+/// Nothing collected at the end survives, because the VM is destroyed at the
+/// deadline (#968) — which is why notes stream as checkpoints.
 ///
 /// Shortening the interval is *not* the fix — it trades the window for polling
 /// cost and cannot remove it, since a run can always die inside whatever
