@@ -56,6 +56,7 @@ id_newtype!(TaskId, "task");
 id_newtype!(SessionId, "sess");
 id_newtype!(SpecId, "spec");
 id_newtype!(BuildId, "build");
+id_newtype!(WorkerId, "work");
 
 /// How much of the pipeline still runs for one repo — the honest per-repo
 /// counterpart to the global [`Mode`].
@@ -337,14 +338,16 @@ pub struct TranscriptLine {
     pub line: String,
 }
 
-/// Which run produced a transcript line. Two variants rather than one opaque
-/// id because they are two resources behind two routes — a reader holding a
-/// line should not have to guess which one to fetch more from.
+/// Which run produced a transcript line. One variant per owning resource
+/// rather than one opaque id because they are separate resources behind
+/// separate routes — a reader holding a line should not have to guess which
+/// one to fetch more from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TranscriptOwner {
     Session { session_id: SessionId },
     Build { build_id: BuildId },
+    Worker { worker_id: WorkerId },
 }
 
 impl TranscriptOwner {
@@ -360,11 +363,18 @@ impl TranscriptOwner {
         }
     }
 
+    pub fn worker(id: &WorkerId) -> Self {
+        TranscriptOwner::Worker {
+            worker_id: id.clone(),
+        }
+    }
+
     /// The owning row's id, whichever side of the arc is set.
     pub fn id(&self) -> &str {
         match self {
             TranscriptOwner::Session { session_id } => session_id.as_str(),
             TranscriptOwner::Build { build_id } => build_id.as_str(),
+            TranscriptOwner::Worker { worker_id } => worker_id.as_str(),
         }
     }
 }
@@ -797,10 +807,11 @@ impl BuildStatus {
     }
 }
 
-/// Which kind of run something is about — a Scout session or a Builder run.
+/// Which kind of run something is about — a Scout session, a Builder run, or
+/// a host worker run.
 ///
 /// The discriminant that lets one `cancellations` table and one cancel path
-/// serve both dispatchers. Deliberately not folded into [`TranscriptOwner`]:
+/// serve every dispatcher. Deliberately not folded into [`TranscriptOwner`]:
 /// that one carries the id and exists to address a transcript, this one is the
 /// bare kind and travels beside an id that is already in hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -808,6 +819,7 @@ impl BuildStatus {
 pub enum RunKind {
     Session,
     Build,
+    Worker,
 }
 
 impl RunKind {
@@ -815,6 +827,7 @@ impl RunKind {
         match self {
             RunKind::Session => "session",
             RunKind::Build => "build",
+            RunKind::Worker => "worker",
         }
     }
 
@@ -822,6 +835,7 @@ impl RunKind {
         match s {
             "session" => Some(RunKind::Session),
             "build" => Some(RunKind::Build),
+            "worker" => Some(RunKind::Worker),
             _ => None,
         }
     }
@@ -832,11 +846,98 @@ impl RunKind {
         match self {
             RunKind::Session => "scout",
             RunKind::Build => "build",
+            RunKind::Worker => "worker",
         }
     }
 }
 
 impl fmt::Display for RunKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A worker run: labor the orchestrator moved out of its own conversation
+/// lane (#1053). A fresh, disposable headless Claude Code session the server
+/// spawns **on the host** — full host capabilities (the checkout, the warm
+/// build directory), no `--resume`, no context carried between jobs.
+///
+/// A worker is a voice, not an authority: its result text comes back into the
+/// orchestrator conversation as a server-written `[worker <job>]` turn, and
+/// its default command carries no `curl` at all — a local process with no
+/// actor header would be attributed as the *human*, whom the charter never
+/// gates, so handing a worker the API would make dispatching one a
+/// privilege-escalation primitive. GitHub and pipeline writes stay where the
+/// server can attribute them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Worker {
+    pub id: WorkerId,
+    /// Short label naming the job, chosen at dispatch. It heads the report
+    /// turn (`[worker <job>]`), so it is what the words are attributed to.
+    pub job: String,
+    /// The job itself, free text. Same trust domain as the orchestrator that
+    /// wrote it.
+    pub prompt: String,
+    pub status: WorkerStatus,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    /// How the run ended, in words — the only thing that later tells a
+    /// deliberate stop from a crash from a budget that ran out.
+    pub exit_reason: Option<String>,
+    /// The result text the run returned, when it completed. The bounded copy
+    /// of this is what lands in the conversation; this is the full text.
+    pub report: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerStatus {
+    Queued,
+    Running,
+    Succeeded,
+    /// The run ended without a report the orchestrator can act on: a non-zero
+    /// exit, a timeout, or a host that went away. Never a strike anywhere — a
+    /// failed worker is information, and whether to redispatch is the
+    /// orchestrator's call on reading the report turn.
+    Failed,
+    /// Stopped on purpose, by an accountable actor, while queued or running.
+    Cancelled,
+}
+
+impl WorkerStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WorkerStatus::Queued => "queued",
+            WorkerStatus::Running => "running",
+            WorkerStatus::Succeeded => "succeeded",
+            WorkerStatus::Failed => "failed",
+            WorkerStatus::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "queued" => Some(WorkerStatus::Queued),
+            "running" => Some(WorkerStatus::Running),
+            "succeeded" => Some(WorkerStatus::Succeeded),
+            "failed" => Some(WorkerStatus::Failed),
+            "cancelled" => Some(WorkerStatus::Cancelled),
+            _ => None,
+        }
+    }
+
+    /// Whether the run has reached a state nothing will move it out of.
+    /// The predicate `POST /workers/{id}/cancel` answers `concluded` on.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            WorkerStatus::Succeeded | WorkerStatus::Failed | WorkerStatus::Cancelled
+        )
+    }
+}
+
+impl fmt::Display for WorkerStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -915,6 +1016,78 @@ impl ChatRole {
     }
 }
 
+/// Why the orchestrator's turn lane is quiet — the two reasons a headless
+/// tick may not start, read through one predicate (#1064).
+///
+/// **A struct and not an enum**, and that is the whole shape. The two are not
+/// alternatives: a human can hold the lane *and* have the session checked out,
+/// and an enum forces a precedence that silently discards one — leaving a
+/// reader to release the wrong thing and find the lane still quiet.
+/// [`Self::describe`] returns both when both hold.
+///
+/// One read behind both, so the loop that decides whether to tick and every
+/// surface that reports why it did not cannot drift into two notions of
+/// "quiet".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OrchestratorLane {
+    /// A human has held the lane: `POST /orchestrator/hold`. Durable — a
+    /// column on the singleton row, so it survives a restart. Deliberately not
+    /// the mode's shape: `TASKS_DEFAULT_MODE` overwrites the stored mode at
+    /// every boot precisely because dispatch should come back quiet, whereas a
+    /// lane hold is a standing decision about the judge, and a restart that
+    /// silently resumed turns would leave a control that looks applied and is
+    /// not.
+    #[serde(default)]
+    pub held: bool,
+    /// When the hold was placed — "held since", which re-holding does not
+    /// move. Decoration for a banner that ages it, so an unreadable timestamp
+    /// can never become "not held".
+    #[serde(default)]
+    pub held_at: Option<DateTime<Utc>>,
+    /// A human has the CC session checked out interactively (a fresh
+    /// heartbeat). CC sessions have no file locking, so a headless turn would
+    /// interleave writes with theirs.
+    #[serde(default)]
+    pub checked_out: bool,
+}
+
+impl OrchestratorLane {
+    /// Whether a headless tick may start. The one predicate — every reader
+    /// asks this rather than testing a field.
+    pub fn may_tick(&self) -> bool {
+        !self.held && !self.checked_out
+    }
+
+    /// Why it may not, in the reader's terms, naming each reason's discharge.
+    /// `None` when the lane is open.
+    ///
+    /// Both reasons when both hold: a reader told only about the checkout
+    /// releases it and finds the lane still quiet, which is how a control
+    /// stops being trusted.
+    pub fn describe(&self) -> Option<String> {
+        let mut reasons = Vec::new();
+        if self.held {
+            reasons.push(
+                "a human is holding the turn lane (POST /orchestrator/release to let turns \
+                 start again)"
+                    .to_string(),
+            );
+        }
+        if self.checked_out {
+            reasons.push(
+                "the session is checked out interactively (it frees itself when the \
+                 checkout heartbeat lapses)"
+                    .to_string(),
+            );
+        }
+        if reasons.is_empty() {
+            None
+        } else {
+            Some(reasons.join("; and "))
+        }
+    }
+}
+
 /// The orchestrator's Claude Code session as clients see it
 /// (`GET /orchestrator/session`): enough to resume it interactively
 /// (`cd <workdir> && claude --resume <cc_session_id>`) and whether someone
@@ -927,7 +1100,18 @@ pub struct OrchestratorSessionInfo {
     pub workdir: Option<String>,
     /// A human holds an interactive checkout (fresh heartbeat); headless
     /// ticks are suspended while true.
+    ///
+    /// Kept beside [`Self::lane`] rather than replaced by it — existing
+    /// clients read this — and filled from the *same* read, so the two cannot
+    /// disagree about the same instant.
     pub checked_out: bool,
+    /// Both reasons the turn lane may be quiet, and the predicate that decides
+    /// whether a tick starts (#1064). `#[serde(default)]` because a client
+    /// built from this crate may be talking to a server that predates the
+    /// field, and an open lane is the honest reading of a server that has no
+    /// hold to report.
+    #[serde(default)]
+    pub lane: OrchestratorLane,
     /// How much context the session is holding as of its last turn, in
     /// tokens: the input side (fresh + cached) of the prompt behind its last
     /// main-chain model call. An absolute reading — this is the number to
@@ -1314,6 +1498,15 @@ decision_actions! {
     /// that was wrong, and the reason `enroll_agents` can be trusted with
     /// `live`.
     RevokeAgent => "revoke_agent", Some(Capability::EnrollAgents);
+    /// A worker run was dispatched: labor (a suite run, a composition check,
+    /// an investigation) moved onto the host worker lane instead of being run
+    /// inside the orchestrator's own turn.
+    ///
+    /// Store-only — `applied` by construction, like `enroll_agent`: the
+    /// dispatch commits in the same transaction family as the row it creates
+    /// and reaches GitHub never. What a worker *returns* is a report turn in
+    /// the conversation, not a gated write.
+    DispatchWorker => "dispatch_worker", Some(Capability::DispatchWorkers);
 }
 
 /// What became of the effect a decision authorized.
@@ -1422,16 +1615,28 @@ pub enum Capability {
     /// capability covers for the same reason `reopen_work` lives under
     /// `retire_work`: an act and its undo belong to one switch.
     EnrollAgents,
+    /// Dispatch a worker run: a fresh headless agent the server spawns on the
+    /// host to do labor (run a suite, verify a composition, investigate) and
+    /// report back into the conversation as a `[worker <job>]` turn.
+    ///
+    /// What makes this safe to ship `live`: a worker conveys labor, not
+    /// authority. Its result is input the orchestrator weighs; its default
+    /// command has no route to the pipeline API (no `curl`) and no GitHub
+    /// credential, so every gated write still happens where the server can
+    /// attribute it. The cost of a bad dispatch is host CPU time, bounded by
+    /// `WORKER_TIMEOUT_SECS` and stoppable under `cancel_runs`.
+    DispatchWorkers,
 }
 
 impl Capability {
     /// Every capability, in the order the charter is meant to be flipped:
     /// additive and trivially reversible first, irreversible-ish last.
-    pub const ALL: [Capability; 10] = [
+    pub const ALL: [Capability; 11] = [
         Capability::CaptureWork,
         Capability::CommentOnWork,
         Capability::RetireWork,
         Capability::QueueTasks,
+        Capability::DispatchWorkers,
         Capability::DispatchBuilds,
         Capability::CancelRuns,
         Capability::AutoReviewSpecs,
@@ -1452,6 +1657,7 @@ impl Capability {
             Capability::CurateWork => "curate_work",
             Capability::CancelRuns => "cancel_runs",
             Capability::EnrollAgents => "enroll_agents",
+            Capability::DispatchWorkers => "dispatch_workers",
         }
     }
 
@@ -1467,6 +1673,7 @@ impl Capability {
             "curate_work" => Some(Capability::CurateWork),
             "cancel_runs" => Some(Capability::CancelRuns),
             "enroll_agents" => Some(Capability::EnrollAgents),
+            "dispatch_workers" => Some(Capability::DispatchWorkers),
             _ => None,
         }
     }
@@ -1486,6 +1693,63 @@ impl Capability {
             Capability::EnrollAgents => {
                 "enroll an external agent: mint a short-lived code that lets it \
                  message you (POST /agents), or revoke one"
+            }
+            Capability::DispatchWorkers => {
+                "dispatch a worker: a fresh host agent that runs a job you \
+                 write (POST /workers) and reports back as a [worker] turn"
+            }
+        }
+    }
+
+    /// One clause for a **human** reading what the pipeline is about to be
+    /// allowed to do — the generated half of the before-first-`play` sheet
+    /// (#993).
+    ///
+    /// Two sentences of one fact, and deliberately not one. [`Self::describe`]
+    /// is second person and instructional ("file issues for work you
+    /// discover") because it is a line of the *orchestrator's* generated
+    /// authority section; rendered at a human it reads as though the human is
+    /// being told to file issues. This one names the act sharply, in the third
+    /// person, and says whose account it acts on — "your default branch",
+    /// "your repositories" — because the whole question the sheet answers is
+    /// what this does to things the reader owns.
+    ///
+    /// It never renders its own slug: `land_builds` is a name for a switch,
+    /// not a description of merging a pull request, and a sheet full of slugs
+    /// is one nobody reads. The match is exhaustive, so a capability added
+    /// later is in the sheet because the enum is, not because somebody
+    /// remembered.
+    pub fn permits(&self) -> &'static str {
+        match self {
+            Capability::CaptureWork => "file new issues in your repositories, without asking",
+            Capability::RetireWork => {
+                "close issues in your repositories as done or not planned, and reopen them"
+            }
+            Capability::QueueTasks => {
+                "queue work for a Scout, which starts a VM that reads one of your repositories"
+            }
+            Capability::DispatchBuilds => {
+                "start Builder runs, which write code and push branches to your repositories"
+            }
+            Capability::AutoReviewSpecs => {
+                "approve or reject a Scout's spec itself, with no human reading it first"
+            }
+            Capability::CommentOnWork => {
+                "post comments on your issues and pull requests, under your account"
+            }
+            Capability::LandBuilds => {
+                "merge its own pull requests into your default branch, or close them unmerged"
+            }
+            Capability::CurateWork => {
+                "rewrite the body and labels of issues it filed in your repositories"
+            }
+            Capability::CancelRuns => "stop a Scout or a Builder that is already running",
+            Capability::EnrollAgents => {
+                "hand another agent a short-lived code that lets it speak into this \
+                 conversation under its own name"
+            }
+            Capability::DispatchWorkers => {
+                "start extra agent processes on this machine, which run commands here"
             }
         }
     }
@@ -1745,6 +2009,61 @@ pub enum OrchestratorFeedEvent {
     Done,
 }
 
+/// A credential the pipeline spends, by name.
+///
+/// One definition rather than a wire copy beside a store copy: the sealed
+/// store's JSON key, the `tasks secrets` argument and the `/secrets/{name}`
+/// path segment are the same string by construction. A divergence would make
+/// a CLI-written store silently unaddressable by the route, for one name only,
+/// which is why `the_wire_spelling_is_the_store_spelling` pins the two
+/// against each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecretName {
+    AnthropicApiKey,
+    GithubToken,
+}
+
+impl SecretName {
+    pub const ALL: [SecretName; 2] = [SecretName::AnthropicApiKey, SecretName::GithubToken];
+
+    /// The store-file / CLI / URL spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SecretName::AnthropicApiKey => "anthropic-api-key",
+            SecretName::GithubToken => "github-token",
+        }
+    }
+
+    /// The environment variable this entry supersedes.
+    pub fn env_var(self) -> &'static str {
+        match self {
+            SecretName::AnthropicApiKey => "ANTHROPIC_API_KEY",
+            SecretName::GithubToken => "GITHUB_TOKEN",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|n| n.as_str() == raw)
+    }
+
+    /// The closed set, rendered from one place so every refusal names the
+    /// same list.
+    pub fn names() -> String {
+        Self::ALL
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for SecretName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1809,5 +2128,24 @@ mod tests {
         assert!(!TaskState::AwaitingMerge.is_terminal());
         assert!(TaskState::Done.is_terminal());
         assert!(TaskState::Rejected.is_terminal());
+    }
+}
+
+#[cfg(test)]
+mod secret_name_tests {
+    use super::SecretName;
+
+    /// The serde spelling and `as_str` are the same string, for every name.
+    /// They are the URL path segment and the sealed store's JSON key
+    /// respectively, so a divergence is a store the route cannot address.
+    #[test]
+    fn the_wire_spelling_is_the_store_spelling() {
+        for name in SecretName::ALL {
+            let wire = serde_json::to_string(&name).unwrap();
+            assert_eq!(wire, format!("\"{}\"", name.as_str()));
+            assert_eq!(SecretName::parse(name.as_str()), Some(name));
+        }
+        assert_eq!(SecretName::parse("nope"), None);
+        assert!(SecretName::names().contains("github-token"));
     }
 }

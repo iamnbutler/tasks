@@ -5,11 +5,25 @@ guess from the tree and will otherwise get wrong.
 
 ## Read `CLAUDE.md` first
 
-It is not agent boilerplate. It is the actual specification of this system —
-every load-bearing design rule, each one written with the failure that
-produced it. Nearly every review comment you would otherwise receive is a
-paragraph in there. If a change contradicts one of those rules, the change
-needs to move the rule *and say why*, in the same commit.
+It is not agent boilerplate. It holds the rules that hold everywhere in this
+repo — short, and each one written with the failure that produced it. If a
+change contradicts one of them, the change needs to move the rule *and say
+why*, in the same commit.
+
+It is deliberately small, because it is loaded in full into every agent turn.
+What it does not hold is the reasoning behind any particular module: that lives
+in the `//!` header on the module itself, and those headers are where nearly
+every review comment you would otherwise receive already is. `CLAUDE.md`
+indexes the ones worth reading first.
+
+**Write your reasoning in the doc comment on the code it governs, not in
+`CLAUDE.md`.** This is the convention that matters most to us and the one
+easiest to get wrong, because putting it in `CLAUDE.md` feels more visible. It
+is the opposite: a paragraph there is read by every turn and updated by none,
+while a doc comment is read by whoever changes the behaviour and deleted when
+the code is. `CLAUDE.md` reached 190,000 characters in August 2026 one
+well-intentioned paragraph at a time (#1093); `crates/tasks/tests/claude_md.rs`
+now fails if it grows back.
 
 ## Before you commit
 
@@ -28,10 +42,11 @@ editor's rust-analyzer, another terminal — stalls the whole suite. Use
 Inside a test, reach for `env!("CARGO_BIN_EXE_<name>")` for a binary in the
 same package and `common::workspace_bin(name)` for one from another.
 
-**Some tests report LEAK, and that is expected.** The three scout-timeout
-tests leave a stray child holding the output pipe. `.config/nextest.toml` sets
-`leak-timeout` to `result = "pass"`; it looks like a failure in the output and
-is not.
+**Some tests report LEAK, and that is expected.** A handful of tests leave a
+stray child holding the output pipe. `.config/nextest.toml` sets `leak-timeout`
+to `result = "pass"` and lists the known set by name beside it — named rather
+than counted, so a test leaking for a new reason reads as new. It looks like a
+failure in the output and is not.
 
 **nextest does not run doctests** — silently, with no skip count. Both
 `make test` and `make test-ci` end with `cargo test --doc --workspace`.

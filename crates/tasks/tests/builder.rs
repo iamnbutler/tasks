@@ -1007,7 +1007,7 @@ impl Drop for PoolLink {
 }
 
 /// vm-pool is a separate long-lived daemon, upgraded separately and — per
-/// CLAUDE.md — restarted *ahead* of this server, so a restart routinely
+/// `docs/operating.md` — restarted *ahead* of this server, so a restart routinely
 /// catches a build in flight. `BuilderError::StreamClosed` was classified
 /// `Verdict`, four lines below the comment explaining why `Egress` is
 /// `Transport`, and `Builder::conclude` reads `failure_class()` straight into

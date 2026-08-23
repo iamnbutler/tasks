@@ -39,7 +39,7 @@ use tasks_client::api::models::{
 use crate::chat_log::{ChatEntryId, ChatRowKey, ChatRowKind};
 use crate::commands::WORKSPACE_CONTEXT;
 use crate::components::{
-    markdown_block, pane_header, sidebar, MarkdownCache, SidebarSide, SidebarState,
+    markdown_block, pane_header, sidebar, MarkdownCache, SidebarSide, SidebarState, SwallowPress,
 };
 use crate::context_gauge::{self, Band, Gauge};
 use crate::empty_state::{self, Action as EmptyStateAction, Explanation, Reachability};
@@ -53,6 +53,7 @@ use crate::palette::{
 use crate::projects::ProjectFilter;
 use crate::repo_composer::{self, RepoComposer};
 use crate::row_menu::{self, RowAction, RowContext, RowEntry};
+use crate::selection::TaskSelection;
 use crate::server::ServerControl;
 use crate::server_window;
 use crate::state::AppState;
@@ -63,12 +64,6 @@ pub(crate) const FONT: &str = "Menlo";
 /// Reading-width cap for conversation content — long markdown replies
 /// wrap at a comfortable measure instead of spanning a wide window.
 const CHAT_MAX_WIDTH: gpui::Pixels = px(768.);
-
-/// The chip's microphone, inline as SVG bytes: the radix set gpuikit ships
-/// has no mic, and `Image::from_bytes(Svg, …)` renders without an asset
-/// source. Stroke is gruvbox's muted gray, hardcoded because an `img` does
-/// not take the text color — acceptable for a control that ships disabled.
-const MIC_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#928374" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>"##;
 
 actions!(
     workspace,
@@ -169,6 +164,28 @@ pub struct Workspace {
     /// resets on relaunch: the app has no settings store, and a view filter
     /// that states its own count in a footer does not need one.
     pub(crate) show_done: bool,
+    /// Whether the rail's tree shows the rows whose work is finished — the
+    /// `awaiting_merge` band. Per-window and resetting on relaunch, exactly
+    /// like [`Self::show_done`], which governs a different set on a different
+    /// surface: `done` in the All Tasks footer against `awaiting_merge` in the
+    /// rail header. The two sets are disjoint by construction. Defaults to
+    /// `true` because the rail has always shown these rows — Clear is
+    /// something the reader does, not a state the app boots into.
+    pub(crate) show_finished: bool,
+    /// Which rows of the All Tasks list are ticked.
+    ///
+    /// The catalog's own selection, and the list's *first*:
+    /// [`Self::selected_task`] is derived from navigation and is `None` for
+    /// the whole time the catalog is on screen, which is why ⇧⌘U / ⇧⌘S / ⇧⌘A
+    /// used to report "select a task first" in exactly the view you would use
+    /// them from. See [`crate::selection`].
+    pub(crate) task_selection: TaskSelection,
+    /// The All Tasks selection bar's Actions menu.
+    ///
+    /// Built once with a weak handle, the same shape as [`Self::rail_overflow`]
+    /// and [`Self::context_popover`], so its counts re-derive from the live
+    /// selection on every open rather than from a snapshot taken here.
+    bulk_actions: Entity<PopoverState>,
     /// Chat composer.
     pub(crate) input: Entity<InputState>,
     /// Review-form composer in the inspector — feedback for a re-scout or a
@@ -293,6 +310,9 @@ impl Workspace {
         cx.observe(&app_state, |this: &mut Self, _, cx| {
             this.sync_menus(cx);
             this.sync_avatar(cx);
+            // An SSE refresh can retire a row out from under a tick. Pruning
+            // cannot live in the render path, which holds `&self`.
+            this.prune_task_selection(cx);
             cx.notify();
         })
         .detach();
@@ -455,6 +475,20 @@ impl Workspace {
         cx.observe(&context_popover, |_, _, cx| cx.notify())
             .detach();
 
+        // Same weak-handle shape again: the menu's counts are folded from the
+        // selection at open time, never from one captured here.
+        let bulk_actions = {
+            let content = cx.entity().downgrade();
+            cx.new(|_cx| {
+                PopoverState::new(
+                    popover("bulk-actions")
+                        .trigger(Self::render_bulk_trigger)
+                        .content(move |window, cx| Self::render_bulk_content(&content, window, cx)),
+                )
+            })
+        };
+        cx.observe(&bulk_actions, |_, _, cx| cx.notify()).detach();
+
         // The palette's query field. ↩ confirms (hence `SubmitOn::Enter`),
         // escape is gpuikit's own blur, and the blur is how the palette learns
         // it was dismissed — but only when the input is still on screen to
@@ -534,6 +568,8 @@ impl Workspace {
             selected_task: None,
             bundle_delete_armed: None,
             show_done: false,
+            show_finished: true,
+            task_selection: TaskSelection::default(),
             input,
             review_input,
             build_input,
@@ -559,6 +595,7 @@ impl Workspace {
             avatar_source: None,
             rail_overflow,
             context_popover,
+            bulk_actions,
             repo_input,
             repo_window: None,
             pending_repo_selection: None,
@@ -639,12 +676,35 @@ impl Workspace {
     pub(crate) fn toggle_show_done(&mut self, cx: &mut Context<Self>) {
         self.show_done = !self.show_done;
         self.sync_menus(cx);
+        // The archive toggle changes what is visible without changing what is
+        // ticked — one of the three places pruning has to run from.
+        self.prune_task_selection(cx);
         cx.notify();
     }
 
-    /// Set the pipeline mode — the title bar's play/pause buttons and the
-    /// Server menu's radio group, on one path.
+    /// Set the pipeline mode — the title bar's play/pause buttons, the Server
+    /// menu's radio group, the palette command and the empty state's CTA, on
+    /// one path.
+    ///
+    /// The before-first-`play` gate is **here** and not at those four call
+    /// sites, so one nobody has written yet inherits it — the same argument
+    /// that put the rationale check in `server::authorize`. `Pause` and `Stop`
+    /// are never gated.
+    ///
+    /// A first `play` **raises the Server window with the sheet up** rather
+    /// than raising a sheet here, and that is a decision rather than an
+    /// omission. The Server window is where the caution, the off switches and
+    /// now the charter already live, so the sheet's own last paragraph —
+    /// "Pause or Stop in this same row, any capability to off in the charter
+    /// below" — is true where it is shown and would be a set of directions to
+    /// somewhere else if it were shown here. The alternative, growing this
+    /// window its first `ModalLayer`, buys a second copy of one sheet whose
+    /// acknowledgement is process-wide anyway.
     pub(crate) fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        if mode == Mode::Play && crate::server::first_play_should_ask(cx) {
+            crate::server_window::open_asking_first_play(cx);
+            return;
+        }
         self.app_state
             .update(cx, |state, cx| state.set_mode(mode, cx));
     }
@@ -955,7 +1015,23 @@ impl Workspace {
                 return;
             }
         }
+        self.dispatch_row_action(action, id, window, cx);
+    }
 
+    /// Run one row verb, legality already established.
+    ///
+    /// Split out of [`Self::perform_row_action`] so the bulk path can reuse
+    /// the dispatch without the single-row report: the check is shared, the
+    /// reporting is not — one aggregate sentence for N rows rather than N
+    /// banners. The split falls exactly there rather than at a second copy of
+    /// this `match`.
+    fn dispatch_row_action(
+        &mut self,
+        action: RowAction,
+        id: TaskId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match action {
             RowAction::Queue => self
                 .app_state
@@ -1049,11 +1125,336 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The catalog's ticks come first when there are any. This is what
+        // fixes the three keystrokes that were dead in All Tasks — by there
+        // being something to find, rather than by a special case for the
+        // view.
+        let ticked = self.selected_task_ids(cx);
+        if !ticked.is_empty() {
+            self.perform_bulk_action(action, ticked, window, cx);
+            return;
+        }
         let Some(id) = self.selected_task.clone() else {
             self.report("select a task first", cx);
             return;
         };
         self.perform_row_action(action, id, window, cx);
+    }
+
+    // --- the All Tasks selection ---
+
+    /// The ticked rows, in the list's order and filtered to what the list is
+    /// showing. Empty whenever the catalog has no selection.
+    pub(crate) fn selected_task_ids(&self, cx: &App) -> Vec<TaskId> {
+        if self.task_selection.is_empty() {
+            return Vec::new();
+        }
+        self.task_selection.ordered(&self.visible_task_ids(cx))
+    }
+
+    /// Drop ticks whose rows have left the list. Runs from the three places
+    /// that change what is visible without changing what is ticked; see
+    /// [`crate::selection::TaskSelection::retain_visible`].
+    fn prune_task_selection(&mut self, cx: &mut Context<Self>) {
+        if self.task_selection.is_empty() {
+            return;
+        }
+        let visible = self.visible_task_ids(cx);
+        self.task_selection.retain_visible(&visible);
+    }
+
+    /// A plain click on a row's tick box.
+    pub(crate) fn toggle_task_tick(&mut self, id: TaskId, cx: &mut Context<Self>) {
+        self.task_selection.toggle(&id);
+        cx.notify();
+    }
+
+    /// A ⇧-click: sweep from the anchor to this row, additively.
+    pub(crate) fn extend_task_tick(&mut self, id: TaskId, cx: &mut Context<Self>) {
+        let visible = self.visible_task_ids(cx);
+        self.task_selection.extend_to(&id, &visible);
+        cx.notify();
+    }
+
+    pub(crate) fn clear_task_selection(&mut self, cx: &mut Context<Self>) {
+        self.task_selection.clear();
+        cx.notify();
+    }
+
+    /// The row contexts behind the ticked rows, in the list's order — what
+    /// [`row_menu::bulk_entries`] folds over.
+    pub(crate) fn selection_contexts(&self, cx: &App) -> Vec<RowContext> {
+        self.selected_task_ids(cx)
+            .iter()
+            .filter_map(|id| self.row_context(id, cx))
+            .collect()
+    }
+
+    /// Run one verb over the ticked rows.
+    ///
+    /// Legality is re-derived here rather than trusted from the menu: the menu
+    /// greyed at open time, and the keyboard path never saw a menu. Every verb
+    /// is a per-task POST — there is no bulk endpoint — so partial legality is
+    /// the normal case, and it is answered by applying the verb to the rows
+    /// that admit it and reporting both counts in the one banner slot.
+    pub(crate) fn perform_bulk_action(
+        &mut self,
+        action: RowAction,
+        ids: Vec<TaskId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.row_menu_open = false;
+        let contexts: Vec<(TaskId, RowContext)> = ids
+            .into_iter()
+            .filter_map(|id| self.row_context(&id, cx).map(|context| (id, context)))
+            .collect();
+        if contexts.is_empty() {
+            self.report("select a task first", cx);
+            return;
+        }
+        let shapes: Vec<RowContext> = contexts.iter().map(|(_, context)| *context).collect();
+        let Some(item) = row_menu::bulk_item(&shapes, action) else {
+            // The bar does not offer this verb — the destructive three, the
+            // review composer and the browser tab. Reached only from a stale
+            // menu; the single-row path is where those live.
+            self.report("that verb runs one row at a time", cx);
+            return;
+        };
+        if item.is_disabled() {
+            self.report(item.menu_label(), cx);
+            return;
+        }
+
+        let eligible: Vec<TaskId> = contexts
+            .iter()
+            .filter(|(_, context)| {
+                row_menu::item(*context, action).is_some_and(|row| row.disabled.is_none())
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        // The clipboard verbs are one act, not N: dispatched per row they
+        // would leave the *last* row's value and silently drop the rest, with
+        // the receipt then claiming all of them.
+        match action {
+            RowAction::CopyNumber | RowAction::CopyUrl => {
+                let state = self.app_state.read(cx);
+                let joined: Vec<String> = eligible
+                    .iter()
+                    .filter_map(|id| {
+                        let task = state.task(id)?;
+                        match action {
+                            RowAction::CopyNumber => Some(format!("#{}", task.gh_issue_number)),
+                            _ => state.github_url(task),
+                        }
+                    })
+                    .collect();
+                if !joined.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(joined.join("\n")));
+                }
+            }
+            _ => {
+                for id in eligible {
+                    self.dispatch_row_action(action, id, window, cx);
+                }
+            }
+        }
+        self.report(item.receipt(), cx);
+        cx.notify();
+    }
+
+    /// Hand the ticked rows to the orchestrator as one message.
+    ///
+    /// It **states** the rows and commands nothing: what to do with them is
+    /// the human's next sentence, in the pane the send reveals. The only
+    /// surface in the app for "do something with these six" without a
+    /// predefined verb — and, having no verb, it has no partial-failure story.
+    pub(crate) fn send_selection_to_orchestrator(&mut self, cx: &mut Context<Self>) {
+        let rows: Vec<String> = {
+            let ids = self.selected_task_ids(cx);
+            let state = self.app_state.read(cx);
+            ids.iter()
+                .filter_map(|id| state.task(id))
+                .map(|task| format!("- #{} {}", task.gh_issue_number, task.title))
+                .collect()
+        };
+        if rows.is_empty() {
+            self.report("select a task first", cx);
+            return;
+        }
+        let message = format!(
+            "I have {} task{} selected in All Tasks:\n\n{}",
+            rows.len(),
+            if rows.len() == 1 { "" } else { "s" },
+            rows.join("\n")
+        );
+        self.ask_orchestrator(message, cx);
+    }
+
+    fn close_bulk_actions(&mut self, cx: &mut Context<Self>) {
+        self.bulk_actions.update(cx, |popover, cx| {
+            popover.close(cx);
+        });
+    }
+
+    /// The selection bar's Actions button.
+    fn render_bulk_trigger(_window: &mut Window, cx: &mut App) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.))
+            .px(px(8.))
+            .py(px(3.))
+            .rounded(px(5.))
+            .bg(theme.surface_tertiary())
+            .text_xs()
+            .text_color(theme.fg())
+            .cursor_pointer()
+            .child("Actions")
+            .child(
+                Icons::chevron_down()
+                    .size(px(10.))
+                    .text_color(theme.fg_muted()),
+            )
+            .into_any_element()
+    }
+
+    /// The Actions menu's rows, folded from the live selection at open time.
+    fn render_bulk_content(
+        workspace: &WeakEntity<Self>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let Some(entity) = workspace.upgrade() else {
+            return div().into_any_element();
+        };
+        let items = entity.read(cx).selection_contexts(cx);
+        let items = row_menu::bulk_entries(&items);
+
+        items
+            .into_iter()
+            .fold(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.))
+                    .p(px(4.))
+                    .min_w(px(220.)),
+                |list, item| {
+                    let disabled = item.is_disabled();
+                    let action = item.action;
+                    let workspace = workspace.clone();
+                    list.child(
+                        div()
+                            .id(item.id)
+                            .px(px(10.))
+                            .py(px(5.))
+                            .rounded(px(4.))
+                            .text_sm()
+                            .text_color(if disabled {
+                                theme.fg_muted()
+                            } else {
+                                theme.fg()
+                            })
+                            .when(!disabled, |el| {
+                                let hover_bg = theme.surface_secondary();
+                                el.cursor_pointer()
+                                    .hover(move |el| el.bg(hover_bg))
+                                    .on_click(move |_event, window, cx| {
+                                        workspace
+                                            .update(cx, |this, cx| {
+                                                this.close_bulk_actions(cx);
+                                                let ids = this.selected_task_ids(cx);
+                                                this.perform_bulk_action(action, ids, window, cx);
+                                            })
+                                            .ok();
+                                    })
+                            })
+                            .child(item.menu_label()),
+                    )
+                },
+            )
+            .into_any_element()
+    }
+
+    /// The bar itself, floating over the bottom of the catalog. Absolutely
+    /// positioned, which is why the list column carries `.relative()`.
+    pub(crate) fn render_selection_bar(
+        &self,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let hover_bg = theme.surface_tertiary();
+        div()
+            .absolute()
+            .bottom(px(12.))
+            .left_0()
+            .right_0()
+            .flex()
+            .flex_row()
+            .justify_center()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(12.))
+                    .py(px(6.))
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(theme.border_subtle())
+                    .bg(theme.surface_secondary())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.fg())
+                            .child(format!(
+                                "{count} task{} selected",
+                                if count == 1 { "" } else { "s" }
+                            )),
+                    )
+                    .child(self.bulk_actions.clone())
+                    .child(
+                        div()
+                            .id("selection-ask-orchestrator")
+                            .px(px(8.))
+                            .py(px(3.))
+                            .rounded(px(5.))
+                            .text_xs()
+                            .text_color(theme.fg())
+                            .cursor_pointer()
+                            .tooltip(tooltip(
+                                "Send these rows to the orchestrator — it states them and commands nothing",
+                            ))
+                            .hover(move |el| el.bg(hover_bg))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.send_selection_to_orchestrator(cx);
+                            }))
+                            .child("Ask Orchestrator"),
+                    )
+                    .child(
+                        div()
+                            .id("selection-clear")
+                            .px(px(8.))
+                            .py(px(3.))
+                            .rounded(px(5.))
+                            .text_xs()
+                            .text_color(theme.fg_muted())
+                            .cursor_pointer()
+                            .tooltip(tooltip("Clear the selection (escape)"))
+                            .hover(move |el| el.bg(hover_bg))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.clear_task_selection(cx);
+                            }))
+                            .child("Clear"),
+                    ),
+            )
     }
 
     /// Say something in the sidebar banner. Same slot the server's own errors
@@ -1204,6 +1605,9 @@ impl Workspace {
         if stale {
             self.clear_selection(window, cx);
         }
+        // The third place the visible set moves without the ticks moving. The
+        // single-selection version of this rule was already here above.
+        self.prune_task_selection(cx);
         cx.notify();
     }
 
@@ -1522,10 +1926,14 @@ impl Workspace {
             )
     }
 
-    /// The chip at the chat's top-right, per the design: the mic (voice mode
-    /// with the orchestrator, later — shipped disabled so the slot exists),
-    /// a divider, and the signed-in human's avatar, which opens their GitHub
-    /// profile.
+    /// The chip at the chat's top-right: the signed-in human's avatar, which
+    /// opens their GitHub profile.
+    ///
+    /// It used to carry a permanently-disabled microphone beside it — the one
+    /// control in the app that shipped disabled, promising a feature that does
+    /// not exist. It is gone, along with the only hardcoded gruvbox colour in
+    /// the tree (the SVG's stroke, defended by a comment that evaporated with
+    /// the control). Nothing here now promises anything the app cannot do.
     ///
     /// Who that is comes from `GET /viewer` — the server's own credential —
     /// and is **inert in every state but the one with a real identity behind
@@ -1534,10 +1942,6 @@ impl Workspace {
     fn render_chat_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let identity = crate::identity::chip_identity(self.app_state.read(cx).viewer.as_ref());
-        let mic = std::sync::Arc::new(gpui::Image::from_bytes(
-            gpui::ImageFormat::Svg,
-            MIC_SVG.to_vec(),
-        ));
 
         let avatar: gpui::AnyElement = match self.avatar.clone() {
             Some(image) => gpui::img(image)
@@ -1557,28 +1961,20 @@ impl Workspace {
             .absolute()
             .top_0()
             .right_0()
+            // Floats over the conversation, so a press here must not anchor a
+            // selection in the markdown underneath. See `components/press.rs`.
+            .swallow_press()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(8.))
-            .pl(px(10.))
-            .pr(px(8.))
+            // Symmetric now there is one child: the asymmetry existed to sit
+            // the mic off the rounded corner, and with the mic gone it read as
+            // an off-centre avatar.
+            .px(px(8.))
             .py(px(5.))
             .rounded_bl(px(14.))
             .bg(theme.surface_secondary())
-            .child(
-                div()
-                    .id("voice-mode")
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .size(px(20.))
-                    .opacity(0.45)
-                    .cursor_not_allowed()
-                    .tooltip(tooltip("Voice mode — coming soon"))
-                    .child(gpui::img(mic).size(px(15.))),
-            )
-            .child(div().w(px(1.)).h(px(14.)).bg(theme.border_secondary()))
             .child(
                 div()
                     .id("github-profile")
@@ -1831,7 +2227,12 @@ impl Workspace {
                 .text_xs()
                 .text_color(theme.fg_muted())
                 .child(div().flex_none().child("●").opacity(0.5))
-                .child(div().flex_1().child(content.clone()))
+                // Wraps rather than overflowing — see the headline row in
+                // `sections/detail.rs` for why a `flex_1` text child in a
+                // `flex_row` needs this. Server-written `[worker <job>]` /
+                // `[pipeline]` / `[agent <name>]` turns are long by
+                // construction.
+                .child(div().flex_1().min_w(px(0.)).child(content.clone()))
                 .into_any_element(),
             // A session seam. The conversation reads as continuous here but
             // the orchestrator's memory does not, so it renders as a divider
@@ -1856,6 +2257,15 @@ impl Workspace {
                 .absolute()
                 .top(px(-6.))
                 .right(px(4.))
+                // The reported bug: without this, copying a message also
+                // anchors a text selection in the reply underneath. On the
+                // container rather than the button, and on the press rather
+                // than the click — see `components/press.rs` for both.
+                //
+                // The row is pinned at `top(-6.)`, so a ~6px sliver of it hangs
+                // over the message above and a press there is swallowed too.
+                // Pre-existing geometry, noted so it is not rediscovered.
+                .swallow_press()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -2008,18 +2418,28 @@ impl Workspace {
                             .child(messages.size_full().py(px(8.)))
                             .when(show_jump_to_newest, |el| {
                                 el.child(
-                                    div().absolute().bottom(px(10.)).right(px(16.)).child(
-                                        icon_button("jump-to-newest", Icons::pin_bottom())
-                                            .width(px(28.))
-                                            .height(px(28.))
-                                            .icon_size(px(14.))
-                                            .tooltip(tooltip("Jump to newest"))
-                                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                                this.chat_list.scroll_to_end();
-                                                this.chat_list.set_follow_mode(FollowMode::Tail);
-                                                cx.notify();
-                                            })),
-                                    ),
+                                    div()
+                                        .absolute()
+                                        .bottom(px(10.))
+                                        .right(px(16.))
+                                        // Floats over the last message — see
+                                        // `components/press.rs`.
+                                        .swallow_press()
+                                        .child(
+                                            icon_button("jump-to-newest", Icons::pin_bottom())
+                                                .width(px(28.))
+                                                .height(px(28.))
+                                                .icon_size(px(14.))
+                                                .tooltip(tooltip("Jump to newest"))
+                                                .on_click(cx.listener(
+                                                    |this, _event, _window, cx| {
+                                                        this.chat_list.scroll_to_end();
+                                                        this.chat_list
+                                                            .set_follow_mode(FollowMode::Tail);
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        ),
                                 )
                             }),
                     )
@@ -2690,7 +3110,10 @@ impl Workspace {
                     .text_xs()
                     .text_color(theme.fg_muted())
                     .child(div().flex_none().child("●").opacity(0.5))
-                    .child(div().flex_1().child(text))
+                    // Wraps rather than overflowing — see the headline row in
+                    // `sections/detail.rs`. Feed notes carry long server-written
+                    // text (the target-directory reclaim line, the hold reasons).
+                    .child(div().flex_1().min_w(px(0.)).child(text))
                     .into_any_element(),
             )
             .into_any_element(),
@@ -2732,7 +3155,11 @@ impl Workspace {
     /// situation needs something queued.
     pub(crate) fn pipeline(&self, cx: &App) -> empty_state::Pipeline {
         let reachability = self.reachability(cx);
-        let holds = empty_state::observe(self.server_control.read(cx).status.as_ref());
+        let control = self.server_control.read(cx);
+        let holds = empty_state::observe(control.status.as_ref());
+        // Read off the same probe as the holds, so the two cannot disagree
+        // about how fresh they are.
+        let credentials = control.secrets.clone();
         let state = self.app_state.read(cx);
         empty_state::Pipeline::count(
             reachability,
@@ -2742,6 +3169,7 @@ impl Workspace {
             &self.project_filter,
             state.mode,
             holds,
+            credentials.as_ref(),
         )
     }
 
@@ -2874,6 +3302,13 @@ impl Workspace {
             EmptyStateAction::AddRepo => self.open_repo_window(cx),
             EmptyStateAction::OpenAllTasks => self.navigate(MiddleView::AllTasks, cx),
             EmptyStateAction::Play => self.set_mode(Mode::Play, cx),
+            // The Server window is where the Credentials rows live today —
+            // one path, the same discipline as the two above: a button in an
+            // empty pane goes through an action the menus already dispatch
+            // rather than opening a surface of its own.
+            EmptyStateAction::ConfigureKeys => {
+                window.dispatch_action(Box::new(menus::ShowServerStatus), cx)
+            }
         }
     }
 
@@ -3102,6 +3537,13 @@ impl Render for Workspace {
                 if this.row_menu_open {
                     this.row_menu_open = false;
                     cx.propagate();
+                    return;
+                }
+                // The catalog's ticks go first, and the middle column's
+                // dismissal is the second press: escape unwinds one thing at
+                // a time.
+                if !this.task_selection.is_empty() {
+                    this.clear_task_selection(cx);
                     return;
                 }
                 // Selection only — escape must not take the chat pane away;

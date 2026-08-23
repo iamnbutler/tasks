@@ -31,11 +31,12 @@ use tasks_api::http::DecisionReconciliation;
 use tasks_api::http::{
     AbandonPullRequest, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelAllResponse,
     CancelRunRequest, CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject,
-    DeviceFlowStatus, EditIssueRequest, EnrollAgentRequest, EnrollAgentResponse, ErrorResponse,
-    GitHubHold, LabelInfo, MergePullRequest, ModeResponse, RejectedBundle, ReopenTaskRequest,
-    ReorderQueue, ReorderSpecQueue, RetargetPullRequest, ReviewCommentRequest, ReviewRequest,
-    RevokeAgentRequest, ScoutRequest, SendMessage, ServerStatus, SetCharter, SetLabelsRequest,
-    SetMode, SetProjectStatus, SettleDecisionRequest, ShadowAck, Viewer,
+    DeviceFlowStatus, DispatchWorkerRequest, EditIssueRequest, EnrollAgentRequest,
+    EnrollAgentResponse, ErrorResponse, GitHubHold, LabelInfo, MergePullRequest, ModeResponse,
+    RejectedBundle, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, RetargetPullRequest,
+    ReviewCommentRequest, ReviewRequest, RevokeAgentRequest, ScoutRequest, SendMessage,
+    ServerStatus, SetCharter, SetLabelsRequest, SetMode, SetProjectStatus, SettleDecisionRequest,
+    ShadowAck, Viewer,
 };
 
 use crate::bundles::RejectedBundles;
@@ -47,7 +48,7 @@ use crate::models::{
     CloseReason, Complexity, Decision, DecisionAction, DecisionInput, DecisionState, Directions,
     GhState, Mode, OrchestratorMessage, OrchestratorSessionInfo, Project, ProjectId, ProjectStatus,
     RunKind, ScoutNotes, Session, SessionId, SessionStatus, Spec, SpecId, SpecQueueItem,
-    SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner,
+    SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner, Worker, WorkerId,
 };
 use crate::store::{
     ACTOR_HEADER, AGENT_HEADER, ActorClaim, MESSAGE_PAGE_DEFAULT, MESSAGE_PAGE_MAX, Store,
@@ -194,6 +195,10 @@ pub struct Services {
     /// reached it (#1027).
     pub trunk: Trunk,
     pub bundles: Option<Arc<RejectedBundles>>,
+    /// The custody service behind `/secrets`. Absent means this router cannot
+    /// reach a sealed store, which is a 503 and never an empty answer — the
+    /// `bundles` shape, for the `bundles` reason.
+    pub secrets: Option<Arc<crate::secrets::Custody>>,
     /// The record the poller writes and the two dispatchers read. Absent means
     /// this router has no dispatchers behind it, which `GET /status` reports as
     /// no hold — honest, because a router with nothing to dispatch is not
@@ -226,6 +231,15 @@ pub struct Services {
     /// builds there — reported as no reading, which is the honest answer and
     /// not a zero.
     pub verify_dir: Option<Arc<crate::verify_dir::VerifyDir>>,
+    /// The live handle on the orchestrator turn in flight (#1064). Absent on
+    /// the health-record terms: this router has no orchestrator loop behind
+    /// it.
+    ///
+    /// Absent is reported as "no turn in flight" and **not** as a 503 — the
+    /// caller's question is whether the lane is quiet, and it is. It is also
+    /// what keeps every router-only test working untouched, since
+    /// [`router`] builds a `Services::default()`.
+    pub turn_control: Option<Arc<crate::orchestrator::TurnControl>>,
     /// Who the server's own GitHub credential is, remembered for a while.
     ///
     /// **The only non-`Option` field here**, and deliberately: every other
@@ -264,6 +278,12 @@ impl FromRef<AppState> for Trunk {
 impl FromRef<AppState> for Option<Arc<RejectedBundles>> {
     fn from_ref(state: &AppState) -> Self {
         state.services.bundles.clone()
+    }
+}
+
+impl FromRef<AppState> for Option<Arc<crate::secrets::Custody>> {
+    fn from_ref(state: &AppState) -> Self {
+        state.services.secrets.clone()
     }
 }
 
@@ -355,6 +375,8 @@ fn routes(store: Arc<Store>, services: Services) -> Router {
         .route("/tasks/{task_id}/dequeue", post(dequeue_task))
         .route("/tasks/{task_id}/scout", post(scout_task_now))
         .route("/tasks/{task_id}/build-now", post(build_task_now))
+        .route("/secrets", get(secrets_status))
+        .route("/secrets/{name}", post(set_secret).delete(delete_secret))
         .route("/tasks/{task_id}/close", post(close_task))
         .route("/tasks/{task_id}/reopen", post(reopen_task))
         .route("/issues", post(capture_issue))
@@ -405,6 +427,17 @@ fn routes(store: Arc<Store>, services: Services) -> Router {
             "/builds/{build_id}/transcript/stream",
             get(stream_build_transcript),
         )
+        .route("/workers", get(list_workers).post(dispatch_worker))
+        .route("/workers/{worker_id}", get(get_worker))
+        .route("/workers/{worker_id}/cancel", post(cancel_worker))
+        .route(
+            "/workers/{worker_id}/transcript",
+            get(list_worker_transcript),
+        )
+        .route(
+            "/workers/{worker_id}/transcript/stream",
+            get(stream_worker_transcript),
+        )
         .route(
             "/orchestrator/messages",
             get(list_orchestrator_messages).post(send_orchestrator_message),
@@ -421,6 +454,12 @@ fn routes(store: Arc<Store>, services: Services) -> Router {
             "/orchestrator/session/release",
             post(release_orchestrator_session),
         )
+        // The two live controls the orchestrator's turn is the only run in the
+        // system to have lacked (#1064). Inside this private `fn routes`, so
+        // the loopback layer covers them by construction.
+        .route("/orchestrator/interrupt", post(interrupt_orchestrator_turn))
+        .route("/orchestrator/hold", post(hold_orchestrator_lane))
+        .route("/orchestrator/release", post(release_orchestrator_lane))
         .route("/viewer", get(get_viewer))
         .route(
             "/auth/github/device",
@@ -2323,6 +2362,12 @@ async fn cancel_run(
             .cancel_queued_build(&BuildId::from_raw(id.to_string()), &request.exit_reason())
             .await?;
     }
+    // A queued worker is the same case one lane over.
+    if kind == RunKind::Worker {
+        store
+            .cancel_queued_worker(&WorkerId::from_raw(id.to_string()), &request.exit_reason())
+            .await?;
+    }
 
     let deadline = tokio::time::Instant::now() + CANCEL_SETTLE;
     let (concluded, status) = settle(store, kind, id, deadline).await?;
@@ -2519,6 +2564,16 @@ async fn settle(
                 (
                     build.status.is_terminal(),
                     build.status.as_str().to_string(),
+                )
+            }
+            RunKind::Worker => {
+                let worker = store
+                    .worker(&WorkerId::from_raw(id.to_string()))
+                    .await?
+                    .ok_or_else(|| ApiError::NotFound(format!("worker {id}")))?;
+                (
+                    worker.status.is_terminal(),
+                    worker.status.as_str().to_string(),
                 )
             }
         };
@@ -2982,7 +3037,8 @@ async fn look_up_artifact(
         | DecisionAction::CancelRun
         | DecisionAction::SettleDecision
         | DecisionAction::EnrollAgent
-        | DecisionAction::RevokeAgent => (
+        | DecisionAction::RevokeAgent
+        | DecisionAction::DispatchWorker => (
             "unknown",
             serde_json::Value::Null,
             "this action never reaches another system, so it has no artifact to find —              a pending row here is a bug, not a window"
@@ -3640,6 +3696,119 @@ async fn revoke_agent(
     Ok(Json(enrollment).into_response())
 }
 
+// --- workers (#1053) ---
+
+/// `POST /workers` — dispatch a worker run onto the host worker lane.
+///
+/// 202: the row is queued; the worker lane claims it in order and the result
+/// comes back as a `[worker <job>]` event turn in the conversation — there is
+/// nothing to poll for here, which is the point: the dispatcher's next move
+/// is to end its turn.
+///
+/// The ledger row is written after the row rather than inside it, the
+/// `enroll_agent` shape: dispatching is trivially reversible (cancel), so the
+/// row is audit, not authorization, and it is store-only — `applied` by
+/// construction, since nothing here reaches another system. What `authorize`
+/// puts ahead of the dispatch is the part that must refuse first: the charter
+/// level and the rationale.
+async fn dispatch_worker(
+    State(store): State<Arc<Store>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<DispatchWorkerRequest>,
+) -> ApiResult<Response> {
+    let actor = actor_of(&store, &headers)?;
+    let decision = DecisionInput {
+        actor,
+        rationale: body.rationale,
+        evidence: body.evidence,
+    };
+    let authority = authorize(
+        &store,
+        &decision,
+        Capability::DispatchWorkers,
+        DecisionAction::DispatchWorker,
+    )
+    .await?;
+    if authority == Authority::Shadow {
+        let seq = store
+            .record_decision(
+                "worker",
+                body.job.trim(),
+                DecisionAction::DispatchWorker,
+                decision,
+                false,
+            )
+            .await?;
+        return Ok(shadowed(seq, "no worker was dispatched"));
+    }
+    let worker = store.create_worker(&body.job, &body.prompt).await?;
+    if actor == Actor::Orchestrator {
+        store
+            .record_decision(
+                "worker",
+                worker.id.as_str(),
+                DecisionAction::DispatchWorker,
+                decision,
+                true,
+            )
+            .await?;
+    }
+    store
+        .append_event(EventPayload::Note {
+            source: WORKER_SOURCE.into(),
+            message: format!(
+                "worker {} (\"{}\") dispatched by {}",
+                worker.id,
+                worker.job,
+                actor.as_str()
+            ),
+        })
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(worker)).into_response())
+}
+
+/// `source` on the worker lane's event-feed breadcrumbs.
+const WORKER_SOURCE: &str = "worker";
+
+/// Workers, newest first — the lane's queue and its history.
+async fn list_workers(State(store): State<Arc<Store>>) -> ApiResult<Json<Vec<Worker>>> {
+    Ok(Json(store.list_workers(100).await?))
+}
+
+async fn get_worker(
+    State(store): State<Arc<Store>>,
+    Path(worker_id): Path<String>,
+) -> ApiResult<Json<Worker>> {
+    let id = WorkerId::from_raw(worker_id);
+    store
+        .worker(&id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::NotFound(format!("worker {id}")))
+}
+
+/// `POST /workers/{worker_id}/cancel` — stop a worker that is queued or
+/// running, under `cancel_runs` like every other run.
+async fn cancel_worker(
+    State(store): State<Arc<Store>>,
+    Path(worker_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<CancelRunRequest>>,
+) -> ApiResult<Response> {
+    let id = WorkerId::from_raw(worker_id);
+    let worker = store
+        .worker(&id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("worker {id}")))?;
+    if worker.status.is_terminal() {
+        return Err(ApiError::Conflict(format!(
+            "worker {id} is {} — it has already concluded",
+            worker.status.as_str()
+        )));
+    }
+    cancel_run(&store, &headers, RunKind::Worker, id.as_str(), body).await
+}
+
 /// The conversation, always bounded.
 ///
 /// `?since=` catches a client up, `?before=` pages backwards, and neither
@@ -3699,6 +3868,161 @@ async fn release_orchestrator_session(
 ) -> ApiResult<Json<OrchestratorSessionInfo>> {
     store.orchestrator_release().await?;
     Ok(Json(store.orchestrator_session_info().await?))
+}
+
+/// The 403 the three lane controls answer any actor but the human with.
+///
+/// **Human-only and not charter-gated**, on the `build-now` precedent: these
+/// decide whether the judge convenes at all, rather than doing a unit of work
+/// inside the pipeline. There is no charter row that could be set to `off`
+/// here, and if lane control is ever wanted as autonomy it wants its own named
+/// capability and its own issue — an orchestrator that can stop and restart
+/// its own turns is a different thing from one that can act within them.
+///
+/// Called **first**, before the service lookup and the body, so a refusal is a
+/// no-op by construction rather than by reading down the function.
+async fn require_human_for_lane(store: &Store, headers: &axum::http::HeaderMap) -> ApiResult<()> {
+    if actor_of(store, headers)? != Actor::Human {
+        return Err(ApiError::Forbidden(
+            "the orchestrator's turn lane is the human's alone: interrupting a turn and \
+             holding the lane decide whether the orchestrator convenes at all, which no \
+             charter capability covers."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `POST /orchestrator/interrupt` — end the turn in flight.
+///
+/// A request that finds nothing running is a **200 saying so**, not a 4xx: the
+/// caller's question is whether the lane is quiet, and it is. Nothing is
+/// stored either, which is what makes "a request cannot leak forward into a
+/// turn nobody asked to stop" structural rather than careful.
+///
+/// The session survives — this kills one invocation, not the conversation —
+/// and no input is lost, because the watermark moves only in
+/// `append_orchestrator_reply` and the interrupted path never reaches it. So
+/// an interrupt **alone** re-answers the same input on the next tick. That is
+/// correct, and it is *why* quieting the lane is two acts; the detail below
+/// and the returned lane both say so.
+async fn interrupt_orchestrator_turn(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<tasks_api::http::LaneControlRequest>>,
+) -> ApiResult<Json<tasks_api::http::InterruptResponse>> {
+    require_human_for_lane(&state.store, &headers).await?;
+    let rationale = body.and_then(|Json(body)| body.rationale);
+    let interrupted = match &state.services.turn_control {
+        Some(control) => control.interrupt(crate::orchestrator::Interruption {
+            actor: "the human".into(),
+            rationale,
+        }),
+        // Not a 503: a router with no orchestrator loop behind it has no turn
+        // in flight, which is exactly what the caller asked.
+        None => false,
+    };
+    let lane = state.store.orchestrator_lane().await?;
+    let detail = if interrupted {
+        let tail = if lane.held {
+            "The lane is held, so no new turn will start."
+        } else {
+            "The input it was answering is unchanged, so the next tick takes it up again — \
+             POST /orchestrator/hold to stop turns starting."
+        };
+        format!("The turn was interrupted; its Claude Code session is intact. {tail}")
+    } else {
+        "There was no turn in flight, so nothing was interrupted — and nothing was recorded, \
+         so this cannot stop a later turn."
+            .to_string()
+    };
+    Ok(Json(tasks_api::http::InterruptResponse {
+        interrupted,
+        detail,
+        lane,
+    }))
+}
+
+/// `POST /orchestrator/hold` — stop new turns starting.
+///
+/// Durable (a column on the singleton row) and idempotent, and re-holding does
+/// **not** move "held since" — that is when the lane went quiet, not when
+/// somebody last said so. It leaves a turn already in flight alone: that is
+/// `interrupt`'s job, and the two being separate acts is the design rather
+/// than an omission.
+///
+/// The Note is written on the **edge only**, the `POST /mode` shape, with the
+/// rationale appended to a statement of what happened — one event rather than
+/// a bare rationale, which would be unreadable a week later.
+async fn hold_orchestrator_lane(
+    State(store): State<Arc<Store>>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<tasks_api::http::LaneControlRequest>>,
+) -> ApiResult<Json<tasks_api::http::LaneResponse>> {
+    require_human_for_lane(&store, &headers).await?;
+    let rationale = body.and_then(|Json(body)| body.rationale);
+    let was_held = store.orchestrator_lane().await?.held;
+    store.orchestrator_hold().await?;
+    if !was_held {
+        store
+            .append_event(lane_note(
+                "The orchestrator's turn lane is held: no new turn will start until it is \
+                 released.",
+                rationale.as_deref(),
+            ))
+            .await?;
+    }
+    let lane = store.orchestrator_lane().await?;
+    Ok(Json(tasks_api::http::LaneResponse {
+        detail: "The turn lane is held. A turn already in flight is unaffected — \
+                 POST /orchestrator/interrupt ends that one."
+            .into(),
+        lane,
+    }))
+}
+
+/// `POST /orchestrator/release` — let turns start again. Unconditional and
+/// idempotent: releasing a lane nobody held is a no-op, which is the only
+/// honest answer to "make sure turns can start".
+async fn release_orchestrator_lane(
+    State(store): State<Arc<Store>>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<tasks_api::http::LaneControlRequest>>,
+) -> ApiResult<Json<tasks_api::http::LaneResponse>> {
+    require_human_for_lane(&store, &headers).await?;
+    let rationale = body.and_then(|Json(body)| body.rationale);
+    let was_held = store.orchestrator_lane().await?.held;
+    store.orchestrator_release_hold().await?;
+    if was_held {
+        store
+            .append_event(lane_note(
+                "The orchestrator's turn lane is released: turns start again on the next tick.",
+                rationale.as_deref(),
+            ))
+            .await?;
+    }
+    let lane = store.orchestrator_lane().await?;
+    let detail = if lane.checked_out {
+        "The hold is released, but the session is still checked out interactively, so no \
+         turn starts yet."
+            .to_string()
+    } else {
+        "The turn lane is open; the next tick answers whatever is waiting.".to_string()
+    };
+    Ok(Json(tasks_api::http::LaneResponse { detail, lane }))
+}
+
+/// One event, statement first and rationale appended — never a bare rationale,
+/// which is unreadable a week later.
+fn lane_note(statement: &str, rationale: Option<&str>) -> EventPayload {
+    let message = match rationale.map(str::trim) {
+        Some(reason) if !reason.is_empty() => format!("{statement} {reason}"),
+        _ => statement.to_string(),
+    };
+    EventPayload::Note {
+        source: crate::orchestrator::NOTE_SOURCE.into(),
+        message,
+    }
 }
 
 /// SSE feed of the in-flight orchestrator tick: `delta` chunks as the reply
@@ -3846,6 +4170,9 @@ async fn get_status(
         Some(watch) => watch.pending(&store).await,
         None => None,
     };
+    // One read behind this and the tick's own gate, so a reader is never
+    // told the lane is open while the loop is declining to start a turn.
+    let lane = store.orchestrator_lane().await?;
     Ok(Json(ServerStatus {
         pid: std::process::id(),
         started_at: serving_since(),
@@ -3874,8 +4201,16 @@ async fn get_status(
         // few seconds anyway — the staleness window is what keeps this honest
         // if they stop.
         pool: pool_health
+            .as_ref()
             .and_then(|health| health.hold(Utc::now()))
             .map(|run| run.to_hold()),
+        // Not a hold — the connection is the gate already — but the fact a
+        // reader needs when *nothing* is dispatching and the capacity record
+        // is silent because it could not be asked (#991). Written from the
+        // dispatch loops' own connects; nothing is probed here.
+        pool_unreachable: pool_health
+            .and_then(|health| health.unreachable(Utc::now()))
+            .map(|run| run.to_wire()),
         // The fourth, on the same terms — and *especially* not probed here: a
         // broker probe is a TCP round trip to the bridge gateway, so a status
         // request that made one would let any caller drive traffic at that
@@ -3896,6 +4231,12 @@ async fn get_status(
         // thousands of files and happens on the orchestrator loop's cadence;
         // `measured_at` is what keeps that honest.
         verify_dir: verify_dir.and_then(|dir| dir.usage()),
+        // **Only when the lane is not open** — the hold shape and not the
+        // `verify_dir` shape one line up: a held lane is an exception a reader
+        // must not miss, and a standing "lane open" row is one a reader learns
+        // to skip.
+        orchestrator_lane: Some(lane)
+            .filter(|lane: &tasks_api::models::OrchestratorLane| !lane.may_tick()),
     }))
 }
 
@@ -4003,6 +4344,35 @@ async fn session_owner(store: &Store, raw: String) -> ApiResult<TranscriptOwner>
         return Err(ApiError::NotFound(format!("session {session_id}")));
     }
     Ok(TranscriptOwner::Session { session_id })
+}
+
+/// Catch-up read of a worker's streamed output, on the same contract as the
+/// scout and build reads — it is what a dead worker's report turn points at.
+async fn list_worker_transcript(
+    State(store): State<Arc<Store>>,
+    Path(worker_id): Path<String>,
+    Query(query): Query<TranscriptQuery>,
+) -> ApiResult<Json<Vec<TranscriptLine>>> {
+    let owner = worker_owner(&store, worker_id).await?;
+    list_owner_transcript(&store, &owner, query).await
+}
+
+/// SSE tail of a worker's transcript, on the same contract.
+async fn stream_worker_transcript(
+    State(store): State<Arc<Store>>,
+    Path(worker_id): Path<String>,
+    Query(query): Query<TranscriptQuery>,
+) -> ApiResult<Sse<impl Stream<Item = Result<SseEvent, Infallible>> + use<>>> {
+    let owner = worker_owner(&store, worker_id).await?;
+    stream_owner_transcript(&store, owner, query).await
+}
+
+async fn worker_owner(store: &Store, raw: String) -> ApiResult<TranscriptOwner> {
+    let worker_id = WorkerId::from_raw(raw);
+    if store.worker(&worker_id).await?.is_none() {
+        return Err(ApiError::NotFound(format!("worker {worker_id}")));
+    }
+    Ok(TranscriptOwner::Worker { worker_id })
 }
 
 async fn build_owner(store: &Store, raw: String) -> ApiResult<TranscriptOwner> {
@@ -4146,6 +4516,176 @@ async fn stream_events(
         }
     });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+}
+
+// --- custody (`/secrets`) ---
+
+/// The 403 all three custody routes answer with, and they call it **first** —
+/// before the service lookup, the name parse and the body. So a refused caller
+/// learns nothing about how the host is configured, and "nothing was written"
+/// holds structurally rather than by reading down the function.
+///
+/// Human-only on the `build-now` precedent, and not charter-gated: the charter
+/// governs units of work *inside* the pipeline, and these change what the
+/// pipeline **authenticates as**. The `GET` is refused too — it carries no
+/// value, so this is not a leak being closed, it is the surface not being
+/// advertised: it names the key source and the store path, which is a map of
+/// what an agent would have to reach to take custody.
+///
+/// What actually enforces this is the **worker allowlist**, not the check
+/// alone: a worker is a local child with no `X-Tasks-Actor`, so it is
+/// attributed as the human and is never gated. `DEFAULT_WORKER_CMD` carrying
+/// no `Bash(curl:*)` is the whole of what stands between the orchestrator and
+/// this route.
+async fn require_human_for_custody(
+    store: &Store,
+    headers: &axum::http::HeaderMap,
+) -> ApiResult<()> {
+    if actor_of(store, headers)? != Actor::Human {
+        return Err(ApiError::Forbidden(
+            "custody of the upstream credentials is the human's alone: these routes change \
+             what the pipeline authenticates as, which no charter capability covers. Ask the \
+             human to paste it, or run `tasks secrets set <name>` at a terminal."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The custody service, or a 503 that says what is missing — the `bundle_service`
+/// shape, and for its reason: a server that cannot reach a sealed store has
+/// not looked in it.
+fn custody_service(
+    secrets: &Option<Arc<crate::secrets::Custody>>,
+) -> ApiResult<&Arc<crate::secrets::Custody>> {
+    secrets.as_ref().ok_or_else(|| {
+        ApiError::Unavailable(
+            "this server has no custody service configured, so it cannot say what is sealed \
+             — which is not the same as nothing being sealed"
+                .into(),
+        )
+    })
+}
+
+/// A 400 naming the closed set, rather than `Path<SecretName>`, whose axum
+/// rejection is a serde message about an enum.
+fn parse_secret_name(raw: &str) -> ApiResult<crate::secrets::SecretName> {
+    crate::secrets::SecretName::parse(raw).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "unknown secret `{raw}`; this system holds exactly: {}",
+            crate::secrets::SecretName::names()
+        ))
+    })
+}
+
+/// `Key` is a **503** and everything else a 500: no unseal key, a locked
+/// keychain or no Keychain on this platform is not something going wrong, it
+/// is a capability that is not configured — and the message says so, because
+/// 503 conventionally means "try again shortly" and this one means "configure
+/// a key source".
+fn custody_error(err: crate::secrets::SecretsError) -> ApiError {
+    match err {
+        crate::secrets::SecretsError::Key(detail) => ApiError::Unavailable(format!(
+            "no usable unseal key: {detail}. This will not clear on its own — set \
+             TASKS_SECRETS_KEY_FILE, or run `tasks secrets init` at a terminal"
+        )),
+        other => ApiError::Internal(other.to_string()),
+    }
+}
+
+/// `GET /secrets` — names, `set_at`, the key-source line, and per name what is
+/// *currently* serving it. Never a value, and deliberately no read-one route.
+async fn secrets_status(
+    State(store): State<Arc<Store>>,
+    State(secrets): State<Option<Arc<crate::secrets::Custody>>>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Json<tasks_api::http::SecretsStatus>> {
+    require_human_for_custody(&store, &headers).await?;
+    let custody = custody_service(&secrets)?;
+    custody.status().map(Json).map_err(custody_error)
+}
+
+/// `POST /secrets/{name}` — write-only. 204 ordinarily, 201 when this call
+/// created the store, 200 when the write landed and this process cannot read
+/// it back until a restart.
+async fn set_secret(
+    State(store): State<Arc<Store>>,
+    State(secrets): State<Option<Arc<crate::secrets::Custody>>>,
+    Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<tasks_api::http::SetSecret>,
+) -> ApiResult<Response> {
+    require_human_for_custody(&store, &headers).await?;
+    let custody = custody_service(&secrets)?;
+    let name = parse_secret_name(&name)?;
+
+    // Wrapped at the moment of extraction, and trimmed and refused empty
+    // exactly as the CLI does. `Secret` has no `Display` at all, so
+    // interpolating it below would be a compile error rather than a silent
+    // `<redacted>`.
+    let value = crate::redact::Secret::new(body.value.trim().to_string());
+    if value.expose().is_empty() {
+        return Err(ApiError::BadRequest(format!(
+            "an empty value is not a credential; to remove one, DELETE /secrets/{name}"
+        )));
+    }
+
+    let (into, outcome) = custody.seal(name, &value).map_err(custody_error)?;
+
+    // The breadcrumb carries the **name only**. A `Note` rather than a typed
+    // variant because it needs no exhaustive-match churn and, more to the
+    // point, `Note` is not `nudge_worthy`: a key rotation must not spend an
+    // orchestrator turn telling the one actor that is refused this route.
+    store
+        .append_event(crate::events::EventPayload::Note {
+            source: "secrets".into(),
+            message: format!("`{name}` was sealed over the API"),
+        })
+        .await?;
+
+    Ok(match (into, outcome) {
+        (_, crate::secrets::SealOutcome::NeedsRestart) => (
+            StatusCode::OK,
+            Json(tasks_api::http::SecretNeedsRestart {
+                name,
+                detail: "sealed; this process cannot read it back until a restart (its one \
+                         late unlock attempt has already been spent). The value is safe on \
+                         disk — do not paste it again"
+                    .into(),
+            }),
+        )
+            .into_response(),
+        (crate::secrets::SealedInto::NewStore { path, key_source }, _) => (
+            StatusCode::CREATED,
+            Json(tasks_api::http::SecretsInitialized {
+                store_path: path.display().to_string(),
+                key_source,
+            }),
+        )
+            .into_response(),
+        (crate::secrets::SealedInto::ExistingStore, _) => StatusCode::NO_CONTENT.into_response(),
+    })
+}
+
+/// `DELETE /secrets/{name}` — 204 whether or not anything was there.
+async fn delete_secret(
+    State(store): State<Arc<Store>>,
+    State(secrets): State<Option<Arc<crate::secrets::Custody>>>,
+    Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Response> {
+    require_human_for_custody(&store, &headers).await?;
+    let custody = custody_service(&secrets)?;
+    let name = parse_secret_name(&name)?;
+    if custody.unseal(name).map_err(custody_error)? {
+        store
+            .append_event(crate::events::EventPayload::Note {
+                source: "secrets".into(),
+                message: format!("`{name}` was removed from the sealed store over the API"),
+            })
+            .await?;
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 #[cfg(test)]

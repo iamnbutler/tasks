@@ -463,6 +463,14 @@ impl RenderOnce for Modal {
             // indistinguishable from one that has stopped responding. Mouse
             // *down*, so a click on a button inside still runs on the mouse up
             // that follows.
+            //
+            // This is the prior art for `components::SwallowPress`, whose docs
+            // carry the full argument (bubble ordering, why not `on_click`, why
+            // not `occlude`). The panel keeps its own listener rather than
+            // adopting the helper because this one has a second job — it also
+            // focuses the target — and a second mouse-down listener beside the
+            // helper's would never run, gpui stopping at the first that stops
+            // propagation.
             .on_mouse_down(MouseButton::Left, {
                 let target = target.clone();
                 move |_event, window, cx| {
@@ -503,13 +511,24 @@ impl RenderOnce for Modal {
         if matches!(self.scrim, Scrim::Dim) {
             scrim = scrim.bg(theme.overlay());
         }
-        if let Some(dismiss) = self.on_dismiss {
-            if dismissible {
-                scrim = scrim.on_mouse_down(MouseButton::Left, move |_event, window, cx| {
-                    dismiss(window, cx)
-                });
+        // A press on the scrim is a press on nothing behind it — a scrim
+        // exists to block, and the thing it is most often over is a selectable
+        // markdown document, which anchors a text selection from a bubble-phase
+        // mouse-down. This is `components::SwallowPress` with a second job (the
+        // dismiss), so it is spelled out here rather than composed: two
+        // mouse-down listeners on one element would race, since gpui skips the
+        // rest once one of them stops propagation.
+        //
+        // Unconditional, and deliberately not inside the `dismissible` branch:
+        // a non-dismissible scrim registered no mouse-down listener at all,
+        // which made it the one arm that let every press straight through.
+        let dismiss = self.on_dismiss.filter(|_| dismissible);
+        scrim = scrim.on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+            cx.stop_propagation();
+            if let Some(dismiss) = &dismiss {
+                dismiss(window, cx);
             }
-        }
+        });
         scrim
     }
 }

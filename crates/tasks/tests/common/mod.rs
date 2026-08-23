@@ -258,6 +258,8 @@ pub fn offline_config(data_dir: &Path) -> tasks::run::Config {
         builder_vm_config: Default::default(),
         builder_image: "builder:v1".into(),
         builder_timeout: Duration::from_secs(300),
+        worker_cmd: "true".into(),
+        worker_timeout: Duration::from_secs(300),
         github_rest_api_url: None,
         orchestrator_cmd: "true".into(),
         orchestrator_timeout: Duration::from_secs(60),

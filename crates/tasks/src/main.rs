@@ -2,8 +2,8 @@
 //!
 //! `serve` runs the server (GitHub poller + scout dispatcher + HTTP control
 //! API — see [`tasks::run`]); `reload` / `status` / `stop` are the upgrade
-//! loop around it and `drain` / `resume` the one for host work the server
-//! itself cannot do (all in [`tasks::reload`]); `add-project` writes straight
+//! loop around it, and `hold` / `drain` / `resume` the ones for host work the
+//! server itself cannot do (all in [`tasks::reload`]); `add-project` writes straight
 //! to the store. Everything else is driven over the API — see [`tasks::server`]
 //! for the route list.
 
@@ -30,10 +30,15 @@ usage:
                                 new binary (alias: restart)
   tasks status                  who is serving, since when, what is in flight
   tasks stop [flags]            SIGTERM the running server and wait for it
-  tasks drain [flags]           quiesce the pipeline for host maintenance
-                                (a vm-pool restart, `make images`) and hold
-                                dispatch until `tasks resume`
+  tasks drain [flags]           quiesce the pipeline for the one host act
+                                with no recovery (restarting vm-pool on the
+                                same socket) and hold dispatch until
+                                `tasks resume`
   tasks resume                  release that hold: dispatch plays again
+  tasks hold [flags] -- CMD     pause dispatch, run CMD, put the mode back the
+                                moment it exits — the wrapper `make images`
+                                uses, and the answer for any host act that can
+                                only be spoiled by a *new* dispatch
   tasks doctor [flags]          check every precondition for a scout on this
                                 machine and print a checklist; reports and
                                 never fixes, exits 1 on any failure
@@ -59,7 +64,8 @@ reload flags:
                                 (pauses dispatch for the wait; the new server
                                 comes up in the mode the old one was in)
   --drain-timeout SECS          how long --when-idle waits (default 3900)
-  --force                       swap even with work in flight
+  --force                       swap against a server that is alive but will
+                                not answer /status
   --no-build                    skip the build and swap in this binary
   --repo PATH                   workspace to build in (default: detected)
   --foreground                  exec the new server here instead of
@@ -73,8 +79,9 @@ reload exit codes:
 stop flags:
   --when-idle                   wait for in-flight scouts/builds to finish
                                 before stopping (pauses dispatch for the wait
-                                — and leaves it paused, since no boot resumes
-                                the stored mode). Plain `tasks stop` is
+                                — and nothing puts it back, though nothing
+                                needs to: the next boot takes
+                                TASKS_DEFAULT_MODE). Plain `tasks stop` is
                                 unchanged: immediate and ungated
   --drain-timeout SECS          how long --when-idle waits (default 3900)
 
@@ -84,8 +91,9 @@ stop exit codes:
 
 drain flags:
   --check                       report whether the pipeline is quiesced and
-                                exit, touching neither the mode nor any run
-                                (this is what `make images` gates on)
+                                exit, touching neither the mode nor any run.
+                                A diagnostic: nothing in the repo refuses on
+                                it (`make images` wraps `tasks hold` instead)
   --cancel-scouts               cancel running scouts instead of waiting them
                                 out; never the default, and refused together
                                 with --check
@@ -155,21 +163,26 @@ mode the last process left in the store.
 const RELOAD_USAGE: &str = "\
 usage: tasks reload [flags]   (alias: tasks restart)
 
-Build, report, gate, drain, swap, verify — the upgrade loop. Refuses by
-default when a scout or a build is in flight.
+Build, report, gate, drain, swap, verify — the upgrade loop.
+
+Work in flight is REPORTED, never refused: the swap re-attaches to every live
+VM, so the worst case is one write-off that charges no attempt. --when-idle is
+the opt-in for someone who would rather not spend even that.
 
   --when-idle             wait for in-flight scouts/builds to finish (pauses
                           dispatch for the wait; the new server comes up in
                           the mode the old one was in)
   --drain-timeout SECS    how long --when-idle waits (default 3900)
-  --force                 swap anyway, with work in flight
+  --force                 swap against a server that is alive but will not
+                          answer /status
   --no-build              skip the build and swap in this binary
   --repo PATH             workspace to build in (default: detected)
   --foreground            exec the new server here instead of backgrounding it
   --port N                port for the new server (default: the running
                           server's, else 4800)
 
-exit codes: 3 busy   4 drain timed out   5 the swap did not land
+exit codes: 3 busy (a server that will not say what is in flight)   4 drain
+timed out   5 the swap did not land
 ";
 
 const STATUS_USAGE: &str = "\
@@ -186,8 +199,9 @@ usage: tasks stop [flags]
 SIGTERM the running server and wait until it is actually gone.
 
   --when-idle             wait for in-flight scouts/builds to finish first
-                          (pauses dispatch for the wait — and LEAVES it
-                          paused, since no boot resumes the stored mode)
+                          (pauses dispatch for the wait and nothing puts it
+                          back — though nothing needs to: the next boot takes
+                          TASKS_DEFAULT_MODE whatever is stored)
   --drain-timeout SECS    how long --when-idle waits (default 3900)
 
 Plain `tasks stop` is unchanged: immediate and ungated.
@@ -199,16 +213,21 @@ flight   4 drain timed out (nothing was stopped)
 const DRAIN_USAGE: &str = "\
 usage: tasks drain [flags]
 
-Quiesce the pipeline for host maintenance — restarting vm-pool, or rebuilding
-the VM images with `make images` — and KEEP it held. Pause dispatch, wait for
+Quiesce the pipeline for the one host act with no recovery — restarting
+vm-pool on the same socket — and KEEP it held. Pause dispatch, wait for
 in-flight scouts and builds to land, and leave dispatch paused until
 `tasks resume` says otherwise.
 
+For a host act that can only be spoiled by a NEW dispatch (`make images`), the
+answer is `tasks hold -- <command>`: it holds for the command's own duration
+and needs no human on the other end of it.
+
   --check                 report whether the pipeline is quiesced and exit.
                           Touches neither the mode nor any run; passes with
-                          nothing serving, refuses a playing pipeline even
-                          with nothing in flight (the dispatcher tops scouts
-                          up on its next tick)
+                          nothing serving, reports a playing pipeline as not
+                          quiesced even with nothing in flight (the dispatcher
+                          tops scouts up on its next tick). A diagnostic —
+                          nothing in the repo refuses on it
   --cancel-scouts         cancel running scouts rather than waiting them out.
                           Opt-in and never the default: waiting costs time,
                           cancelling costs work. A cancel is a request the
@@ -237,6 +256,41 @@ Nothing resumes automatically: only the operator knows vm-pool is back up and
 the images are rebuilt.
 
 Exits 1 when nothing is serving — there is no mode to write.
+";
+
+const HOLD_USAGE: &str = "\
+usage: tasks hold [--label TEXT] -- <command> [args...]
+
+Pause dispatch, run <command> as this process's own child, and put the mode
+back the instant that child exits — success, failure or signal. Exits with the
+child's status, so a recipe that wraps a command in `tasks hold` says exactly
+what it would have said unwrapped.
+
+It waits for nothing and cancels nothing: this is not a drain. What a host act
+like `make images` can spoil is a run DISPATCHED INTO it (which starts in the
+old image); a run that started earlier re-attaches or dies charging nothing.
+For a host act that destroys running work — restarting vm-pool on the same
+socket — use `tasks drain`, which is that act's only caller.
+
+  --label TEXT            what to call this hold in the output (cosmetic; the
+                          argv is the truth)
+
+Flags are read only AHEAD of `--`. Everything after it is the command,
+verbatim, so `tasks hold -- make -j4 images` passes `-j4` to make.
+
+The restore is a parent process rather than two recipe lines on purpose: a
+`make` that died between a `tasks drain` and a `tasks resume` would leave the
+pipeline paused with nothing left running that knows to undo it. A SIGINT or
+SIGTERM here is forwarded to the child and still restores. A SIGKILL of this
+process is the one case that strands the pause — `tasks resume` releases it.
+
+A pipeline that was not playing is left exactly as it is (`stop` is tighter
+than `pause`, and \"restoring\" it would turn intake back on). If somebody
+changes the mode while the command runs, the pause is left as found rather
+than promoted back to play.
+
+With nothing serving, or a server that will not answer /status, the command
+still runs — unheld, and it says so.
 ";
 
 const DOCTOR_USAGE: &str = "\
@@ -420,7 +474,11 @@ launchd resurrects the server behind the report. A developer's own server
 /// theoretical collision — a repo literally named `help` — cannot arise, since
 /// `add-project` requires an `owner/repo` slash.
 fn wants_help(args: &[String]) -> bool {
+    // Stops at `--`, because `tasks hold -- make help` is a command that
+    // happens to contain one of these words, not a request for usage. No other
+    // subcommand takes a `--`, so this is inert for all of them.
     args.iter()
+        .take_while(|a| *a != "--")
         .any(|a| a == "--help" || a == "-h" || a == "help")
 }
 
@@ -433,6 +491,7 @@ fn usage_for(command: &str) -> &'static str {
         "stop" => STOP_USAGE,
         "drain" => DRAIN_USAGE,
         "resume" => RESUME_USAGE,
+        "hold" => HOLD_USAGE,
         "doctor" => DOCTOR_USAGE,
         "add-project" => ADD_PROJECT_USAGE,
         "auth" => AUTH_USAGE,
@@ -496,6 +555,7 @@ async fn dispatch(env_sources: Vec<tasks::env_file::Source>) -> Result<()> {
         Some("stop") => stop_cmd(&args[1..]).await,
         Some("drain") => drain_cmd(&args[1..]).await,
         Some("resume") => resume_cmd(&args[1..]).await,
+        Some("hold") => hold_cmd(&args[1..]).await,
         Some("doctor") => doctor_cmd(&args[1..], env_sources).await,
         Some("add-project") => add_project(&args[1..]).await,
         Some("auth") => auth_cmd(&args[1..]).await,
@@ -681,6 +741,53 @@ async fn drain_cmd(args: &[String]) -> Result<()> {
                 println!("{closing}");
             }
             Ok(())
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(err.exit_code());
+        }
+    }
+}
+
+/// `tasks hold [--label TEXT] -- <command>`: pause dispatch for exactly as
+/// long as `command` runs.
+///
+/// Flags are parsed **only ahead of `--`**. The command routinely carries
+/// flags of its own (`make -j4`), and a parser that kept looking would eat
+/// them.
+///
+/// The child's status is propagated verbatim with [`std::process::exit`], so
+/// wrapping a recipe line in `tasks hold` changes nothing about what that
+/// recipe reports.
+async fn hold_cmd(args: &[String]) -> Result<()> {
+    let mut label = None;
+    let mut command = Vec::new();
+
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--" => {
+                command.extend(rest.cloned());
+                break;
+            }
+            "--label" => {
+                label = Some(rest.next().context("--label requires a value")?.to_string());
+            }
+            other => bail!("unexpected argument: {other}\n\n{HOLD_USAGE}"),
+        }
+    }
+    if command.is_empty() {
+        bail!("nothing to run after `--`\n\n{HOLD_USAGE}");
+    }
+
+    let opts = reload::HoldOptions { command, label };
+    match reload::hold_for_command(&run::data_dir()?, opts).await {
+        Ok(outcome) => {
+            let closing = reload::render_held(&outcome.held);
+            if !closing.is_empty() {
+                println!("{closing}");
+            }
+            std::process::exit(outcome.code);
         }
         Err(err) => {
             eprintln!("{err}");
@@ -1070,6 +1177,12 @@ async fn service_cmd(args: &[String]) -> Result<()> {
                      makes restarts resume dispatch"
                 ),
             }
+            // Last, and silent when `tasks` already resolves to the binary
+            // just installed — however it got onto the PATH.
+            print!(
+                "{}",
+                service::path_advice_lines(&outcome.paths.bin, &outcome.paths.home)
+            );
             Ok(())
         }
         Some("uninstall") => {

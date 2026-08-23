@@ -41,11 +41,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::watch;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -85,6 +86,17 @@ pub enum OrchestratorError {
     /// the feed and the ledger start disagreeing about the same night.
     #[error("agent abandoned: {0}")]
     Suspended(Expiry),
+    /// A human ended this turn in flight (`POST /orchestrator/interrupt`).
+    ///
+    /// The **one** error that does not become an assistant turn. Every other
+    /// path deliberately writes itself into the chat, because persisting a
+    /// reply settles the tick condition so the loop cannot retry a poison
+    /// prompt forever — and settling the tick condition is exactly what an
+    /// interrupt must not do. The input the interrupt exists to preserve is
+    /// preserved by *not* advancing the watermark, which happens only in
+    /// `append_orchestrator_reply`, which this path never reaches.
+    #[error("the turn was interrupted{}", .0.by_line())]
+    Interrupted(Interruption),
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +152,11 @@ pub struct OrchestratorConfig {
     /// from the data dir rather than from anything that can fail — the prompt
     /// is what decides whether it is mentioned.
     pub worktree_dir: PathBuf,
+    /// Budget for one worker run (`WORKER_TIMEOUT_SECS`), quoted in the
+    /// delegation text so the prompt never names a budget the lane does not
+    /// have — the same derived-from-the-environment rule as everything else
+    /// the prompt claims.
+    pub worker_timeout: Duration,
     /// Whether the server booted with a GitHub credential.
     ///
     /// Same principle as [`Self::workdir_is_checkout`], applied to the other
@@ -164,6 +181,166 @@ pub struct Orchestrator {
     config: OrchestratorConfig,
 }
 
+/// `source` on the event-log breadcrumbs about the orchestrator's own
+/// lifecycle.
+///
+/// One constant with [`crate::run`] and `maintain_verify_dir`, which were two
+/// spellings of the same string until this became the third reader.
+pub const NOTE_SOURCE: &str = "orchestrator";
+
+/// Who ended a turn, and why — the audit shape a `cancellations` row would
+/// have carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Interruption {
+    /// Who asked. Always the human today: the three lane controls are
+    /// human-only, on the `build-now` precedent.
+    pub actor: String,
+    /// Optional, unlike a `decisions` rationale — nothing here is
+    /// charter-gated, so there is no ledger row to leave unreviewable.
+    pub rationale: Option<String>,
+}
+
+impl Interruption {
+    /// The trailing clause of the error's own sentence.
+    pub fn by_line(&self) -> String {
+        match &self.rationale {
+            Some(reason) if !reason.trim().is_empty() => {
+                format!(" by {}: {}", self.actor, reason.trim())
+            }
+            _ => format!(" by {}", self.actor),
+        }
+    }
+}
+
+/// The live handle on the turn in flight: one slot, taken while a turn runs
+/// and empty otherwise (#1064).
+///
+/// **An in-process signal, not a `cancellations` row — decided, with the
+/// reason.** [`crate::cancel`]'s row exists for a premise that is false here:
+/// *the process taking the request need not be the one following the run*. A
+/// scout or a build lives in a VM and may be picked back up by
+/// `resume_in_flight` in a later process; an orchestrator turn is a local child
+/// of this one server, dies with it, and can never be reattached — the process
+/// taking the request **is** the process running the turn. (Workers are local
+/// children too and *do* use a row; the difference is that a worker has a
+/// durable id. A turn has none, `cancellations` is keyed `(run_kind, run_id)`,
+/// and the only id available is the singleton's — so a request landing a moment
+/// late would sit on record and stop a *later* turn nobody asked to stop.) What
+/// the row would have bought, an audit shape, is kept as an
+/// `EventPayload::Note` carrying the actor and the rationale.
+///
+/// The slot is the whole concurrency argument, and it must not be replaced by
+/// an `AtomicBool` plus a stored request: a request that arrives with nothing
+/// running finds **no slot**, is answered honestly, and is never stored — which
+/// is what makes "a request cannot leak into the next turn" structural rather
+/// than careful. [`TurnGuard`] clears the slot on every exit path including a
+/// panic.
+#[derive(Default)]
+pub struct TurnControl {
+    slot: Mutex<Option<watch::Sender<Option<Interruption>>>>,
+}
+
+impl TurnControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take the slot for the turn about to run, handing back the receiver the
+    /// turn selects on and a guard that frees the slot however the turn ends.
+    ///
+    /// Armed around the whole of `run_agent` rather than per invocation: a
+    /// turn whose resume fails invokes twice, and a window between them
+    /// answering "no turn in flight" would be a lie.
+    fn arm(self: &Arc<Self>) -> (watch::Receiver<Option<Interruption>>, TurnGuard) {
+        let (tx, rx) = watch::channel(None);
+        *self.slot.lock().expect("turn control slot") = Some(tx);
+        (
+            rx,
+            TurnGuard {
+                control: self.clone(),
+            },
+        )
+    }
+
+    /// End the turn in flight, if there is one. `false` means there was
+    /// nothing to end — a 200 saying so, never a 4xx, and nothing recorded.
+    pub fn interrupt(&self, interruption: Interruption) -> bool {
+        let slot = self.slot.lock().expect("turn control slot");
+        match slot.as_ref() {
+            Some(tx) => tx.send(Some(interruption)).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Whether a turn is in flight right now.
+    pub fn in_flight(&self) -> bool {
+        self.slot.lock().expect("turn control slot").is_some()
+    }
+
+    fn disarm(&self) {
+        *self.slot.lock().expect("turn control slot") = None;
+    }
+}
+
+/// Frees the slot when the turn ends — return, error, or panic.
+struct TurnGuard {
+    control: Arc<TurnControl>,
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        self.control.disarm();
+    }
+}
+
+/// SIGTERM then SIGKILL a whole process group, best effort.
+///
+/// `kill_on_drop` takes the agent alone, and its bash children survive holding
+/// the pipes we are reading — `run_script`'s hazard one surface over, and the
+/// same answer. The child is spawned with `.process_group(0)`, so signalling
+/// `-pgid` reaches the agent *and* whatever `cargo` it left behind.
+///
+/// Best-effort by design: every failure here is `ESRCH` (already gone) or a
+/// permission error a retry cannot fix, and an interrupt that errored *after*
+/// freeing the lane would be worse than the hang it replaced.
+///
+/// Public and taking a bare pgid so a second caller can use it — the worker
+/// lane has the same `kill_on_drop`-takes-the-child-only hazard, filed
+/// separately and deliberately not fixed here.
+pub fn signal_group(pgid: u32, signal: i32) {
+    // Negative pid: the group. A pgid of 0 or 1 would mean "every process we
+    // may signal", which is never what a caller means.
+    if pgid <= 1 {
+        return;
+    }
+    // SAFETY: `kill` with a negative pid is a plain libc call with no memory
+    // contract; the worst an unknown pgid does is return ESRCH, which is
+    // exactly the case this ignores.
+    unsafe {
+        libc::kill(-(pgid as i32), signal);
+    }
+}
+
+/// The sweep both the interrupt and the timeout path run: ask the group to
+/// stop, then make sure.
+///
+/// The **timeout path gets the same sweep**, so a turn killed at its deadline
+/// cannot leave a `cargo` behind holding the warm build directory — that
+/// directory reached 51 GB unattended once already.
+///
+/// Liveness between the two signals is re-derived with
+/// [`crate::pidfile::pid_alive`] — `ps -o state=`, where an empty row or a
+/// leading `Z` is dead. A killed grandchild is a **zombie, not an absence**:
+/// its parent is dead and nothing here reaps it, so `kill(pid, 0)` reports
+/// every corpse as alive. That is the pidfile rule, and it is the one
+/// implementation of it: this server runs on macOS, which has no `/proc`.
+pub fn sweep_group(pgid: u32) {
+    signal_group(pgid, libc::SIGTERM);
+    if crate::pidfile::pid_alive(pgid) {
+        signal_group(pgid, libc::SIGKILL);
+    }
+}
+
 impl Orchestrator {
     pub fn new(store: Arc<Store>, config: OrchestratorConfig) -> Self {
         Self { store, config }
@@ -173,7 +350,7 @@ impl Orchestrator {
     /// a reply was produced. One reply covers every unanswered turn — they
     /// are joined into one prompt, which is also what makes the tick
     /// idempotent.
-    pub async fn tick(&self) -> Result<bool, OrchestratorError> {
+    pub async fn tick(&self, control: &Arc<TurnControl>) -> Result<bool, OrchestratorError> {
         let pending = self.store.unanswered_orchestrator_messages().await?;
         if pending.is_empty() {
             return Ok(false);
@@ -199,7 +376,12 @@ impl Orchestrator {
         if let Err(e) = self.store.begin_orchestrator_turn().await {
             warn!(error = %e, "could not mark the orchestrator turn as in flight");
         }
-        let (reply, session_id) = match self.run_agent(&prompt).await {
+        // Armed around the whole of `run_agent` — resume and the fresh-session
+        // retry behind it — so there is no window between two invocations in
+        // which an interrupt would be told there is no turn in flight. The
+        // guard frees the slot on every exit path below, panic included.
+        let (interrupt, _guard) = control.arm();
+        let (reply, session_id) = match self.run_agent(&prompt, interrupt).await {
             Ok(turn) => {
                 info!(
                     session = %turn.session_id,
@@ -208,6 +390,19 @@ impl Orchestrator {
                     "orchestrator turn complete"
                 );
                 (turn.text, Some(turn.session_id))
+            }
+            // The one error that is not written into the chat. Persisting a
+            // reply is what settles the tick condition, and settling it is
+            // exactly what an interrupt must not do: the input stays
+            // unanswered and the next tick puts the same prompt back. Adding a
+            // `return` through `append_orchestrator_reply` here "to record
+            // what happened" would silently eat the input the interrupt exists
+            // to preserve.
+            Err(OrchestratorError::Interrupted(interruption)) => {
+                return self
+                    .conclude_interrupted(interruption)
+                    .await
+                    .map(|()| false);
             }
             Err(e) => {
                 // The error becomes the assistant turn: the chat must never
@@ -239,6 +434,54 @@ impl Orchestrator {
         Ok(true)
     }
 
+    /// Wind up an interrupted turn: clear the in-flight marker, put the
+    /// accounting on the feed, and tell live subscribers the in-flight view is
+    /// over.
+    ///
+    /// The Note is written **here, by the turn, and not by the route**. The
+    /// select in `invoke` is `biased` with the work first
+    /// ([`crate::cancel::bounded`]'s rule — an outcome already in hand is
+    /// never discarded for a request that arrived in the same poll), so a note
+    /// written at the request would sometimes claim a stop that never
+    /// happened.
+    ///
+    /// `answered_through` is deliberately untouched: it moves only in
+    /// `append_orchestrator_reply`, which this path never reaches, so the
+    /// input survives and the next tick re-answers it. That an interrupt alone
+    /// re-answers the same input is correct, and is *why* quieting the lane is
+    /// two acts.
+    async fn conclude_interrupted(
+        &self,
+        interruption: Interruption,
+    ) -> Result<(), OrchestratorError> {
+        if let Err(e) = self.store.end_orchestrator_turn().await {
+            warn!(error = %e, "could not clear the orchestrator turn marker");
+        }
+        let detail = match interruption.rationale.as_deref().map(str::trim) {
+            Some(reason) if !reason.is_empty() => format!(
+                "The orchestrator turn was interrupted by {}: {reason}. The input it was \
+                 answering is unchanged, so the next tick takes it up again — hold the lane \
+                 (POST /orchestrator/hold) to stop turns starting.",
+                interruption.actor
+            ),
+            _ => format!(
+                "The orchestrator turn was interrupted by {}. The input it was answering is \
+                 unchanged, so the next tick takes it up again — hold the lane \
+                 (POST /orchestrator/hold) to stop turns starting.",
+                interruption.actor
+            ),
+        };
+        self.store
+            .append_event(EventPayload::Note {
+                source: NOTE_SOURCE.into(),
+                message: detail,
+            })
+            .await?;
+        self.store
+            .publish_orchestrator_feed(OrchestratorFeedEvent::Done);
+        Ok(())
+    }
+
     /// Run one headless Claude Code turn against the persistent session,
     /// creating the session on first use and healing a lost one by starting
     /// over with a fresh id.
@@ -252,7 +495,11 @@ impl Orchestrator {
     /// The standing prompt rides along on every turn — resume included — so
     /// prompt updates reach a long-lived session without resetting it, and a
     /// fresh session is re-armed with its instructions on turn one.
-    async fn run_agent(&self, prompt: &str) -> Result<Turn, OrchestratorError> {
+    async fn run_agent(
+        &self,
+        prompt: &str,
+        interrupt: watch::Receiver<Option<Interruption>>,
+    ) -> Result<Turn, OrchestratorError> {
         // Re-read every turn: the charter is the one statement of what the
         // orchestrator may do, and it reaches a long-lived session only
         // through the prompt. A human flipping a capability takes effect on
@@ -260,11 +507,12 @@ impl Orchestrator {
         let charter = self.store.charter().await?;
         let system = system_prompt(&self.config, &charter);
         match self.store.orchestrator_cc_session().await? {
-            None => self.start_session(&system, prompt, None).await,
+            None => self.start_session(&system, prompt, None, interrupt).await,
             Some(session) => match self
                 .invoke(
                     &["--resume", &session, "--append-system-prompt", &system],
                     prompt,
+                    interrupt.clone(),
                 )
                 .await
             {
@@ -287,7 +535,8 @@ impl Orchestrator {
                     self.store
                         .end_orchestrator_session(&session, SessionEndReason::ResumeFailed)
                         .await?;
-                    self.start_session(&system, prompt, Some(&session)).await
+                    self.start_session(&system, prompt, Some(&session), interrupt)
+                        .await
                 }
                 Err(e) => Err(e),
             },
@@ -302,12 +551,14 @@ impl Orchestrator {
         system: &str,
         prompt: &str,
         replacing: Option<&str>,
+        interrupt: watch::Receiver<Option<Interruption>>,
     ) -> Result<Turn, OrchestratorError> {
         let session = Uuid::new_v4().to_string();
         let (text, usage) = self
             .invoke(
                 &["--session-id", &session, "--append-system-prompt", system],
                 prompt,
+                interrupt,
             )
             .await?;
         self.store
@@ -336,6 +587,7 @@ impl Orchestrator {
         &self,
         extra_args: &[&str],
         prompt: &str,
+        mut interrupt: watch::Receiver<Option<Interruption>>,
     ) -> Result<(String, TurnUsage), OrchestratorError> {
         let mut parts = split_command(&self.config.command).into_iter();
         let prog = parts.next().unwrap_or_else(|| "claude".to_string());
@@ -383,7 +635,15 @@ impl Orchestrator {
             )
             // A timeout drops the read future below, which drops the child —
             // this makes that drop kill the process instead of leaking it.
+            // It takes the agent **alone**, though: the bash children it left
+            // behind survive holding the pipes we are reading, which is why
+            // the child gets a process group of its own below and both the
+            // interrupt and the timeout path sweep it.
             .kill_on_drop(true)
+            // Its own process group, so one signal reaches the agent and
+            // whatever `cargo` it started. Set before the spawn because the
+            // pgid is the child's pid, which is what `sweep_group` is given.
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -407,6 +667,13 @@ impl Orchestrator {
         }
 
         let mut child = cmd.spawn().map_err(OrchestratorError::Spawn)?;
+        // Read **before** the child is moved into the read future below —
+        // afterwards there is no handle left to ask, and the sweep needs the
+        // pgid on exactly the paths where the future is being dropped. The
+        // process group is the child's own pid, because of `.process_group(0)`
+        // above. `None` means the child has already been reaped, which leaves
+        // nothing to sweep and no group to name.
+        let pgid = child.id().unwrap_or(0);
         let mut stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
@@ -482,18 +749,52 @@ impl Orchestrator {
         // Two clocks, for the reason the dispatchers use them: a lid closed
         // mid-turn is not a turn that spent 900 seconds thinking.
         let deadline = Deadline::starting_now(self.config.timeout);
-        let (status, result_text, raw, usage) =
-            deadline::bounded(&deadline, read)
-                .await
-                .map_err(|expiry| {
-                    if expiry.starved_by_suspend() {
-                        OrchestratorError::Suspended(expiry)
-                    } else {
-                        OrchestratorError::Timeout {
-                            secs: self.config.timeout.as_secs(),
-                        }
-                    }
-                })??;
+        // `Box::pin`, not `tokio::pin!`: the interrupt arm below needs a *real*
+        // drop to take the child with it, and dropping the `Pin<&mut F>` that
+        // `tokio::pin!` yields drops nothing at all — the child would outlive
+        // the decision to kill it. clippy's `drop_non_drop` catches that one;
+        // do not silence it.
+        let mut read = Box::pin(deadline::bounded(&deadline, read));
+        let outcome = tokio::select! {
+            // Biased, with the work first: an outcome already in hand is never
+            // discarded for a request that arrived in the same poll
+            // (`cancel::bounded`'s rule). It is also what lets the Note be
+            // written by the turn rather than by the route — a note written at
+            // the request would sometimes claim a stop that never happened.
+            biased;
+            outcome = &mut read => Some(outcome),
+            _ = interrupt.changed() => None,
+        };
+        let Some(outcome) = outcome else {
+            let interruption = interrupt.borrow().clone().unwrap_or(Interruption {
+                actor: "a human".into(),
+                rationale: None,
+            });
+            // Order matters. Ask the group to stop first, then drop the read
+            // future — which takes `claude` itself via `kill_on_drop` — then
+            // make sure with SIGKILL.
+            signal_group(pgid, libc::SIGTERM);
+            drop(read);
+            // `abort()` rather than awaiting an EOF that will never come: the
+            // pipe is held by children we have just signalled, and a reader
+            // parked on it would hang the interrupt it is part of.
+            stderr_task.abort();
+            sweep_group(pgid);
+            return Err(OrchestratorError::Interrupted(interruption));
+        };
+        let (status, result_text, raw, usage) = outcome.map_err(|expiry| {
+            // The same sweep as the interrupt path: a turn killed at its
+            // deadline must not leave a `cargo` behind holding the warm
+            // build directory.
+            sweep_group(pgid);
+            if expiry.starved_by_suspend() {
+                OrchestratorError::Suspended(expiry)
+            } else {
+                OrchestratorError::Timeout {
+                    secs: self.config.timeout.as_secs(),
+                }
+            }
+        })??;
 
         if !status.success() {
             let stderr = stderr_task.await.unwrap_or_default();
@@ -559,7 +860,7 @@ pub struct TurnUsage {
 /// One entry of the `result` record's `modelUsage` map: a model, and the
 /// window it says it has.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ModelReport {
+pub(crate) struct ModelReport {
     /// The map key — the wire id, suffix included.
     id: String,
     /// `canonicalModel`, which is what an `assistant` record's `message.model`
@@ -570,7 +871,7 @@ struct ModelReport {
 }
 
 /// What one line of agent stdout means for the live feed.
-enum StreamLine {
+pub(crate) enum StreamLine {
     /// Assistant text as it's generated (`--include-partial-messages`).
     Delta(String),
     /// A completed assistant turn: its tool invocations (for the feed) and,
@@ -600,7 +901,7 @@ enum StreamLine {
     NotStreamJson,
 }
 
-fn parse_stream_line(line: &str) -> StreamLine {
+pub(crate) fn parse_stream_line(line: &str) -> StreamLine {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return StreamLine::NotStreamJson;
     };
@@ -1380,13 +1681,46 @@ fn workdir_section(is_checkout: bool) -> &'static str {
 ///
 /// (c) is untouched: a green suite still says nothing about whether a pixel
 /// landed.
-fn landing_section(charter: &[CharterEntry], can_verify: bool) -> &'static str {
+fn landing_section(charter: &[CharterEntry], can_verify: bool, delegate: bool) -> &'static str {
     let level = charter
         .iter()
         .find(|e| e.capability == Capability::LandBuilds)
         .map(|e| e.level)
         .unwrap_or(CharterLevel::Off);
     match level {
+        // The delegation arm (#1053): the run still decides the merge, but it
+        // is a worker's to make, not this turn's. What sends a batch to a
+        // human is still unverifiability, not risk — the three carve-outs are
+        // unchanged; only where the (b) run comes from moved.
+        CharterLevel::Live if delegate => {
+            "Landing it is YOURS, and waiting is not the default: merge it this \
+             turn with POST /pull-requests/{number}/merge, and say that you did. \
+             The brief above has already asked the three questions that could \
+             stop you, and they are the whole list: (a) GitHub would refuse the \
+             merge, or reports a check on the head commit that has not gone \
+             green — CI runs this project's suite on every push, `unstable` \
+             means a check FAILED or has not finished and GitHub will not say \
+             which, and nothing will refuse the merge for you, so find out \
+             which it is and stop unless it is green; (b) no passing run backs \
+             it AND you could not obtain one — and under this charter that can \
+             only mean a worker you dispatched came back without one, since a \
+             failing suite fails the build inside the VM and never becomes a \
+             pull request at all, so DISPATCH A WORKER to run it (see the \
+             verification section) rather than handing it over unrun; (c) \
+             nothing runnable here could have checked it — the app-gpui \
+             rendering case. Say which of the three it is rather than \
+             defaulting to caution, and if it is none of them, merge it.\n\n\
+             A batch whose suite passed is not thereby finished with you. That \
+             run tested the branch against its OWN base, and the trunk has moved \
+             since — pull requests land while a queue drains. Two branches can \
+             each be green against their own base and red composed, and nothing \
+             upstream can see that, because the merged result does not exist \
+             until you make it. So when several are waiting, or when one has \
+             sat behind others that landed, dispatch a worker to check them out \
+             together onto current main and run the suite on the composition — \
+             then merge on its report. That run is the one nobody else can \
+             make; the judgment on it stays yours."
+        }
         CharterLevel::Live if can_verify => {
             "Landing it is YOURS, and waiting is not the default: merge it this \
              turn with POST /pull-requests/{number}/merge, and say that you did. \
@@ -1554,7 +1888,13 @@ pub fn command_budget(turn: Duration) -> Duration {
 /// when the next verification arrives, and a bare `git checkout` refuses. A
 /// wedged worktree is worse than a slow one — it means no verification at all,
 /// and carve-out (b) then routes every batch to a human.
-fn verification_section(target_dir: Option<&Path>, worktree: &Path, turn: Duration) -> String {
+fn verification_section(
+    target_dir: Option<&Path>,
+    worktree: &Path,
+    turn: Duration,
+    worker_timeout: Duration,
+    delegate: bool,
+) -> String {
     let Some(dir) = target_dir else {
         return String::new();
     };
@@ -1562,6 +1902,46 @@ fn verification_section(target_dir: Option<&Path>, worktree: &Path, turn: Durati
     let tree = worktree.display();
     let command_secs = command_budget(turn).as_secs();
     let turn_secs = turn.as_secs();
+    if delegate {
+        // #1053: the labor moves to the worker lane; the judgment stays here.
+        // The worktree and build-directory discipline are deliberately NOT
+        // restated — they live in the worker's own server-written prompt, and
+        // one source is the rule.
+        let worker_secs = worker_timeout.as_secs();
+        let worker_command_secs = command_budget(worker_timeout).as_secs();
+        return format!(
+            "You can have this repository's tests run, and a merge decision \
+             should rest on that rather than on a typecheck — but the run is \
+             not yours to make in this turn. DISPATCH A WORKER AND END YOUR \
+             TURN: POST /workers with a short `job` label and a `prompt` \
+             saying what to check out and what to run — PR numbers, branch \
+             names, SHAs, and what to report back. The worker is a fresh \
+             session that knows nothing you do not tell it, but it already \
+             knows this host's verification discipline (the fixed worktree, \
+             the warm build directory, its budgets) from its own prompt, so \
+             yours carries only the job. Its report returns as a \
+             `[worker <job>]` turn you will answer within a tick of your lane \
+             being free; running the suite here instead holds the conversation \
+             the human is waiting behind, which is the failure the worker lane \
+             exists to end.\n\n\
+             The threshold, stated once: DELEGATE ANYTHING THAT COMPILES OR \
+             RUNS A SUITE; KEEP ANYTHING THAT ANSWERS IN SECONDS. A `curl` to \
+             this API, a brief fact, a diff read — those answer in seconds, \
+             and a worker round trip for one of them makes you slower, not \
+             faster. The run worth dispatching is the one nobody upstream can \
+             make: each Builder already ran the suite against its own branch, \
+             so what is unknown is whether those branches still pass COMPOSED \
+             with a trunk that moved under them while they queued — put that \
+             in the job prompt when it is the question.\n\n\
+             Budgets: a worker runs up to {worker_secs}s with a \
+             {worker_command_secs}s per-command ceiling — room for a cold \
+             build and the whole suite, which your own turn ({turn_secs}s, \
+             {command_secs}s per command) does not have. A worker that dies \
+             mid-job still reports what it had streamed, so a dispatch is \
+             never a black hole; workers are serial, so jobs queue behind one \
+             another rather than fighting over the build directory.\n\n"
+        );
+    }
     format!(
         "You can run this repository's tests, and a merge decision should rest \
          on that rather than on a typecheck. The run worth making here is the \
@@ -1735,16 +2115,65 @@ fn reporting_section(charter: &[CharterEntry]) -> String {
 fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> String {
     let port = config.api_port;
     let can_verify = config.workdir_is_checkout && config.target_dir.is_some();
+    // Computed once, like `can_verify` and for the same reason: the landing
+    // section, the verification section and the endpoint list must not
+    // disagree about whether a worker can be dispatched. Charter-gated
+    // because a paragraph claiming an authority the server will refuse is
+    // worse than silence (the landing-text precedent); `Live` only — a
+    // shadowed dispatch runs nothing, so telling the agent to rely on it
+    // would strand every verification on a report that never comes.
+    let delegate = can_verify
+        && charter
+            .iter()
+            .find(|e| e.capability == Capability::DispatchWorkers)
+            .map(|e| e.level)
+            .unwrap_or(CharterLevel::Off)
+            == CharterLevel::Live;
     let authority = authority_section(charter);
-    let landing = landing_section(charter, can_verify);
+    let landing = landing_section(charter, can_verify, delegate);
     let reporting = reporting_section(charter);
     let workdir = workdir_section(config.workdir_is_checkout);
     let verification = verification_section(
         config.target_dir.as_deref(),
         &config.worktree_dir,
         config.timeout,
+        config.worker_timeout,
+        delegate,
     );
+    let worker_endpoints = if delegate {
+        "- POST /workers {\"job\",\"prompt\",\"rationale\"} — dispatch a \
+         worker (see the verification section for when and what to write). \
+         202 means queued; the report arrives as a [worker <job>] turn, so \
+         end your turn rather than polling\n\
+         - GET /workers, GET /workers/{id}, \
+           GET /workers/{id}/transcript?since=N — the lane, one run, and \
+           what a run streamed (the thing to read when one died)\n\
+         - POST /workers/{id}/cancel {\"rationale\"} — stop one that is \
+           queued or running; costs nothing anywhere\n"
+    } else {
+        ""
+    };
+    let workers_voice = if delegate {
+        "A fourth voice is your own labor coming back: turns starting with \
+         \"[worker <job>]\" are reports from workers you dispatched \
+         (POST /workers) — fresh, disposable host sessions that do one job \
+         and end. The heading is server-written; a worker cannot claim to be \
+         anyone else. Act on a report with the authority you already have, \
+         and treat its claims like any agent's: a worker saying a suite \
+         passed is evidence, a worker saying nothing is not. A worker that \
+         died reports how it ended and what it had streamed; redispatching \
+         is your call, and nothing is charged anywhere.\n\n"
+    } else {
+        ""
+    };
     let degradation = degradation_section(config.github_configured);
+    // Unconditional, and deliberately not part of `verification_section`:
+    // that function returns nothing when there is no target directory, so a
+    // clause spliced there would be absent on precisely the hosts that cannot
+    // verify and must therefore reason hardest from command output. Every
+    // other reader of this clause loses a run or writes a wrong sentence when
+    // a pipe manufactures a green exit; this one merges.
+    let pipe_clause = crate::prompt::PIPE_EXIT_STATUS;
     let curl_config = config.curl_config.display();
     format!(
         "You are the Orchestrator for Tasks — a human-in-the-loop platform \
@@ -1768,6 +2197,7 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
          would otherwise run. The sender may not be watching for your reply, \
          so anything that needs the human, say plainly in the conversation \
          rather than addressing it back to the agent.\n\n\
+         {workers_voice}\
          Two kinds of automated turn arrive, and they mean different things. \
          A *notification* reports something that happened, once. A *standing \
          obligation* is work the pipeline is still owed, derived from its \
@@ -1844,6 +2274,7 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
          {authority}\n\n\
          {degradation}\
          {workdir}\n\n\
+         {pipe_clause}\n\n\
          {verification}\
          Pipeline control goes through the tasks HTTP API at \
          http://127.0.0.1:{port} (use curl) — not around it; API writes keep \
@@ -1915,6 +2346,7 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
            no attempt is charged. `concluded: false` in the reply means the \
            request is recorded and the run has not stopped yet — watch for \
            its completion event rather than asking again\n\
+         {worker_endpoints}\
          - GET /projects — the repositories this server tracks, each with a \
            status: active (scouted and built), paused (still polled, nothing \
            dispatched) or archived (not even ingested). Read it before filing \
@@ -2081,7 +2513,7 @@ fn system_prompt(config: &OrchestratorConfig, charter: &[CharterEntry]) -> Strin
 /// Deliberately not a full shell parser: no escapes, no variable expansion, no
 /// operators. An agent under a static allowlist cannot expand `$VAR` anyway,
 /// and a command string that needs more than grouping wants `sh -c`.
-fn split_command(command: &str) -> Vec<String> {
+pub(crate) fn split_command(command: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut in_word = false;
@@ -2310,6 +2742,7 @@ mod tests {
         OrchestratorConfig {
             command: "true".into(),
             timeout: Duration::from_secs(900),
+            worker_timeout: Duration::from_secs(3600),
             workdir: PathBuf::from("/repo"),
             workdir_is_checkout: true,
             target_dir: None,
@@ -2658,16 +3091,17 @@ mod tests {
         // An absent row is `off` — `Store::charter_entry` reads a missing row
         // that way, so the prompt has to as well or the two disagree.
         assert_eq!(
-            landing_section(&[], false),
-            landing_section(&charter(CharterLevel::Off), false)
+            landing_section(&[], false, false),
+            landing_section(&charter(CharterLevel::Off), false, false)
         );
 
         // All three name the three carve-outs, so the standard a batch is
         // judged against does not change with who applies it.
         for section in [
-            landing_section(&charter(CharterLevel::Live), false),
-            landing_section(&charter(CharterLevel::Shadow), false),
-            landing_section(&charter(CharterLevel::Off), false),
+            landing_section(&charter(CharterLevel::Live), false, false),
+            landing_section(&charter(CharterLevel::Live), true, true),
+            landing_section(&charter(CharterLevel::Shadow), false, false),
+            landing_section(&charter(CharterLevel::Off), false, false),
         ] {
             assert!(section.contains("three"), "{section}");
             assert!(
@@ -2865,7 +3299,13 @@ mod tests {
     fn verification_is_described_only_where_it_is_possible() {
         let worktree = Path::new("/state/verify-worktree");
         assert_eq!(
-            verification_section(None, worktree, Duration::from_secs(900)),
+            verification_section(
+                None,
+                worktree,
+                Duration::from_secs(900),
+                Duration::from_secs(3600),
+                false
+            ),
             ""
         );
 
@@ -2873,6 +3313,8 @@ mod tests {
             Some(Path::new("/state/verify-target")),
             worktree,
             Duration::from_secs(900),
+            Duration::from_secs(3600),
+            false,
         );
         assert!(section.contains("/state/verify-target"), "{section}");
         assert!(section.contains("CARGO_TARGET_DIR"), "{section}");
@@ -2957,7 +3399,7 @@ mod tests {
     fn a_host_that_can_run_the_suite_is_told_to_run_it_before_handing_over() {
         let live = landing_charter(CharterLevel::Live);
 
-        let can = landing_section(&live, true);
+        let can = landing_section(&live, true, false);
         assert!(
             !can.contains("nothing re-runs its tests for you"),
             "the claim is false on a host that can verify: {can}"
@@ -2974,8 +3416,141 @@ mod tests {
         // Shadow and Off do not vary with it.
         for level in [CharterLevel::Shadow, CharterLevel::Off] {
             let c = landing_charter(level);
-            assert_eq!(landing_section(&c, true), landing_section(&c, false));
+            assert_eq!(
+                landing_section(&c, true, false),
+                landing_section(&c, false, false)
+            );
+            assert_eq!(
+                landing_section(&c, true, true),
+                landing_section(&c, true, false)
+            );
         }
+    }
+
+    /// #1071, and this is the consumer where a false pass becomes a merge:
+    /// the orchestrator reads an exit status and what it does with the
+    /// reading is `POST /pull-requests/{n}/merge`, whose recourse is a
+    /// revert. Unconditional — and specifically **not** inside
+    /// `verification_section`, which returns nothing when there is no target
+    /// directory, i.e. on precisely the hosts that cannot verify and must
+    /// therefore reason hardest from command output.
+    #[test]
+    fn the_orchestrator_prompt_says_a_pipe_reports_the_pipes_exit_status() {
+        let charter = crate::models::Capability::ALL
+            .iter()
+            .map(|&capability| CharterEntry {
+                capability,
+                level: CharterLevel::Live,
+                daily_limit: None,
+                updated_at: chrono::Utc::now(),
+            })
+            .collect::<Vec<_>>();
+        // A host that can verify, and one that cannot: the clause is present
+        // either way, which is the whole point of keeping it out of
+        // `verification_section`.
+        for target_dir in [Some(PathBuf::from("/state/verify-target")), None] {
+            let p = system_prompt(
+                &OrchestratorConfig {
+                    target_dir,
+                    ..prompt_config()
+                },
+                &charter,
+            );
+            assert!(p.contains(crate::prompt::PIPE_EXIT_STATUS), "{p}");
+        }
+    }
+
+    /// #1053: with the worker lane live and a host that can build, the labor
+    /// moves off the orchestrator's own turn. The prompt must say so in every
+    /// generated section at once — a delegation instruction beside a standing
+    /// "run the suite yourself" is the two-sources failure the single
+    /// computed `delegate` exists to prevent — and must say none of it when
+    /// the capability is not `Live`, because telling the agent to rely on a
+    /// dispatch the server will refuse (or shadow into a no-op) strands every
+    /// verification on a report that never comes.
+    #[test]
+    fn a_live_worker_lane_moves_the_suite_off_the_orchestrators_own_turn() {
+        let charter = |worker_level: CharterLevel| {
+            vec![
+                CharterEntry {
+                    capability: crate::models::Capability::LandBuilds,
+                    level: CharterLevel::Live,
+                    daily_limit: None,
+                    updated_at: chrono::Utc::now(),
+                },
+                CharterEntry {
+                    capability: crate::models::Capability::DispatchWorkers,
+                    level: worker_level,
+                    daily_limit: None,
+                    updated_at: chrono::Utc::now(),
+                },
+            ]
+        };
+        let config = OrchestratorConfig {
+            target_dir: Some(PathBuf::from("/state/verify-target")),
+            ..prompt_config()
+        };
+
+        let live = system_prompt(&config, &charter(CharterLevel::Live));
+        assert!(
+            live.contains("DISPATCH A WORKER AND END YOUR TURN"),
+            "{live}"
+        );
+        // The threshold, so "always delegate" cannot be over-applied to
+        // things that answer in seconds.
+        assert!(
+            live.contains("DELEGATE ANYTHING THAT COMPILES OR RUNS A SUITE"),
+            "{live}"
+        );
+        assert!(
+            live.contains("KEEP ANYTHING THAT ANSWERS IN SECONDS"),
+            "{live}"
+        );
+        // The voice, the route, and the worker's real budget.
+        assert!(live.contains("[worker <job>]"), "{live}");
+        assert!(live.contains("POST /workers"), "{live}");
+        assert!(
+            live.contains("3600s"),
+            "the worker budget is quoted: {live}"
+        );
+        // The landing arm sends carve-out (b) through the lane too.
+        assert!(live.contains("DISPATCH A WORKER to run it"), "{live}");
+        // The inline worktree discipline moved to the worker's own prompt;
+        // restating it here would be the second source.
+        assert!(!live.contains("CHECK OUT WHAT YOU ARE VERIFYING"), "{live}");
+        assert!(!live.contains("run the suite yourself"), "{live}");
+
+        // Off and Shadow both fall back to the inline instructions whole —
+        // a shadowed dispatch runs nothing, so it must not be relied on. (The
+        // authority section may still *name* the route while describing the
+        // shadowed capability; what must be gone is the instruction to lean
+        // on it.)
+        for level in [CharterLevel::Off, CharterLevel::Shadow] {
+            let p = system_prompt(&config, &charter(level));
+            assert!(
+                p.contains("CHECK OUT WHAT YOU ARE VERIFYING"),
+                "{level:?}: {p}"
+            );
+            assert!(
+                !p.contains("DISPATCH A WORKER AND END YOUR TURN"),
+                "{level:?}: {p}"
+            );
+            assert!(!p.contains("[worker <job>]"), "{level:?}: {p}");
+        }
+
+        // And a host that cannot build gets no delegation text however live
+        // the capability — the prompt claims only what the environment has.
+        let bare = system_prompt(
+            &OrchestratorConfig {
+                target_dir: None,
+                ..prompt_config()
+            },
+            &charter(CharterLevel::Live),
+        );
+        assert!(
+            !bare.contains("DISPATCH A WORKER AND END YOUR TURN"),
+            "{bare}"
+        );
     }
 
     /// Carve-out (b) asks whether a passing run **backs** the batch, never
@@ -2989,8 +3564,8 @@ mod tests {
     #[test]
     fn no_landing_arm_describes_verification_as_something_the_build_reported() {
         for level in [CharterLevel::Live, CharterLevel::Shadow, CharterLevel::Off] {
-            for can_verify in [true, false] {
-                let section = landing_section(&landing_charter(level), can_verify);
+            for (can_verify, delegate) in [(true, false), (false, false), (true, true)] {
+                let section = landing_section(&landing_charter(level), can_verify, delegate);
                 for forbidden in [
                     "the build reported",
                     "reported a passing test run",
@@ -3017,8 +3592,8 @@ mod tests {
     #[test]
     fn every_landing_arm_says_a_passing_run_does_not_cover_the_composition() {
         for level in [CharterLevel::Live, CharterLevel::Shadow, CharterLevel::Off] {
-            for can_verify in [true, false] {
-                let section = landing_section(&landing_charter(level), can_verify);
+            for (can_verify, delegate) in [(true, false), (false, false), (true, true)] {
+                let section = landing_section(&landing_charter(level), can_verify, delegate);
                 assert!(
                     section.contains("its own base") || section.contains("its OWN base"),
                     "{level:?}/{can_verify}: {section}"
@@ -3045,8 +3620,8 @@ mod tests {
     #[test]
     fn every_landing_arm_asks_what_ci_said_and_not_only_whether_github_would_refuse() {
         for level in [CharterLevel::Live, CharterLevel::Shadow, CharterLevel::Off] {
-            for can_verify in [true, false] {
-                let section = landing_section(&landing_charter(level), can_verify);
+            for (can_verify, delegate) in [(true, false), (false, false), (true, true)] {
+                let section = landing_section(&landing_charter(level), can_verify, delegate);
                 assert!(
                     section.contains("check"),
                     "{level:?}/{can_verify}: (a) is refusal-only: {section}"
@@ -3078,8 +3653,9 @@ mod tests {
     /// agent looking for one is looking for something that cannot exist.
     #[test]
     fn the_live_arms_say_a_failing_suite_never_became_a_pull_request() {
-        for can_verify in [true, false] {
-            let section = landing_section(&landing_charter(CharterLevel::Live), can_verify);
+        for (can_verify, delegate) in [(true, false), (false, false), (true, true)] {
+            let section =
+                landing_section(&landing_charter(CharterLevel::Live), can_verify, delegate);
             assert!(
                 section.contains("never became a pull request")
                     || section.contains("never becomes a pull request"),
@@ -3093,12 +3669,24 @@ mod tests {
     /// Code refuses to run under a static `Bash(curl:*)` allowlist — so the
     /// safest deployment was the one where nothing could be attributed and
     /// the charter was inert.
+    ///
+    /// The blanket "no `$` anywhere" was a proxy for that, and #1071 is the
+    /// first legitimate `$` this prompt has carried: the shared pipe clause
+    /// names `${PIPESTATUS[0]}`, which is not a credential and is not a
+    /// command the prompt asks be run. So the blanket is kept over everything
+    /// this file writes and the one shared const is excised before the check
+    /// — narrower than deleting the assertion, since a `$FOO` added anywhere
+    /// else still goes red, and the const has its own wording test. Under a
+    /// static allowlist the agent cannot run a pipeline at all, and the clause
+    /// ends on the escape that needs no variable in any case.
     #[test]
     fn the_prompt_asks_for_the_config_file_and_never_a_shell_variable() {
         let p = prompt(4800, &[]);
         assert!(p.contains("-K /data/orchestrator-curl.conf"), "{p}");
+        let own_words = p.replace(crate::prompt::PIPE_EXIT_STATUS, "");
+        assert_ne!(own_words.len(), p.len(), "the clause is spliced in: {p}");
         assert!(
-            !p.contains("TASKS_ACTOR_TOKEN") && !p.contains('$'),
+            !own_words.contains("TASKS_ACTOR_TOKEN") && !own_words.contains('$'),
             "a command with a variable in it is not statically verifiable: {p}"
         );
         // The two things `-K` makes possible to get wrong: pointing it at

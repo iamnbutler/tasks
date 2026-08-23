@@ -18,8 +18,9 @@ use tasks_client::api::models::{
     BuildId, Complexity, GhState, SpecId, SpecQueueStatus, TaskId, TaskState,
 };
 
-use crate::components::{byte_size, status_badge, task_state_color, title_case};
+use crate::components::{byte_size, status_badge, task_state_color};
 use crate::time;
+use crate::vocabulary;
 use crate::workspace::Workspace;
 
 /// Amber: this is not an error and not a success. The build failed, but the
@@ -154,8 +155,33 @@ impl Workspace {
                 .items_start()
                 .gap(px(8.))
                 .child(
+                    // A flex item's automatic minimum size is a MIN_CONTENT
+                    // measure of its content, and gpui's text element answers
+                    // that probe with its whole unwrapped line — so without
+                    // this the row is floored at the entire title on one line
+                    // and `flex_1`'s 0% basis is clamped *up* to that floor.
+                    // `min_w(px(0.))` (CSS `min-width: 0`) drops the floor to
+                    // zero, taffy's final pass then hands the text element a
+                    // definite width, and the same code path wraps it.
+                    //
+                    // `.overflow_hidden()` reaches the same taffy branch and
+                    // is *not* an equivalent fix here: it installs a content
+                    // mask that would clip the second line this exists to
+                    // reveal. That pairing is why every `.truncate()` site in
+                    // this app carries it — it was never about the ellipsis.
+                    //
+                    // The rule, for the next row: in a `flex_row`, a text
+                    // child needs either `min_w(px(0.))` to wrap or
+                    // `overflow_hidden() + truncate()` to ellipsize. The
+                    // default — neither — is the one combination that
+                    // misbehaves, and it misbehaves silently, since nothing
+                    // in the test suite can see it. It is a rule about text
+                    // that can *grow*, not about the shape alone: `rail.rs`'s
+                    // "Tasks" heading is the same shape with a static string
+                    // child and is deliberately left as it is.
                     div()
                         .flex_1()
+                        .min_w(px(0.))
                         .text_lg()
                         .text_color(theme.fg())
                         .child(task.title.clone()),
@@ -181,17 +207,29 @@ impl Workspace {
                 .flex_row()
                 .items_center()
                 .gap(px(6.))
-                .child(status_badge(
-                    title_case(task.state.as_str()),
-                    task_state_color(task.state),
-                ))
-                .child(status_badge(
-                    task.gh_state.as_str().to_string(),
-                    match task.gh_state {
-                        GhState::Open => gpui::hsla(135. / 360., 0.55, 0.52, 1.),
-                        GhState::Closed => gpui::hsla(280. / 360., 0.70, 0.68, 1.),
-                    },
-                ))
+                .child({
+                    // A constant id is correct here: at most one Overview
+                    // header is on screen.
+                    let term = vocabulary::task_state(task.state);
+                    status_badge(
+                        "overview-task-state",
+                        term.label,
+                        term.gloss,
+                        task_state_color(task.state),
+                    )
+                })
+                .child({
+                    let term = vocabulary::gh_state(task.gh_state);
+                    status_badge(
+                        "overview-gh-state",
+                        term.label,
+                        term.gloss,
+                        match task.gh_state {
+                            GhState::Open => gpui::hsla(135. / 360., 0.55, 0.52, 1.),
+                            GhState::Closed => gpui::hsla(280. / 360., 0.70, 0.68, 1.),
+                        },
+                    )
+                })
                 .child(
                     div()
                         .text_xs()

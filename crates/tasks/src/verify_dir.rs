@@ -4,8 +4,8 @@
 //! `ORCHESTRATOR_TARGET_DIR` is a `CARGO_TARGET_DIR` the orchestrator builds
 //! and tests in, shared and long-lived because the warmth is the whole reason
 //! a merge decision can rest on a real test run rather than on a typecheck.
-//! It had no bound and — worse — no *report*: CLAUDE.md said "expect ~7.5 GB
-//! and nothing prunes it", and it was found at 39 GB by a human hunting for
+//! It had no bound and — worse — no *report*: the documentation said "expect
+//! ~7.5 GB and nothing prunes it", and it was found at 39 GB by a human hunting for
 //! disk (#1010), then measured at **51 GB** a week later, growing ~2 GB per
 //! verification.
 //!
@@ -240,6 +240,19 @@ pub struct VerifyDir {
     /// deliberately not switchable**: a directory that grows silently is
     /// exactly what #1010 was.
     budget: Option<u64>,
+    /// Who may touch the directory right now. Read half: a run that builds in
+    /// it (a worker run holds it for its whole job). Write half: the reclaim.
+    ///
+    /// This lock exists because the worker lane (#1053) broke the argument
+    /// that used to make a lock unnecessary — "the orchestrator loop is the
+    /// only thing that starts a process in this directory, so a deletion
+    /// cannot race a compile by construction". With two lanes building here,
+    /// construction no longer covers it, and a deletion racing a compile is
+    /// exactly the failure the old argument existed to rule out. The reclaim
+    /// takes `try_write` and **skips rather than waits** when the lane is
+    /// busy: a worker holds the read half for up to its whole budget, and a
+    /// maintenance pass parked behind it would stall the loop that runs it.
+    lane: tokio::sync::RwLock<()>,
     inner: Mutex<Inner>,
 }
 
@@ -269,12 +282,23 @@ impl VerifyDir {
         Self {
             dir,
             budget,
+            lane: tokio::sync::RwLock::new(()),
             inner: Mutex::new(Inner::default()),
         }
     }
 
     pub fn path(&self) -> &Path {
         &self.dir
+    }
+
+    /// Hold the directory against the reclaim for the duration of a build.
+    ///
+    /// Shared, not exclusive — the worker lane is serial anyway, and what
+    /// this guards against is only the deletion. Await is fine here: the
+    /// write half is only ever taken with `try_write`, so this never parks
+    /// behind a reclaim in progress for longer than the deletion itself.
+    pub async fn share(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.lane.read().await
     }
 
     /// Claim the next walk, if one is due. Claims on the **attempt**.
@@ -317,13 +341,14 @@ impl VerifyDir {
             return None;
         }
         if !may_reclaim {
-            let mut inner = self.inner.lock().expect("verify dir lock");
-            if std::mem::replace(&mut inner.over_announced, true) {
-                return None;
-            }
-            drop(inner);
-            return Some(Notice::OverBudget { reading, budget });
+            return self.announce_over_budget(reading, budget);
         }
+        // A run building in the directory holds the read half; deleting under
+        // it is the race this lock exists for. Skip, not wait — the lane can
+        // stay busy for a whole worker budget, and the next pass retries.
+        let Ok(_lane) = self.lane.try_write() else {
+            return self.announce_over_budget(reading, budget);
+        };
 
         // Tier 1: the per-profile incremental caches. Keyed to one worktree
         // path, so nothing that survives could ever have reused them.
@@ -366,6 +391,17 @@ impl VerifyDir {
             after: after.bytes,
             budget,
         }))
+    }
+
+    /// Say the directory is over budget and not being reclaimed — once per
+    /// stretch over the ceiling, however many passes decline.
+    fn announce_over_budget(&self, reading: Reading, budget: u64) -> Option<Notice> {
+        let mut inner = self.inner.lock().expect("verify dir lock");
+        if std::mem::replace(&mut inner.over_announced, true) {
+            return None;
+        }
+        drop(inner);
+        Some(Notice::OverBudget { reading, budget })
     }
 
     /// What `/status` reports. `None` until the first successful walk —

@@ -600,7 +600,7 @@ mod tests {
     /// The check is deliberately one-directional. The reverse — every variable
     /// the tree reads is documented — is the drift that produced a *known*
     /// live instance while this was being written (`BUILDER_IMAGE` is real and
-    /// missing from CLAUDE.md's table; it is filed as its own issue). It is
+    /// missing from `docs/operating.md`'s table; it is filed as its own issue). It is
     /// not implemented here because "a variable the tree reads" has no
     /// grep-shaped definition: `std::env::var` calls are wrapped, names are
     /// built from constants, and test fixtures set variables no operator ever

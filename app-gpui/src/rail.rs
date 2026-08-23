@@ -21,6 +21,22 @@
 //! drop there would rewrite the rank of work whose place a pull request
 //! already decided.
 //!
+//! **Finished rows sort last, and the header can hide them.** `AwaitingMerge`
+//! is the one band the rail holds whose work is done, and it has no count
+//! ceiling — this pipeline stacks builds routinely — so it accumulates at
+//! whichever end of the list it is put. It sorts after both draggable strata,
+//! and [`clear_finished`] is the header's per-window view filter over it. Two
+//! safety properties hold that control's shape:
+//!
+//! - **It hides rows; it closes nothing.** The label carries its count, the
+//!   tooltip says so outright, the filter is per-window and resets on
+//!   relaunch, and the way back is the same control. "Clear" is the one word
+//!   in this app a person could read as destructive.
+//! - **Hiding a row cannot change a drag payload**, by construction rather
+//!   than by care: [`task_queue_base`] reads `state.tasks` filtered by
+//!   `is_picked_up`, never the displayed rows, so a cleared rail posts the
+//!   same complete order an uncleared one does.
+//!
 //! **Awaiting Feedback is deliberately cross-project** — attention must not
 //! hide behind the switcher — so its rows carry a project prefix instead.
 //! It is the review queue (`spec_queue` pending entries, in rank order);
@@ -72,16 +88,22 @@ fn band(state: TaskState) -> Option<(u8, RailReorder)> {
             1,
             RailReorder::Fixed("A Builder is running — already dispatched, so its place is spent."),
         )),
-        TaskState::AwaitingMerge => Some((
-            2,
-            RailReorder::Fixed("Its pull request is open — the merge decides what happens next."),
-        )),
         TaskState::Queued => Some((3, RailReorder::TaskQueue { group: UP_NEXT })),
         TaskState::ReadyToBuild => Some((
             4,
             RailReorder::TaskQueue {
                 group: READY_TO_BUILD,
             },
+        )),
+        // Strictly **after** `ReadyToBuild`, not level with it: the sort is
+        // stable, so a tie would interleave the awaiting-merge rows among the
+        // ready-to-build ones in whatever order they arrived rather than
+        // putting them last. This is the one band whose work is *finished* —
+        // the implementation exists and a pull request is open — so nobody in
+        // the rail can act on it, and it sat above both draggable strata.
+        TaskState::AwaitingMerge => Some((
+            5,
+            RailReorder::Fixed("Its pull request is open — the merge decides what happens next."),
         )),
         TaskState::InReview | TaskState::Backlog | TaskState::Done | TaskState::Rejected => None,
     }
@@ -121,6 +143,26 @@ pub(crate) fn tree_rows(tasks: &[Task], filter: &ProjectFilter) -> Vec<RailRow> 
         .collect();
     rows.sort_by_key(|(band, _)| *band);
     rows.into_iter().map(|(_, row)| row).collect()
+}
+
+/// The rail's counterpart to `sections/tasks.rs`'s `archive`: split the tree
+/// into what the rail shows and how many of its rows are *finished*.
+///
+/// It **drops rows, never sorts them** — [`tree_rows`] has already decided the
+/// order, and this only filters. The count is of rows that are finished rather
+/// than of rows currently hidden, so the header's number does not move when
+/// the toggle does; and it runs over `tree_rows`' output, so the repo filter is
+/// already applied and the count is the count for the repo on screen.
+pub(crate) fn clear_finished(rows: Vec<RailRow>, show_finished: bool) -> (Vec<RailRow>, usize) {
+    let finished = rows
+        .iter()
+        .filter(|row| row.state == TaskState::AwaitingMerge)
+        .count();
+    let visible = rows
+        .into_iter()
+        .filter(|row| show_finished || row.state != TaskState::AwaitingMerge)
+        .collect();
+    (visible, finished)
 }
 
 /// One Awaiting Feedback row.
@@ -229,9 +271,10 @@ impl Workspace {
 
         // Owned projections first — the rows need `cx` for listeners after
         // the state borrow ends.
-        let (tree, feedback, banner, queue_notice) = {
+        let (tree, feedback, banner, queue_notice, finished_count) = {
             let state = self.app_state.read(cx);
             let tree = tree_rows(&state.tasks, &self.project_filter);
+            let (tree, finished_count) = clear_finished(tree, self.show_finished);
             let feedback = feedback_rows(&state.tasks, &state.spec_queue, &state.projects);
             let queue_notice = state.queue_notice.clone();
 
@@ -259,7 +302,7 @@ impl Workspace {
             } else {
                 None
             };
-            (tree, feedback, banner, queue_notice)
+            (tree, feedback, banner, queue_notice, finished_count)
         };
 
         let all_selected = matches!(self.nav.current(), MiddleView::AllTasks);
@@ -335,6 +378,13 @@ impl Workspace {
                                     .text_color(text_muted)
                                     .child("Tasks"),
                             )
+                            // The finished rows' toggle, immediately left of
+                            // the +. Absent when there is nothing awaiting
+                            // merge, so a rail with none renders exactly as
+                            // it did before.
+                            .when(finished_count > 0, |el| {
+                                el.child(self.render_clear_finished(finished_count, cx))
+                            })
                             // The section's +, per the design — the same
                             // capture surface ⌘N opens.
                             .child(
@@ -394,17 +444,33 @@ impl Workspace {
                             .min_h(px(0.))
                             .overflow_y_scroll()
                             .map(|el| {
-                                if tree.is_empty() {
+                                if !tree.is_empty() {
+                                    el.children(
+                                        tree.into_iter().map(|row| self.render_tree_row(row, cx)),
+                                    )
+                                } else if finished_count > 0 {
+                                    // The catalog's `empty && done_count > 0`
+                                    // arm, for the same reason: a view filter
+                                    // hiding rows that exist is not a pipeline
+                                    // state, and answering it with the
+                                    // pipeline's standing sentence would be a
+                                    // lie about why the rail is empty.
+                                    el.child(
+                                        div()
+                                            .p(px(16.))
+                                            .text_sm()
+                                            .text_color(theme.fg_muted())
+                                            .child(
+                                            "Nothing in flight — every row here is awaiting merge.",
+                                        ),
+                                    )
+                                } else {
                                     el.child(self.render_explanation(
                                         &explanation,
                                         "rail-empty",
                                         false,
                                         cx,
                                     ))
-                                } else {
-                                    el.children(
-                                        tree.into_iter().map(|row| self.render_tree_row(row, cx)),
-                                    )
                                 }
                             }),
                     )
@@ -816,6 +882,70 @@ impl Workspace {
 
     /// The rail composer — a second door into the ⌘N flow, not a new path.
     /// The orchestrator titles and files the issue; this box only drafts.
+    /// The Tasks header's Clear control: "3 open PRs · Clear" /
+    /// "3 open PRs · Show".
+    ///
+    /// The label carries its count on **both** sides of the toggle, and that
+    /// is not decoration — "Clear" is the one word in this app a person could
+    /// read as destructive (closing the PR, closing the issue, abandoning the
+    /// branch), and the count is the receipt. Do not shorten it to a bare
+    /// icon.
+    fn render_clear_finished(
+        &self,
+        finished_count: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let verb = if self.show_finished { "Clear" } else { "Show" };
+        let noun = if finished_count == 1 {
+            "1 open PR".to_string()
+        } else {
+            format!("{finished_count} open PRs")
+        };
+        let hover_bg = theme.surface_secondary();
+
+        div()
+            .id("rail-clear-finished")
+            // The header's "Tasks" label is `flex_1`; this must be `flex_none`
+            // or it fights the label for the slack.
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.))
+            .mr(px(4.))
+            .px(px(5.))
+            .py(px(1.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .role(gpui::Role::Button)
+            .aria_label(format!("{verb} tasks awaiting merge"))
+            .tooltip(tooltip(format!(
+                "{verb} the {noun} awaiting merge — hides the rows in this window; nothing is closed"
+            )))
+            .hover(move |el| el.bg(hover_bg))
+            .text_xs()
+            .on_click(cx.listener(|this, _event, _window, cx| {
+                this.toggle_show_finished(cx);
+            }))
+            .child(div().text_color(theme.fg_muted()).child(noun))
+            .child(div().text_color(theme.fg_muted()).child("·"))
+            .child(div().text_color(theme.fg()).child(verb))
+    }
+
+    /// Flip the rail's finished-row filter.
+    ///
+    /// Deliberately **not** routed through `menus::sync` the way
+    /// [`Workspace::toggle_show_done`] is: there is no `View` item and no
+    /// keybinding behind this one, because the control states its own count in
+    /// the header whenever there is anything to clear — the hidden set
+    /// announces itself where the rows were. Calling `sync_menus` with no menu
+    /// entry to update would be a no-op that reads as a wired one.
+    pub(crate) fn toggle_show_finished(&mut self, cx: &mut Context<Self>) {
+        self.show_finished = !self.show_finished;
+        cx.notify();
+    }
+
     fn render_rail_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let draft = self.rail_input.read(cx).content();
@@ -999,7 +1129,105 @@ mod tests {
             task(9, TaskState::Done),
         ];
         let rows = tree_rows(&tasks, &ProjectFilter::All);
-        assert_eq!(numbers(&rows), [2, 8, 7, 1, 3, 6]);
+        assert_eq!(numbers(&rows), [2, 8, 1, 3, 6, 7]);
+
+        // Pinning the position alone would have passed the mistake this
+        // replaces: the sort is stable, so giving `AwaitingMerge` the same
+        // band as `ReadyToBuild` leaves it *interleaved* among those rows in
+        // arrival order rather than last. The bands must differ strictly.
+        let ready = band(TaskState::ReadyToBuild)
+            .expect("ready to build is in the tree")
+            .0;
+        let awaiting = band(TaskState::AwaitingMerge)
+            .expect("awaiting merge is in the tree")
+            .0;
+        assert!(
+            awaiting > ready,
+            "finished rows must sort strictly after ready-to-build ({awaiting} vs {ready})"
+        );
+        for state in [TaskState::Scouting, TaskState::Building, TaskState::Queued] {
+            let other = band(state).expect("in the tree").0;
+            assert!(
+                awaiting > other,
+                "{state:?} ({other}) vs awaiting ({awaiting})"
+            );
+        }
+    }
+
+    /// The header's Clear drops the finished rows and counts them, and the
+    /// count does not move when the toggle does.
+    #[test]
+    fn clear_drops_the_finished_rows_and_counts_them() {
+        let tasks = [
+            task(1, TaskState::Queued),
+            task(2, TaskState::AwaitingMerge),
+            task(3, TaskState::ReadyToBuild),
+            task(4, TaskState::AwaitingMerge),
+        ];
+        let tree = tree_rows(&tasks, &ProjectFilter::All);
+        let (visible, finished) = clear_finished(tree.clone(), false);
+        assert_eq!(numbers(&visible), [1, 3]);
+        assert_eq!(finished, 2);
+
+        let (visible, finished) = clear_finished(tree, true);
+        assert_eq!(numbers(&visible), [1, 3, 2, 4]);
+        assert_eq!(
+            finished, 2,
+            "the count is of finished rows, not hidden ones"
+        );
+    }
+
+    /// **`Done` is not what "clear" can mean here.** `band` maps `Done` and
+    /// `Rejected` to `None`, so the rail has never shown a done task — a
+    /// change that "hides done tasks from the sidebar" would compile, pass,
+    /// and change nothing on screen.
+    #[test]
+    fn clear_is_about_awaiting_merge_and_not_about_done() {
+        assert!(band(TaskState::Done).is_none());
+        assert!(band(TaskState::Rejected).is_none());
+        let tasks = [
+            task(1, TaskState::Done),
+            task(2, TaskState::Rejected),
+            task(3, TaskState::Queued),
+        ];
+        let tree = tree_rows(&tasks, &ProjectFilter::All);
+        let (visible, finished) = clear_finished(tree, false);
+        assert_eq!(numbers(&visible), [3]);
+        assert_eq!(finished, 0, "nothing here is the control's business");
+    }
+
+    /// It runs over `tree_rows`' output, so the repo filter is already applied
+    /// and the header's number is the number for the repo on screen.
+    #[test]
+    fn the_finished_count_is_the_count_for_the_repo_on_screen() {
+        let tasks = [
+            task_in(1, TaskState::AwaitingMerge, "proj-1"),
+            task_in(2, TaskState::AwaitingMerge, "proj-2"),
+            task_in(3, TaskState::AwaitingMerge, "proj-2"),
+            task_in(4, TaskState::Queued, "proj-2"),
+        ];
+        let scoped = tree_rows(&tasks, &ProjectFilter::One(ProjectId::from_raw("proj-2")));
+        let (visible, finished) = clear_finished(scoped, false);
+        assert_eq!(numbers(&visible), [4]);
+        assert_eq!(finished, 2);
+    }
+
+    /// Hiding rail rows must not change a drag payload — and it does not, by
+    /// construction: the base is `state.tasks` filtered by `is_picked_up`,
+    /// never the displayed rows, so a cleared rail posts the same complete
+    /// order an uncleared one does.
+    #[test]
+    fn clearing_does_not_change_the_reorder_base() {
+        let tasks = [
+            task(1, TaskState::Queued),
+            task(2, TaskState::AwaitingMerge),
+            task(3, TaskState::ReadyToBuild),
+        ];
+        let base = task_queue_base(&tasks);
+        let cleared = clear_finished(tree_rows(&tasks, &ProjectFilter::All), false).0;
+        assert_eq!(numbers(&cleared), [1, 3], "the row is off screen…");
+        assert_eq!(base.len(), 3, "…and still in the payload");
+        assert!(base.contains(&tasks[1].id));
     }
 
     /// The switcher scopes what the tree shows…

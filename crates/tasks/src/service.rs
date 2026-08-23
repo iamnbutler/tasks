@@ -166,6 +166,186 @@ fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Whether a `tasks` typed at a terminal is the one the service runs.
+///
+/// `install` puts the binary at `~/.tasks/bin/tasks` — the right stable home,
+/// and on nobody's `PATH` — so every CLI verb this repository documents still
+/// needs a checkout or a typed path on an installed machine (#991). This is
+/// the diagnosis; the words are [`path_advice_lines`]'.
+///
+/// The case worth the code is [`PathAdvice::Shadowed`]: a checkout's
+/// `target/debug/tasks`, a stale copy or an older install means `tasks status`
+/// answers confidently about a **different** binary than the service is
+/// running. That is a wrong answer rather than a missing one, and it is the
+/// only one of the three states that fails quietly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathAdvice {
+    /// The installed binary is what a shell would run — however it got there.
+    /// A `/usr/local/bin/tasks -> ~/.tasks/bin/tasks` symlink, and the brew
+    /// route (#997), land here, because the comparison canonicalizes: this
+    /// must accommodate the other routes, not compete with them.
+    Resolved,
+    /// No `tasks` on the `PATH` at all. Fails loudly on its own.
+    Absent(PathSuggestion),
+    /// A different `tasks` wins the search.
+    Shadowed {
+        /// What a shell would actually run.
+        other: PathBuf,
+        suggestion: PathSuggestion,
+    },
+}
+
+/// The one line to paste, and where it goes.
+///
+/// Derived from `$SHELL`'s basename rather than written once for every shell:
+/// `export PATH=` is not valid in fish, so a single portable line would be
+/// advice that cannot be followed on the shell that needs it most.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathSuggestion {
+    /// The line itself. Spells `$HOME/.tasks/bin` when the directory is under
+    /// `$HOME` — a line to paste rather than one to translate, and one that
+    /// survives a home that moves.
+    pub line: String,
+    /// The file it goes in, or `None` when we could not tell which shell this
+    /// is. A **guessed** rc file sends somebody editing a file their shell
+    /// never sources, which is worse than silence.
+    pub file: Option<String>,
+}
+
+/// The advice, computed from parameters and nothing else.
+///
+/// Every input is an argument — no environment read inside — so it is testable
+/// the way [`plist_contents`] and [`same_path`] are, and so the caller decides
+/// *whose* environment is being judged. That last part matters: `service
+/// install` is also run by the **app**, whose parent is launchd, whose `PATH`
+/// is not the terminal's.
+pub fn path_advice(bin: &Path, path_var: &str, shell: Option<&str>, home: &Path) -> PathAdvice {
+    let found = resolve_on_path(path_var);
+    match found {
+        Some(other) if same_path(&other, bin) => PathAdvice::Resolved,
+        Some(other) => PathAdvice::Shadowed {
+            other,
+            suggestion: suggest(bin, shell, home),
+        },
+        None => PathAdvice::Absent(suggest(bin, shell, home)),
+    }
+}
+
+/// The first `tasks` a shell would run, walking `PATH` in order.
+///
+/// **The first, and an executable one.** A shell searching `PATH` skips an
+/// entry that exists but is not executable and keeps looking, so testing for a
+/// mere file would report a stray download or a half-copied file as a shadow
+/// when nothing is actually shadowed — a false accusation in the one state
+/// this code exists for. And a later correct entry does not rescue an earlier
+/// wrong one, because that is not what execution does.
+fn resolve_on_path(path_var: &str) -> Option<PathBuf> {
+    path_var
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| Path::new(dir).join("tasks"))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn suggest(bin: &Path, shell: Option<&str>, home: &Path) -> PathSuggestion {
+    let dir = bin.parent().unwrap_or(bin);
+    // `$HOME/.tasks/bin` rather than `/Users/nate/.tasks/bin`: a line to
+    // paste, and one that survives a home that moves.
+    let spelled = match dir.strip_prefix(home) {
+        Ok(rest) => format!("$HOME/{}", rest.display()),
+        Err(_) => dir.display().to_string(),
+    };
+    let basename = shell
+        .and_then(|s| Path::new(s).file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    match basename {
+        // `export PATH=` is not valid fish, so this is the one shell that
+        // needs a different line rather than a different file.
+        "fish" => PathSuggestion {
+            line: format!("fish_add_path {spelled}"),
+            file: Some("~/.config/fish/config.fish".into()),
+        },
+        "zsh" => PathSuggestion {
+            line: format!("export PATH=\"{spelled}:$PATH\""),
+            file: Some("~/.zshrc".into()),
+        },
+        // A macOS terminal window is a login shell, so `.bash_profile` and
+        // not `.bashrc`.
+        "bash" => PathSuggestion {
+            line: format!("export PATH=\"{spelled}:$PATH\""),
+            file: Some("~/.bash_profile".into()),
+        },
+        _ => PathSuggestion {
+            line: format!("export PATH=\"{spelled}:$PATH\""),
+            file: None,
+        },
+    }
+}
+
+/// The advice rendered against *this* process's environment — **empty on
+/// [`PathAdvice::Resolved`]**, so a machine that is already set up says
+/// nothing at all.
+///
+/// Printed rather than acted on, deliberately. `service install` is also run
+/// by the app, whose parent is launchd and whose `PATH` is not the terminal's,
+/// so a spurious suggestion costs a duplicated entry while *acting* would mean
+/// writing to a shell profile on evidence that is not about that shell.
+pub fn path_advice_lines(bin: &Path, home: &Path) -> String {
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    let shell = std::env::var("SHELL").ok();
+    render_path_advice(&path_advice(bin, &path_var, shell.as_deref(), home), bin)
+}
+
+/// The words. Split from [`path_advice`] so the decision is testable without
+/// asserting on prose, and the prose without an environment.
+pub fn render_path_advice(advice: &PathAdvice, bin: &Path) -> String {
+    let (headline, suggestion) = match advice {
+        PathAdvice::Resolved => return String::new(),
+        PathAdvice::Absent(suggestion) => (
+            format!(
+                "`tasks` is installed at {} and is not on your PATH, so typing \
+                 `tasks` in a terminal will not find it.",
+                bin.display()
+            ),
+            suggestion,
+        ),
+        // Both paths, because "add this line" alone does not explain why the
+        // numbers disagreed.
+        PathAdvice::Shadowed { other, suggestion } => (
+            format!(
+                "A different `tasks` is earlier on your PATH ({}), so typed commands \
+                 answer about it rather than about {} — the binary this service runs.",
+                other.display(),
+                bin.display()
+            ),
+            suggestion,
+        ),
+    };
+    let mut out = format!(
+        "\n{headline}\nAdd it to your PATH:\n\n    {}\n",
+        suggestion.line
+    );
+    if let Some(file) = &suggestion.file {
+        out.push_str(&format!("\n(in {file}, then open a new terminal)\n"));
+    }
+    out
+}
+
 /// The `TASKS_DATA_DIR` an installed agent pins — read back out of our own
 /// plist, whose shape [`plist_contents`] owns, so there is no second parser
 /// to drift. `None` for a plist this code did not write, which reads as
@@ -565,6 +745,8 @@ pub async fn status_lines() -> Result<String, ServiceError> {
             }
         ));
     }
+    // Where a human asks "is this set up" — and silent when it is.
+    out.push_str(&path_advice_lines(&paths.bin, &paths.home));
     Ok(out)
 }
 
@@ -593,6 +775,145 @@ pub async fn wait_for_serving(
             )));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[cfg(test)]
+mod path_advice_tests {
+    use super::*;
+
+    /// Write an executable `tasks` into `dir` and return it.
+    fn plant(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("tasks");
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    /// Silent when the installed binary is what a shell would run — and the
+    /// symlink route (`/usr/local/bin/tasks -> ~/.tasks/bin/tasks`, which is
+    /// also what a brew formula would leave) counts, because the comparison
+    /// canonicalizes. This must accommodate the other routes, not compete
+    /// with them.
+    #[test]
+    fn an_installed_binary_on_the_path_is_silent_however_it_got_there() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = ServicePaths::under(home.path());
+        plant(paths.bin.parent().unwrap());
+
+        let direct = paths.bin.parent().unwrap().display().to_string();
+        let advice = path_advice(&paths.bin, &direct, Some("/bin/zsh"), home.path());
+        assert_eq!(advice, PathAdvice::Resolved);
+        assert_eq!(render_path_advice(&advice, &paths.bin), "");
+
+        // …and through a symlink somebody else's route put there.
+        #[cfg(unix)]
+        {
+            let local = home.path().join("usr-local-bin");
+            std::fs::create_dir_all(&local).unwrap();
+            std::os::unix::fs::symlink(&paths.bin, local.join("tasks")).unwrap();
+            let via_link = format!("{}:{direct}", local.display());
+            assert_eq!(
+                path_advice(&paths.bin, &via_link, Some("/bin/zsh"), home.path()),
+                PathAdvice::Resolved,
+                "a symlink to the installed binary is the installed binary"
+            );
+        }
+    }
+
+    /// Absent gets a line and, where the shell is known, a file. An unknown
+    /// shell gets the portable line and **no file**: a guessed rc file sends
+    /// somebody editing a file their shell never sources.
+    #[test]
+    fn an_absent_tasks_suggests_a_line_and_a_file_per_shell() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = ServicePaths::under(home.path());
+
+        let PathAdvice::Absent(zsh) = path_advice(&paths.bin, "", Some("/bin/zsh"), home.path())
+        else {
+            panic!("nothing on an empty PATH");
+        };
+        assert_eq!(zsh.line, "export PATH=\"$HOME/.tasks/bin:$PATH\"");
+        assert_eq!(zsh.file.as_deref(), Some("~/.zshrc"));
+
+        // fish cannot take `export PATH=`, so one line for every shell would
+        // be advice that cannot be followed.
+        let PathAdvice::Absent(fish) =
+            path_advice(&paths.bin, "", Some("/opt/homebrew/bin/fish"), home.path())
+        else {
+            panic!("nothing on an empty PATH");
+        };
+        assert_eq!(fish.line, "fish_add_path $HOME/.tasks/bin");
+        assert_eq!(fish.file.as_deref(), Some("~/.config/fish/config.fish"));
+
+        let PathAdvice::Absent(unknown) = path_advice(&paths.bin, "", None, home.path()) else {
+            panic!("nothing on an empty PATH");
+        };
+        assert!(unknown.line.starts_with("export PATH="));
+        assert_eq!(unknown.file, None, "never guess an rc file");
+    }
+
+    /// The case worth the code: a *different* `tasks` answers confidently
+    /// about a binary the service is not running. The message names both
+    /// paths, because "add this line" alone does not explain why the numbers
+    /// disagreed.
+    #[test]
+    fn another_tasks_earlier_on_the_path_is_a_shadow_not_an_absence() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = ServicePaths::under(home.path());
+        plant(paths.bin.parent().unwrap());
+        let checkout = home.path().join("src/tasks/target/debug");
+        let stale = plant(&checkout);
+
+        let path_var = format!(
+            "{}:{}",
+            checkout.display(),
+            paths.bin.parent().unwrap().display()
+        );
+        let advice = path_advice(&paths.bin, &path_var, Some("/bin/zsh"), home.path());
+        let PathAdvice::Shadowed { other, .. } = &advice else {
+            panic!("the first hit wins, and a later correct entry does not rescue it");
+        };
+        assert!(same_path(other, &stale));
+
+        let words = render_path_advice(&advice, &paths.bin);
+        assert!(words.contains("target/debug"), "{words}");
+        assert!(words.contains(".tasks/bin"), "{words}");
+    }
+
+    /// A `tasks` that exists and is not executable is skipped, exactly as a
+    /// shell skips it — so a stray download or a half-copied file is not
+    /// reported as a shadow, which would be a false accusation in the one
+    /// state this code exists for.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_tasks_is_not_a_shadow() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let paths = ServicePaths::under(home.path());
+        plant(paths.bin.parent().unwrap());
+
+        let downloads = home.path().join("Downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        let dud = downloads.join("tasks");
+        std::fs::write(&dud, b"half a file").unwrap();
+        std::fs::set_permissions(&dud, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let path_var = format!(
+            "{}:{}",
+            downloads.display(),
+            paths.bin.parent().unwrap().display()
+        );
+        assert_eq!(
+            path_advice(&paths.bin, &path_var, Some("/bin/zsh"), home.path()),
+            PathAdvice::Resolved,
+            "a shell skips a non-executable entry and keeps looking"
+        );
     }
 }
 

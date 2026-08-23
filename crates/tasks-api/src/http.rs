@@ -7,7 +7,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::models::{Build, BuildId, Mode, ProjectId, RunKind, SpecId, TaskId};
+use crate::models::{
+    Build, BuildId, Mode, OrchestratorLane, ProjectId, RunKind, SecretName, SpecId, TaskId,
+};
 use crate::version::ImageIdentity;
 
 /// Body of `POST /projects`.
@@ -440,6 +442,26 @@ pub struct SendMessage {
     pub content: String,
 }
 
+/// Body of `POST /workers` — dispatch a worker run onto the host worker lane.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DispatchWorkerRequest {
+    /// Short label naming the job. It heads the report turn
+    /// (`[worker <job>]`), so it is what the report's words are attributed
+    /// to; chosen by the dispatcher, validated by the server.
+    pub job: String,
+    /// The job itself, free text — what to check out, what to run, what to
+    /// report. The worker already knows the host's verification discipline
+    /// (the fixed worktree, the warm build directory, its budgets) from its
+    /// own server-written prompt; this is the half only the dispatcher knows.
+    pub prompt: String,
+    /// Why this job, now. Required of the orchestrator; lands on the
+    /// decision row.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<serde_json::Value>,
+}
+
 /// Body of `POST /agents` — mint an enrollment code for an external agent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnrollAgentRequest {
@@ -568,6 +590,15 @@ pub struct ServerStatus {
     /// reason as the fields above.
     #[serde(default)]
     pub pool: Option<PoolHold>,
+    /// Set for as long as this server's dispatch loops cannot *connect* to
+    /// vm-pool at all — a report rather than a hold, and one that outranks
+    /// `pool` wherever both are rendered. `#[serde(default)]` for the same
+    /// reload-skew reason as the fields above: `reload` decodes the *older*
+    /// server's `/status` with the newer binary, so a required field would
+    /// fail every upgrade past this commit at exactly the step whose job is to
+    /// verify the upgrade.
+    #[serde(default)]
+    pub pool_unreachable: Option<PoolUnreachable>,
     /// Set for as long as scout and build dispatch is being held because the
     /// credential broker is not answering. `#[serde(default)]` for the same
     /// reload-skew reason as the fields above.
@@ -594,6 +625,16 @@ pub struct ServerStatus {
     /// happened yet.
     #[serde(default)]
     pub verify_dir: Option<VerifyDirUsage>,
+    /// Why the orchestrator's turn lane is quiet — **present only when it is
+    /// not open** (#1064).
+    ///
+    /// The hold shape and deliberately not the `verify_dir` shape: a held lane
+    /// is an exception a reader must not miss, and a standing "lane open" row
+    /// is one a reader learns to skip. `#[serde(default)]` for the same
+    /// reload-skew reason as the fields above — `reload` reads `/status` off
+    /// the *older* server before it swaps.
+    #[serde(default)]
+    pub orchestrator_lane: Option<OrchestratorLane>,
 }
 
 /// Why the pipeline is idle when the container runtime is not running.
@@ -717,6 +758,37 @@ pub struct PoolHold {
     /// `VM_POOL_MAX_VMS` that can never dispatch — from `0 of 6`, which is work
     /// or a leak holding every slot.
     pub total: usize,
+}
+
+/// Why nothing is happening when vm-pool is not there at all.
+///
+/// [`PoolHold`]'s sibling and deliberately not a variant of it: capacity is
+/// only askable **down a connection that exists**, so the record above is
+/// silent by construction while the pool is missing, and "the pool is dead"
+/// was left to be inferred from things not dispatching (#991).
+///
+/// It is a *report*, not a seventh dispatch hold: the connection is the gate
+/// already — a dispatch loop with no client cannot start anything — so a hold
+/// would be a second mechanism enforcing what the code's shape enforces.
+///
+/// **Unreachable outranks exhausted, and they share one row wherever both are
+/// rendered.** A capacity record can only have been written down a connection,
+/// so with no connection it is stale by construction; printing both would tell
+/// a reader that a pool nobody can reach also has no free slots, and send them
+/// hunting a leaked VM instead of starting a daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolUnreachable {
+    /// The first failed connect in this run, which later ones do not move.
+    pub since: DateTime<Utc>,
+    /// The most recent failed connect — the gap to now separates an outage a
+    /// dispatch loop is still retrying from a record about to expire.
+    pub last_seen: DateTime<Utc>,
+    /// How many connects have failed since `since`.
+    pub attempts: u32,
+    /// The socket path, because the fix names it.
+    pub socket: String,
+    /// What the last connect said. For the human; nothing decides on it.
+    pub error: String,
 }
 
 /// Why new containers are waiting: an upgrade is half-applied.
@@ -1069,6 +1141,115 @@ pub enum DeviceFlow {
     Refused { message: String, at: DateTime<Utc> },
 }
 
+// --- custody (`/secrets`) ---
+
+/// `POST /secrets/{name}`. The only place a credential appears in the wire
+/// vocabulary at all, and it only ever travels **inbound**: there is no type
+/// here that can carry a value outbound, which is what makes the write-only
+/// property structural rather than a rule somebody remembers.
+///
+/// **No `Debug`, deliberately, and it is the one type here without one.** Most
+/// of this module derives it; a derived `Debug` on the one struct that carries
+/// a credential puts the value one `tracing` field from a log sink, which is
+/// #923 in the client rather than in a VM. Deleting the derive is what makes
+/// that a compile error instead of a review note.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SetSecret {
+    pub value: String,
+}
+
+/// What is *currently* serving a name — which is not the same question as
+/// whether it is sealed.
+///
+/// Four variants rather than a `bool` beside an `Option`: "sealed, but the
+/// environment is what serves it" is a real state (the unseal key moved) and
+/// the one a human most needs to see, and a renderer is forced by the compiler
+/// to answer all four.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SecretSource {
+    /// The sealed store under the data dir. What production should say.
+    Sealed,
+    /// A boot-captured environment variable.
+    Environment { var: String },
+    /// The host's Claude Code `apiKeyHelper` — Anthropic only.
+    ApiKeyHelper { path: String },
+    /// Nothing resolves this name at all.
+    Unset,
+}
+
+impl SecretSource {
+    /// Whether what serves this name is a fallback rather than the store.
+    pub fn is_fallback(&self) -> bool {
+        matches!(
+            self,
+            SecretSource::Environment { .. } | SecretSource::ApiKeyHelper { .. }
+        )
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            SecretSource::Sealed => "the sealed store".into(),
+            SecretSource::Environment { var } => format!("{var} in the environment"),
+            SecretSource::ApiKeyHelper { path } => format!("apiKeyHelper {path}"),
+            SecretSource::Unset => "nothing".into(),
+        }
+    }
+}
+
+/// One name's public metadata. Never a value.
+///
+/// `set_at` and `serving` are independent on purpose: the first is read from
+/// the store file, the second through the live handle. Deriving one from the
+/// other flattens "sealed, but the environment serves it" into a lie whichever
+/// way it falls.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SecretEntry {
+    pub name: SecretName,
+    /// When it was sealed, or `None` if it is not in the store.
+    pub set_at: Option<DateTime<Utc>>,
+    pub serving: SecretSource,
+}
+
+/// `GET /secrets`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SecretsStatus {
+    pub store_path: String,
+    pub initialized: bool,
+    /// Where the unseal key lives, as the store header records it.
+    pub key_source: Option<String>,
+    /// One entry per name in the closed set, always — an absent name is
+    /// `set_at: None`, never a missing row.
+    pub entries: Vec<SecretEntry>,
+}
+
+impl SecretsStatus {
+    pub fn entry(&self, name: SecretName) -> Option<&SecretEntry> {
+        self.entries.iter().find(|e| e.name == name)
+    }
+}
+
+/// `POST /secrets/{name}` 201: this call created the store, so the response
+/// has to say where the unseal key went.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SecretsInitialized {
+    pub store_path: String,
+    pub key_source: String,
+}
+
+/// `POST /secrets/{name}` 200: the write landed and this process cannot read
+/// it back until a restart.
+///
+/// A 2xx and not a 5xx, and that is the whole point of the type: the
+/// ciphertext **is** on disk, and a 5xx renders everywhere as "your paste did
+/// not work", whose obvious human response is to paste again — forever, while
+/// the value was stored correctly every time.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SecretNeedsRestart {
+    pub name: SecretName,
+    pub detail: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AppliedMigration, Viewer};
@@ -1142,4 +1323,43 @@ mod tests {
             "20260815030411_build_transcripts"
         );
     }
+}
+
+/// Body of `POST /orchestrator/interrupt`, `/hold` and `/release` (#1064).
+///
+/// The rationale is **optional**, unlike a `decisions` rationale. Nothing here
+/// is charter-gated — these three decide whether the judge convenes at all,
+/// which is the `build-now` category — so there is no ledger row to leave
+/// unreviewable. It is addressed to whoever reads the feed later, and a human
+/// stopping a turn in a hurry should not have to compose a sentence first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneControlRequest {
+    #[serde(default)]
+    pub rationale: Option<String>,
+}
+
+/// Answer to `POST /orchestrator/interrupt`.
+///
+/// A request that finds **no turn in flight is a 200 saying so**, never a 4xx:
+/// the caller's question is whether the lane is quiet, and it is. The request
+/// is not stored either — see `orchestrator::TurnControl` — so it cannot leak
+/// forward into a turn nobody asked to stop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterruptResponse {
+    /// Whether there was a turn to end.
+    pub interrupted: bool,
+    /// What happened, in the reader's terms — including that an interrupt
+    /// alone re-answers the same input on the next tick, which is *why*
+    /// quieting the lane is two acts.
+    pub detail: String,
+    /// The lane as it stands after the request, so a caller that wanted the
+    /// lane quiet can see in one answer that it is not.
+    pub lane: OrchestratorLane,
+}
+
+/// Answer to `POST /orchestrator/hold` and `POST /orchestrator/release`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneResponse {
+    pub lane: OrchestratorLane,
+    pub detail: String,
 }

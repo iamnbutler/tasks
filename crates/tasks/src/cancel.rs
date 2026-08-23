@@ -276,7 +276,7 @@ mod tests {
     }
 
     /// The deadline still works, and still looks like a deadline: nothing about
-    /// cancellation may quietly rebrand a timeout, which CLAUDE.md and the
+    /// cancellation may quietly rebrand a timeout, which [`crate::deadline`] and the
     /// scout timeout tests pin from the other side.
     #[tokio::test]
     async fn the_budget_still_expires_on_its_own() {

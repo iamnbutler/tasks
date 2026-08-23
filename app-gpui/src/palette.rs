@@ -41,10 +41,10 @@ use gpui::{
 };
 use gpuikit::input::{InputState, SubmitOn};
 use gpuikit::theme::{ActiveTheme, Themeable};
-use tasks_client::api::models::{BuildStatus, TaskId};
+use tasks_client::api::models::TaskId;
 
 use crate::commands::{Command, Facts, Selection, COMMANDS};
-use crate::components::{text_field, title_case};
+use crate::components::text_field;
 use crate::workspace::Workspace;
 
 actions!(
@@ -550,7 +550,12 @@ impl Workspace {
                     PaletteRow {
                         key: format!("task:{}", task.id.as_str()),
                         label,
-                        detail: Some(title_case(task.state.as_str())),
+                        // The label only, deliberately: a palette row is
+                        // keyboard-driven, so a hover definition would never
+                        // be seen, and the pane it navigates to carries the
+                        // gloss. What matters is that the *word* comes from
+                        // one place — see `crate::vocabulary`.
+                        detail: Some(crate::vocabulary::task_state(task.state).label),
                         refusal: None,
                         positions: matched.positions,
                         target: PaletteTarget::Task(task.id.clone()),
@@ -573,7 +578,9 @@ impl Workspace {
                         detail: state
                             .latest_queue_entry(&task.id)
                             .filter(|item| item.entry.spec_id == spec.id)
-                            .map(|item| title_case(item.entry.status.as_str())),
+                            .map(|item| {
+                                crate::vocabulary::spec_queue_status(item.entry.status).label
+                            }),
                         refusal: None,
                         positions: matched.positions,
                         target: PaletteTarget::Spec(task.id.clone()),
@@ -603,7 +610,7 @@ impl Workspace {
                     PaletteRow {
                         key: format!("build:{}", build.id.as_str()),
                         label,
-                        detail: Some(title_case(build_status(build.status))),
+                        detail: Some(crate::vocabulary::build_status(build.status).label),
                         refusal: url.is_none().then(|| "no pull request yet".to_string()),
                         positions: matched.positions,
                         target: PaletteTarget::Build(url),
@@ -792,19 +799,6 @@ impl Workspace {
             .into_any_element();
 
         Some([backdrop, panel])
-    }
-}
-
-/// A build status as the wire spells it. Not `BuildStatus::as_str` because
-/// there isn't one; the mapping is here rather than in a match at the call
-/// site so the row and any future one agree.
-fn build_status(status: BuildStatus) -> &'static str {
-    match status {
-        BuildStatus::Queued => "queued",
-        BuildStatus::Running => "running",
-        BuildStatus::Succeeded => "succeeded",
-        BuildStatus::Failed => "failed",
-        BuildStatus::Cancelled => "cancelled",
     }
 }
 

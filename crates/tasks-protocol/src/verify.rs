@@ -38,8 +38,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// **base** commit and never out of its tip.
 ///
 /// A script rather than a command string: no parser, no schema to version, a
-/// multi-step suite is one file, and it sidesteps the quoting trap CLAUDE.md
-/// documents, where a command split on whitespace shatters `Bash(git log:*)`
+/// multi-step suite is one file, and it sidesteps the quoting trap
+/// `tasks::orchestrator::split_command` documents, where a command split on
+/// whitespace shatters `Bash(git log:*)`
 /// into two permissions that match nothing. Always invoked as `sh <script>` —
 /// the shebang is decorative and the executable bit is deliberately not
 /// consulted, because honouring it would mean two invocation paths that can

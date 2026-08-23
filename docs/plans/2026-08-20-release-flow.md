@@ -3,9 +3,14 @@
 *2026-08-20, written against #997, consuming the artifacts of
 docs/plans/2026-08-19-signing-and-notarization.md (#988, merged). That plan
 deliberately ended at "no tag, no `gh release create`, no asset upload — #997
-owns the release flow and consumes these artifacts." This is that flow. It is
-a design: nothing here has been implemented yet, and the implementation notes
-at the end say what lands and what must not be touched.*
+owns the release flow and consumes these artifacts." This is that flow.*
+
+***Status: implemented** (#997). `scripts/changelog.sh`, the seven Makefile
+targets, the bootstrap `CHANGELOG.md`, the `CLI_ZIP` rename and the inert-version
+comment all landed; nothing has been tagged, because `make publish` delegates to
+`make release` and Apple enrollment (Block B of the signing plan) has not
+completed. Three `[as built]` notes below say where the implementation differs
+from what was designed here.*
 
 ## What a release is
 
@@ -79,14 +84,29 @@ The raw material is already written. This repository's commit subjects are
 sentences — "A broker outage holds dispatch instead of destroying the queue
 (#1006)" — so the changelog job is **selection and assembly, not authorship**.
 
-- **Generation rule**: `git log --first-parent <prev-tag>..HEAD --format=%s` —
+- **Generation rule** *[as built: not `--first-parent`]*: the walk is the full
+  reachable set, keeping a commit when it is either on the first-parent chain or
+  is itself a pull-request merge by subject shape. `--first-parent` alone is
+  wrong on this repository's own history — `28c879e` ("Merge pull request #758
+  from iamnbutler/feat/mac-app") is reachable from `main` and off its
+  first-parent chain, so the bootstrap section would have shipped with the Mac
+  app missing from it. It recurs whenever a build is merged into another build's
+  branch rather than into the trunk, which this pipeline does routinely (the
+  same stacking `POST /pull-requests/{n}/retarget` exists for), and it is what
+  puts the denylist to work: under `--first-parent` those entries matched
+  nothing. What was designed was
+  `git log --first-parent <prev-tag>..HEAD --format=%s` —
   one line per landing on `main`, whether it landed as a merge or a direct
   commit. Subjects of the form `Merge pull request #N from …` are replaced by
   that PR's title (one `gh` call each); pure housekeeping lines are dropped by
   a small stated denylist (`Merge origin/main into …`, `Sweep: work the agent
   left uncommitted`, `Merge remote-tracking branch …`). The script is
-  `scripts/changelog.sh <from> <to>`, deterministic, and testable against a
-  fixture range.
+  `scripts/changelog.sh <from> <to>`, deterministic, and *[as built]* tested
+  against a **synthetic** repository rather than a fixture range: a Scout VM
+  clones `--depth 50`, so a test pinned to real history passes in exactly the
+  two places nobody is watching. The `gh` call is also *[as built]* the
+  **fallback** rather than the rule — GitHub already puts the PR title in the
+  merge commit's body, which is free, offline and un-rate-limitable.
 - **`CHANGELOG.md`**, newest first. Each release is one section:
 
   ```
@@ -219,7 +239,9 @@ Order of operations, gated on Apple enrollment completing:
   `verify-publish`, composite `publish`; the `CLI_ZIP` rename. **The #988
   chain (`release-bundle` through `verify-release`) is consumed, not
   modified.**
-- `CHANGELOG.md` bootstrap section (hand-written, at publish time).
+- `CHANGELOG.md` bootstrap section (hand-written, at publish time). *[as
+  built]* the file ships with its header now; the first `make publish` adds the
+  first section.
 - The `Cargo.toml` inert-version comment.
 - CLAUDE.md: a short bullet under Running for `make publish`, and the
   human-only sentence.

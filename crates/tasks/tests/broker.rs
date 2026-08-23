@@ -13,8 +13,8 @@
 //! this process.
 //!
 //! The scope tests are the load-bearing ones. "A Scout or Builder cannot push
-//! whatever its prompt talks it into" is a sentence in CLAUDE.md; here it is a
-//! 403 with an untouched upstream behind it.
+//! whatever its prompt talks it into" is a sentence in `crates/tasks/src/broker.rs`;
+//! here it is a 403 with an untouched upstream behind it.
 
 use std::sync::{Arc, Mutex};
 
@@ -259,7 +259,7 @@ async fn an_agent_lease_fetches_with_the_hosts_token_injected() {
     );
 }
 
-/// CLAUDE.md: "a Scout or Builder cannot push whatever its prompt talks it
+/// The scope rule: "a Scout or Builder cannot push whatever its prompt talks it
 /// into". Both halves of a smart-HTTP push are refused, and neither reaches
 /// GitHub — the scope is enforcement, not description.
 #[tokio::test]

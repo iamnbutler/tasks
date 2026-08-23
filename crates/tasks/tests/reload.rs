@@ -464,31 +464,27 @@ async fn an_idle_swap_replaces_the_process() {
     cli(dir.path(), &["stop"]).await;
 }
 
-/// The default gate: a 20-minute scout is not destroyed because someone typed
-/// `reload`, and the refusal names both ways forward.
+/// A scout in flight is *reported* and never refused: `resume_in_flight`
+/// re-attaches to every live VM, so the worst a swap costs is one write-off
+/// that charges no attempt. `--force` is not named, because there is no longer
+/// a refusal for it to be the way past.
 #[tokio::test]
-async fn a_scout_in_flight_refuses_the_swap_until_forced() {
+async fn a_scout_in_flight_does_not_refuse_the_swap() {
     let dir = DataDir::new();
     let port = free_port().await;
     let (mut old, before) = start_server(dir.path(), port).await;
     insert_running_session(dir.path()).await;
 
     let (code, stdout, stderr) = cli(dir.path(), &["reload", "--no-build"]).await;
-    assert_eq!(code, 3, "busy has its own exit code\n{stdout}{stderr}");
-    assert!(stderr.contains("1 scout in flight"), "{stderr}");
-    assert!(stderr.contains("--when-idle"), "{stderr}");
-    assert!(stderr.contains("--force"), "{stderr}");
-    // The report showed it, with its age, before refusing.
-    assert!(stdout.contains("scout"), "{stdout}");
-    assert!(
-        pidfile::pid_alive(before.pid),
-        "a refusal must not touch the server"
-    );
-    assert_eq!(fetch_status(port).await.unwrap().pid, before.pid);
-
-    // Told twice, it swaps.
-    let (code, stdout, stderr) = cli(dir.path(), &["reload", "--no-build", "--force"]).await;
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    // Reported, with its age, on the way past.
+    assert!(stdout.contains("1 scout in flight"), "{stdout}");
+    assert!(stdout.contains("--when-idle"), "{stdout}");
+    assert!(
+        !stdout.contains("--force") && !stderr.contains("--force"),
+        "--force is no longer the way past work in flight\n{stdout}{stderr}"
+    );
+
     wait_until_gone(before.pid).await;
     let after = wait_serving(port).await;
     assert_ne!(after.pid, before.pid);
@@ -497,6 +493,160 @@ async fn a_scout_in_flight_refuses_the_swap_until_forced() {
 
     let _ = old.start_kill();
     cli(dir.path(), &["stop"]).await;
+}
+
+/// The pause is proved by the *held command itself* reading `/mode` back —
+/// not by the test process sampling it, which would be testing its own
+/// scheduler. And the mode comes back although the command exited 7, because
+/// the whole reason the child is ours is that its failure must not strand the
+/// hold.
+#[tokio::test]
+async fn a_hold_pauses_for_exactly_as_long_as_its_command_runs() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut server, _) = start_server(dir.path(), port).await;
+    set_mode(port, Mode::Play).await;
+
+    let seen = dir.path().join("mode-during");
+    let script = dir.path().join("held.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncurl -sS localhost:{port}/mode > {}\nexit 7\n",
+            seen.display()
+        ),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = cli(
+        dir.path(),
+        &[
+            "hold",
+            "--label",
+            "a test",
+            "--",
+            "sh",
+            script.to_str().unwrap(),
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 7, "the child's status, verbatim\n{stdout}{stderr}");
+    let during = std::fs::read_to_string(&seen).unwrap();
+    assert!(
+        during.contains("pause"),
+        "the command ran with dispatch held: {during}"
+    );
+    assert!(stdout.contains("a test"), "the label is echoed: {stdout}");
+    assert!(
+        stdout.contains("dispatch is playing again"),
+        "and the mode came back although the child failed: {stdout}"
+    );
+    assert_eq!(fetch_status(port).await.unwrap().mode, Mode::Play);
+
+    // Both edges are on the feed, so an hour later something says why the
+    // mode moved twice.
+    let notes = drain_notes(dir.path()).await;
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("`tasks hold`") && n.contains("host command")),
+        "the pause edge: {notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("`tasks hold`") && n.contains("back to play")),
+        "the restore edge: {notes:?}"
+    );
+
+    let _ = server.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// A scout in flight is not waited for and not cancelled: what a rebuild can
+/// spoil is a run dispatched *into* it, and one that started earlier is not
+/// that case.
+#[tokio::test]
+async fn a_hold_neither_waits_for_nor_cancels_a_running_scout() {
+    let dir = DataDir::new();
+    let port = free_port().await;
+    let (mut server, _) = start_server(dir.path(), port).await;
+    let session = insert_running_session(dir.path()).await;
+
+    let (code, stdout, stderr) = cli(dir.path(), &["hold", "--", "true"]).await;
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    let status = fetch_status(port).await.unwrap();
+    assert!(
+        status
+            .in_flight
+            .scouts
+            .iter()
+            .any(|s| s.id == session.to_string()),
+        "the scout is still running: {:?}",
+        status.in_flight
+    );
+
+    let _ = server.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// With nothing serving the command still runs — a gate that only worked on a
+/// host that happens to be serving would be no gate at all — and a pipeline
+/// that was not playing is left exactly as it is rather than promoted.
+#[tokio::test]
+async fn a_hold_runs_the_command_whatever_state_the_host_is_in() {
+    let dir = DataDir::new();
+    let (code, stdout, stderr) = cli(dir.path(), &["hold", "--", "true"]).await;
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("not serving"), "{stdout}");
+
+    let port = free_port().await;
+    let (mut server, _) = start_server(dir.path(), port).await;
+    set_mode(port, Mode::Stop).await;
+    let (code, stdout, stderr) = cli(dir.path(), &["hold", "--", "false"]).await;
+    assert_eq!(code, 1, "still the child's status\n{stdout}{stderr}");
+    assert_eq!(
+        fetch_status(port).await.unwrap().mode,
+        Mode::Stop,
+        "`stop` is tighter than `pause`; restoring it would turn intake back on"
+    );
+
+    let _ = server.start_kill();
+    cli(dir.path(), &["stop"]).await;
+}
+
+/// Flags are read only ahead of `--`; everything after it is the command,
+/// verbatim, including its own flags.
+#[tokio::test]
+async fn a_holds_flags_stop_at_the_double_dash() {
+    let dir = DataDir::new();
+    let out = dir.path().join("argv");
+    let script = dir.path().join("argv.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\necho \"$@\" > {}\n", out.display()),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = cli(
+        dir.path(),
+        &[
+            "hold",
+            "--",
+            "sh",
+            script.to_str().unwrap(),
+            "--label",
+            "-j4",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "--label -j4");
+
+    // And nothing to run is a usage error rather than a silent hold.
+    let (code, _, stderr) = cli(dir.path(), &["hold", "--"]).await;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("nothing to run"), "{stderr}");
 }
 
 /// `--when-idle` pauses dispatch (without which the wait never terminates),
@@ -868,8 +1018,11 @@ async fn stop_when_idle_waits_for_the_drain_and_leaves_dispatch_paused() {
         stdout.contains(&format!("stopped pid {}", status.pid)),
         "{stdout}"
     );
-    // The one lasting consequence is the last thing said, with its undo.
-    assert!(stdout.contains("dispatch is left paused"), "{stdout}");
+    // What waiting left the mode at is the last thing said — a report and not
+    // a debt, since a boot overwrites the stored mode from TASKS_DEFAULT_MODE
+    // before the listener binds. The `curl` is for a server already back up.
+    assert!(stdout.contains("nothing put it back"), "{stdout}");
+    assert!(stdout.contains("TASKS_DEFAULT_MODE"), "{stdout}");
     assert!(stdout.contains("/mode"), "{stdout}");
 
     assert!(!pidfile::pid_alive(status.pid));

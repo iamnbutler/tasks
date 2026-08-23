@@ -11,12 +11,17 @@
 //! lenient fallback. Version skew between a dev client and a dev server is
 //! a build error here, on purpose.
 
-//! One module here is not a wire type: `paths` is the filesystem record a
-//! server publishes about itself (`<data dir>/tasks.pid`). It lives here for
-//! the same reason the rest does — the server writes it and more than one
-//! client reads it, so there is one definition rather than a copy per client.
+//! Two modules here are not wire types, for one reason. `paths` is the
+//! filesystem record a server publishes about itself
+//! (`<data dir>/tasks.pid`), and `first_play` is the record that a human has
+//! been told what `play` does on this install (`<data dir>/first-play.json`)
+//! plus the grouping of the charter that sheet renders. Both live here because
+//! more than one client reads them, so there is one definition rather than a
+//! copy per client — and because `app-gpui` is not a workspace member, so a
+//! rule left in the app is a rule `make test` never runs.
 
 pub mod events;
+pub mod first_play;
 pub mod http;
 pub mod models;
 pub mod paths;

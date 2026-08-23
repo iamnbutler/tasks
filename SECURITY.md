@@ -60,7 +60,7 @@ These are known, documented and deliberate. Reporting one is welcome as an
   `<img src>`/`<script src>`, so a cross-site load of a loopback `GET` passes
   both loopback rules. The residual is bounded to responses the attacker
   cannot read and effects that are server-side; the two non-nil routes are
-  named in `CLAUDE.md`.
+  named in `crates/tasks/src/loopback.rs`.
 
 ## There is no embargo process, because there is no release train
 

@@ -55,8 +55,10 @@ TEST_BIN_DIR := $(abspath $(CARGO_TARGET_DIR)/debug)
         server-release dist-install dist \
         check-signing check-notary release-bundle sign notarize dmg \
         notarize-dmg verify-release check-clean-tree release release-clean \
+        check-publish changelog tag push gh-release verify-publish publish \
         app-check app-stubs app-test \
-        server serve restart status stop drain resume check-quiesced \
+        server serve restart status stop drain resume \
+        images-rebuild \
         migration verify-warm site-check
 
 # Extra flags for the reload targets: `make restart RELOAD=--when-idle`.
@@ -173,6 +175,19 @@ app-stop:
 # assertion with nothing behind it, one level out. Copied here rather than in
 # `dist-install` because `make app` is a redistribution too the moment anyone
 # hands the bundle over.
+#
+# The AppIcon.icns copy and Info.plist.in's CFBundleIconFile are two halves of
+# one change (#986): either alone leaves the app drawing the generic blank, and
+# macOS warns about neither. One line here covers every bundle — `release-bundle`
+# runs this same target with APP_BUNDLE overridden, so `make dist` and `make
+# release` inherit it, and `codesign` seals whatever is in Resources without
+# being told about it. Do NOT add a second copy aimed at dist/: that is how the
+# signed download comes to differ from the bundle that was tested, which is what
+# the comment on `release-bundle` already refuses.
+#
+# No CI runner executes this recipe — it is check-darwin gated — so nothing
+# would notice it going missing. `crates/tasks/tests/app_icon.rs` is the guard,
+# and it lives in the workspace precisely because this one cannot be run.
 app-install: check-darwin
 	@bundle="$(APP_BUNDLE)"; \
 	if [ "$$bundle" = "$(APP_BUNDLE_DEFAULT)" ]; then \
@@ -187,6 +202,7 @@ app-install: check-darwin
 	sed -e 's/@VERSION@/$(APP_VERSION)/' -e 's/@COMMIT@/$(APP_COMMIT)/' \
 		app-gpui/Info.plist.in > "$$bundle/Contents/Info.plist"; \
 	cp -R app-gpui/third-party "$$bundle/Contents/Resources/third-party"; \
+	cp app-gpui/AppIcon.icns "$$bundle/Contents/Resources/AppIcon.icns"; \
 	echo "installed $$bundle ($(APP_VERSION), $(APP_COMMIT))"
 
 # Build and install, exactly as `make app` always did.
@@ -267,7 +283,10 @@ dist:
 DIST_DIR := $(abspath dist)
 RELEASE_BUNDLE := $(DIST_DIR)/Tasks.app
 DMG := $(DIST_DIR)/Tasks-$(BUILD_VERSION).dmg
-CLI_ZIP := $(DIST_DIR)/tasks-$(BUILD_VERSION)-macos-arm64.zip
+# `tasks-server-`, not `tasks-`: the binary inside is the server/daemon, and
+# `tasks-<v>-macos-arm64.zip` is ambiguous about what it contains (the whole
+# system? the client?). Free to rename now and expensive once a release exists.
+CLI_ZIP := $(DIST_DIR)/tasks-server-$(BUILD_VERSION)-macos-arm64.zip
 
 # Empty on purpose: there is no default that could be right, and a wrong
 # default would sign with somebody else's certificate or fall through to an
@@ -452,7 +471,8 @@ verify-release: check-darwin
 
 # A release names a commit — #997 tags them v0.1.<commit count>, the same
 # number BUILD_VERSION already carries — so a dirty tree makes the tag a lie.
-# FORCE=1 overrides, matching the `make images` convention.
+# FORCE=1 overrides, the escape-hatch convention this Makefile uses wherever a
+# recipe would otherwise refuse.
 check-clean-tree:
 	@if [ -n "$(FORCE)" ]; then \
 		echo "FORCE=$(FORCE): releasing a dirty tree; $(BUILD_VERSION) will not name what shipped"; \
@@ -486,6 +506,190 @@ release:
 # $(APP_BUNDLE_DEFAULT) and is untouched by this.
 release-clean:
 	rm -rf $(DIST_DIR)
+
+# ---------------------------------------------------------------------------
+# Cutting a release (#997). `make publish` is the whole act; every stage below
+# is also its own target, because a notarization retry must not regenerate the
+# changelog and a failed upload must not re-notarize.
+#
+# The #988 chain (release-bundle .. verify-release) is CONSUMED, not modified.
+#
+# A release is a human act — the `build-now` / `POST /projects` category — and
+# it is structurally human-only for now by there being no API route at all.
+#
+# The version arithmetic lives in exactly one place, and it is not here:
+# `scripts/changelog.sh --next-version`. The changelog commit is inside its own
+# release, so the version is one past what HEAD counts today — two copies of
+# that off-by-one is how one of them gets fixed alone.
+#
+# PUBLISH_VERSION is expanded on EVERY make invocation, including `make
+# test-ci` inside a Builder VM with no network and an unauthenticated `gh`.
+# `--next-version` is one `git rev-list` and touches neither, and it prints
+# nothing rather than failing when it cannot answer — `check-publish` refuses
+# on the empty result, where a shell error would break every target in the
+# tree. `crates/tasks/tests/changelog.rs` pins both halves of that.
+PUBLISH_VERSION := $(shell bash scripts/changelog.sh --next-version)
+CHANGELOG := CHANGELOG.md
+# Staged in dist/, which is gitignored (and unanchored, so it is never
+# committed). Deliberately NOT named after a version: PUBLISH_VERSION and
+# BUILD_VERSION both move across the changelog commit, and every stage after it
+# has to find the same file. `release-clean` would remove it and is not part of
+# `publish`; `release`'s own sub-targets only rm the bundle and the submission
+# staging, so the notes survive from `changelog` through to `gh-release`.
+RELEASE_NOTES := $(DIST_DIR)/release-notes.md
+# `make publish HEADLINE="One or two sentences."` — optional; the bullets stand
+# alone.
+HEADLINE ?=
+
+# Refusals, cheapest first. Nothing here changes anything.
+#
+# The dirty-tree check is a SECOND copy of `check-clean-tree`, which `release`
+# already carries, and that is deliberate: this one has to refuse *before* the
+# changelog commit, which is several stages earlier. Do not delete either as
+# redundant.
+#
+# One limit, stated rather than papered over: the check runs are read for the
+# CURRENT HEAD, and `changelog` then commits on top of it — so the commit that
+# gets tagged and pushed is one no CI run has ever seen. That is accepted
+# rather than fixed, because the alternative does not exist: check runs for an
+# unpushed commit are unconditionally absent, so a re-read after the commit
+# would refuse every release. What bounds it is that the commit is
+# changelog-only, and `make release` builds every artifact locally from it.
+check-publish:
+	@command -v gh >/dev/null 2>&1 || { \
+		echo "gh is not installed; a release is cut with it."; \
+		echo "  brew install gh && gh auth login"; exit 1; }
+	@gh auth status >/dev/null 2>&1 || { \
+		echo "gh is not authenticated."; echo "  gh auth login"; exit 1; }
+	@[ -n "$(PUBLISH_VERSION)" ] || { \
+		echo "scripts/changelog.sh --next-version came back empty; refusing to"; \
+		echo "cut a release with no number."; \
+		echo "  bash scripts/changelog.sh --next-version   # see what it says"; \
+		exit 1; }
+	@git diff --quiet && git diff --cached --quiet || { \
+		echo "uncommitted changes; a release names a commit and this tree is not one."; \
+		echo "  git status        # then commit or stash"; exit 1; }
+	@git fetch --quiet origin main || { echo "could not fetch origin/main"; exit 1; }
+	@[ "$$(git rev-parse HEAD)" = "$$(git rev-parse origin/main)" ] || { \
+		echo "HEAD is not origin/main. rev-list --count is monotone along one"; \
+		echo "branch and meaningless across two, so a release cut from a side"; \
+		echo "branch can collide with a later main count."; \
+		echo "  git checkout main && git pull"; exit 1; }
+	@if git rev-parse -q --verify "refs/tags/v$(PUBLISH_VERSION)" >/dev/null; then \
+		echo "tag v$(PUBLISH_VERSION) already exists locally; tags are never moved."; \
+		exit 1; fi
+	@if [ -n "$$(git ls-remote --tags origin "refs/tags/v$(PUBLISH_VERSION)" 2>/dev/null)" ]; then \
+		echo "tag v$(PUBLISH_VERSION) already exists on origin; tags are never moved."; \
+		exit 1; fi
+	@sha=$$(git rev-parse HEAD); \
+	runs=$$(gh api "repos/{owner}/{repo}/commits/$$sha/check-runs" \
+		--jq '.check_runs[] | "\(.status) \(.conclusion) \(.name)"' 2>/dev/null); \
+	if [ -z "$$runs" ]; then \
+		echo "no check runs on $$sha. A release must not race the suite, and"; \
+		echo "'nothing ran' refuses exactly as red does."; \
+		echo "  gh run list --commit $$sha"; exit 1; fi; \
+	bad=$$(printf '%s\n' "$$runs" | grep -v '^completed \(success\|neutral\|skipped\) '); \
+	if [ -n "$$bad" ]; then \
+		echo "CI is not green on $$sha — 'still running' refuses the same as red:"; \
+		printf '  %s\n' "$$bad"; \
+		echo "  gh run list --commit $$sha"; exit 1; fi
+	@echo "ready to publish v$(PUBLISH_VERSION) from $$(git rev-parse --short HEAD)"
+
+# Write the section, stage it in dist/ for `gh-release`, insert it into
+# CHANGELOG.md and commit.
+#
+# Inserted before the FIRST `## v` heading rather than at a fixed line offset:
+# CHANGELOG.md opens with prose about the numbering, and a `head -n 2` prepend
+# would bury it under the newest release. With no `## v` yet it appends, which
+# is right for the bootstrap.
+changelog:
+	@[ -n "$(PUBLISH_VERSION)" ] || { echo "no version; run make check-publish"; exit 1; }
+	@mkdir -p $(DIST_DIR)
+	@prev=$$(git describe --tags --abbrev=0 --match 'v0.1.*' 2>/dev/null); \
+	CHANGELOG_VERSION="$(PUBLISH_VERSION)" CHANGELOG_HEADLINE="$(HEADLINE)" \
+		bash scripts/changelog.sh "$$prev" HEAD > "$(RELEASE_NOTES)" || exit 1; \
+	[ -s "$(RELEASE_NOTES)" ] || { echo "changelog.sh wrote nothing"; exit 1; }
+	@awk -v notes="$(RELEASE_NOTES)" ' \
+		!done && /^## v/ { while ((getline line < notes) > 0) print line; print ""; done=1 } \
+		{ print } \
+		END { if (!done) { print ""; while ((getline line < notes) > 0) print line } }' \
+		"$(CHANGELOG)" > "$(CHANGELOG).new" && mv "$(CHANGELOG).new" "$(CHANGELOG)"
+	git add "$(CHANGELOG)"
+	git commit -m "Release v$(PUBLISH_VERSION)"
+	@echo "wrote $(CHANGELOG) and $(RELEASE_NOTES) for v$(PUBLISH_VERSION)"
+
+# From here on the stamp is the version: `changelog` committed, so
+# BUILD_VERSION — re-derived by this sub-make against the new HEAD — now equals
+# what PUBLISH_VERSION was before it. `BUILD_VERSION := ...` is expanded at
+# parse time, so within ONE make invocation it would be stale the moment
+# `changelog` commits; only the sub-make structure of `publish` below saves it.
+#
+# The guard is that rule enforced rather than documented: the tag refuses
+# unless CHANGELOG.md's newest `## v` heading is the stamp it is about to tag,
+# which catches the off-by-one in both directions.
+tag:
+	@newest=$$(grep -m1 '^## v' "$(CHANGELOG)" | sed -e 's/^## v//' -e 's/ .*//'); \
+	if [ "$$newest" != "$(BUILD_VERSION)" ]; then \
+		echo "CHANGELOG.md's newest section is v$$newest but the stamp is $(BUILD_VERSION)."; \
+		echo "The tag names a commit and the changelog names a release; if those"; \
+		echo "two disagree, one of them is off by one. Run make changelog first."; \
+		exit 1; fi
+	@[ -s "$(RELEASE_NOTES)" ] || { \
+		echo "no release notes at $(RELEASE_NOTES); run make changelog"; exit 1; }
+	git tag -a "v$(BUILD_VERSION)" -F "$(RELEASE_NOTES)"
+	@echo "tagged v$(BUILD_VERSION) at $$(git rev-parse --short HEAD)"
+
+# Both refs in one command: a rejected main push (someone merged under us)
+# must leave no orphaned tag behind. The recovery is then honest and cheap —
+# reset the changelog commit and start over against the new HEAD. Nothing has
+# been published at this point.
+push:
+	git push --atomic origin main "v$(BUILD_VERSION)"
+
+gh-release:
+	@[ -s "$(RELEASE_NOTES)" ] || { \
+		echo "no release notes at $(RELEASE_NOTES); run make changelog"; exit 1; }
+	@[ -f "$(DMG)" ] || { echo "no $(DMG); run make release"; exit 1; }
+	@[ -f "$(CLI_ZIP)" ] || { echo "no $(CLI_ZIP); run make release"; exit 1; }
+	gh release create "v$(BUILD_VERSION)" \
+		--title "v$(BUILD_VERSION)" \
+		--notes-file "$(RELEASE_NOTES)" \
+		"$(DMG)#Tasks for macOS (client)" \
+		"$(CLI_ZIP)#Tasks server for macOS (Apple silicon)"
+	@echo "published v$(BUILD_VERSION)"
+
+# The assets are what a stranger downloads, so the check is a download: a
+# non-200 or a zero-byte body fails. `gh release view` alone would only prove
+# the release object exists.
+verify-publish:
+	@for name in "$$(basename "$(DMG)")" "$$(basename "$(CLI_ZIP)")"; do \
+		url=$$(gh release view "v$(BUILD_VERSION)" \
+			--json assets --jq ".assets[] | select(.name==\"$$name\") | .url"); \
+		[ -n "$$url" ] || { echo "$$name is not attached to v$(BUILD_VERSION)"; exit 1; }; \
+		bytes=$$(curl -sSL -o /dev/null -w '%{http_code} %{size_download}' "$$url") || exit 1; \
+		code=$${bytes%% *}; size=$${bytes##* }; \
+		[ "$$code" = "200" ] || { echo "$$name: HTTP $$code"; exit 1; }; \
+		[ "$$size" -gt 0 ] || { echo "$$name: zero bytes"; exit 1; }; \
+		echo "$$name: $$code, $$size bytes"; \
+	done
+	@echo "verified the assets of v$(BUILD_VERSION)"
+
+# Sub-makes rather than prerequisites, as everywhere else in this file — and
+# here it is load-bearing twice over: `make -j` gives prerequisites no ordering
+# at all, and each stage has to RE-PARSE the Makefile so BUILD_VERSION is
+# re-derived against the HEAD `changelog` just created.
+#
+# Nothing public happens until the artifacts are verified: build, sign,
+# notarize, staple, verify, and only then tag, push, upload. A failed
+# notarization retries without un-tagging anything, because no tag exists yet.
+publish:
+	@$(MAKE) --no-print-directory check-publish
+	@$(MAKE) --no-print-directory changelog
+	@$(MAKE) --no-print-directory release
+	@$(MAKE) --no-print-directory tag
+	@$(MAKE) --no-print-directory push
+	@$(MAKE) --no-print-directory gh-release
+	@$(MAKE) --no-print-directory verify-publish
 # ---------------------------------------------------------------------------
 
 # Build, stop, install, launch — in that order, and each step is where it is
@@ -602,11 +806,11 @@ status: server
 stop: server
 	@$(TASKS_BIN) stop $(STOP)
 
-# Quiesce the pipeline for host work this repo's own tooling has to do to the
-# machine rather than to the server: restarting vm-pool (the successor stops
-# its predecessor's containers off the orphan ledger) and `make images`.
-# Neither is something `tasks reload` covers, because a reload re-attaches to
-# every live VM and these do not.
+# Quiesce the pipeline for the one host act with no recovery: restarting
+# vm-pool on the same socket, where the successor stops its predecessor's
+# containers off the orphan ledger. `tasks reload` does not need this (a reload
+# re-attaches to every live VM) and neither does `make images` any more — that
+# wraps `tasks hold`, which holds for the rebuild's own duration.
 #
 # `make drain DRAIN=--cancel-scouts` stops running scouts instead of waiting
 # them out. The hold outlives the command: `make resume` is what gives it back.
@@ -615,23 +819,6 @@ drain: server
 
 resume: server
 	@$(TASKS_BIN) resume
-
-# The gate `make images` runs before it rebuilds anything, and the reason it
-# is not merely advisory: a scout dispatched while the rebuild is in flight
-# starts in the OLD image — the #909 staleness the update hold exists to
-# prevent, and the one case it cannot see, since the identity it reads is only
-# ever observed from a run that has already started.
-#
-# It passes with nothing serving (no dispatcher, nothing that can start a
-# container), and refuses a *playing* pipeline even with nothing in flight,
-# because the dispatcher tops scouts up on its next tick. FORCE=1 is the
-# escape hatch for someone who knows better.
-check-quiesced: server
-	@if [ -n "$(FORCE)" ]; then \
-		echo "FORCE=$(FORCE): skipping the drain check"; \
-	else \
-		$(TASKS_BIN) drain --check; \
-	fi
 
 # Prime the orchestrator's verification build directory, so the first merge
 # decision it makes is not also the first cold build.
@@ -772,12 +959,28 @@ image-builder: image-agent builder-supervisor-linux
 	container build -t builder:v1 images/builder
 	rm -f images/builder/builder-supervisor
 
+# The rebuild, wrapped in a hold rather than gated on a human.
+#
+# What a rebuild can actually spoil is a run DISPATCHED INTO it: that one
+# starts in the OLD image — the #909 staleness the update hold exists to
+# prevent and the one case it cannot see, since the identity it reads is only
+# ever observed from a run that has already started. A run that started
+# earlier is not that case, so there is nothing here to wait for.
+#
+# `tasks hold` pauses dispatch, runs the sub-make as its own child, and puts
+# the mode back the instant that child exits — success, failure or Ctrl-C —
+# exiting with its status. A parent process rather than two recipe lines,
+# because a `make` that died between a `tasks drain` and a `tasks resume`
+# would leave the pipeline paused with nothing left running that knows to undo
+# it. That is why `images-rebuild` exists as a target: `hold` needs exactly one
+# command to be the parent of.
+images: server
+	@$(TASKS_BIN) hold --label 'make images' -- $(MAKE) --no-print-directory images-rebuild
+
 # Sub-makes rather than prerequisites, for the reason `app`, `run` and
 # `images-check` already give: `make -j` gives prerequisites no ordering at
-# all, and every property of this sequence is an ordering. The gate has to run
-# *before* the build, or it is checking the state the rebuild already raced.
-images:
-	@$(MAKE) --no-print-directory check-quiesced
+# all, and every property of this sequence is an ordering.
+images-rebuild:
 	@$(MAKE) --no-print-directory image-scout
 	@$(MAKE) --no-print-directory image-builder
 	@$(MAKE) --no-print-directory images-check

@@ -126,7 +126,8 @@ impl BuilderError {
             // finished, whereas this one means the host stopped being able to
             // observe the run at all. It recurs for a structural reason —
             // vm-pool is a separate long-lived daemon, upgraded separately
-            // and, per CLAUDE.md, restarted *ahead* of this server — so every
+            // and, per `docs/operating.md`, restarted *ahead* of this server —
+            // so every
             // vm-pool restart that caught a build in flight used to charge
             // the whole batch, and three of them `blocked` specs that had
             // never failed to build.
@@ -1131,8 +1132,16 @@ fn render_prompt(batch: &[BatchItem], directions: Option<&Directions>, budget: D
          one chance to fix it and then the build fails with no pull request, \
          so getting there first is entirely in your interest. It reads that \
          script out of the build's BASE commit, so editing it changes nothing \
-         about what runs.\n",
+         about what runs.\n\n\
+         {pipe_clause}\n",
         budget_mins = budget.as_secs() / 60,
+        // After the supervisor's-suite paragraph, which is the verification
+        // discussion in this prompt. Worth saying *because* that backstop
+        // exists rather than despite it: the structured `Verification` status
+        // covers the final verdict, and every ad-hoc command the agent runs on
+        // the way there is still read by the agent, which is where the belief
+        // it writes into `SUMMARY.md` is formed.
+        pipe_clause = crate::prompt::PIPE_EXIT_STATUS,
     ));
     out
 }
@@ -1468,6 +1477,18 @@ mod tests {
                 scout_directions: None,
             },
         )
+    }
+
+    /// #1071. Worth saying to a Builder *because* the supervisor's suite run
+    /// exists rather than despite it: that backstop covers the final verdict,
+    /// and every ad-hoc command the agent runs on the way there is still read
+    /// by the agent, which is where the belief it writes into `SUMMARY.md` is
+    /// formed.
+    #[test]
+    fn the_build_prompt_says_a_pipe_reports_the_pipes_exit_status() {
+        let batch = vec![item(7, "First thing", "do it")];
+        let prompt = render_prompt(&batch, None, Duration::from_secs(3600));
+        assert!(prompt.contains(crate::prompt::PIPE_EXIT_STATUS), "{prompt}");
     }
 
     /// #962's sibling: the Builder prompt has the same shape and the same

@@ -17,8 +17,9 @@ use gpui::{div, px, AnyElement, Context};
 use gpuikit::theme::{ActiveTheme, Themeable};
 use tasks_client::api::models::{Build, BuildStatus, TaskState, Verification, VerificationStatus};
 
-use crate::components::{status_badge, task_state_color, title_case};
+use crate::components::{status_badge, task_state_color};
 use crate::time;
+use crate::vocabulary;
 use crate::workspace::Workspace;
 
 /// How the Changes tab renders a build's verification.
@@ -200,10 +201,17 @@ impl Workspace {
                     .flex_row()
                     .items_center()
                     .gap(px(8.))
-                    .child(status_badge(
-                        title_case(build.status.as_str()),
-                        task_state_color(TaskState::Building),
-                    ))
+                    .child({
+                        // A constant id: at most one build card header is on
+                        // screen at a time.
+                        let term = vocabulary::build_status(build.status);
+                        status_badge(
+                            "build-card-status",
+                            term.label,
+                            term.gloss,
+                            task_state_color(TaskState::Building),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()

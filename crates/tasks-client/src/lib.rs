@@ -26,14 +26,55 @@ use tasks_api::http::{
     BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelAllResponse, CancelRunRequest,
     CaptureIssue, CloseTaskRequest, CreateProject, DeviceFlowStatus, ErrorResponse, ModeResponse,
     RejectedBundle, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, ReviewRequest, ScoutRequest,
-    SendMessage, ServerStatus, SetCharter, SetMode, SetProjectStatus, Viewer,
+    SecretsStatus, SendMessage, ServerStatus, SetCharter, SetMode, SetProjectStatus, SetSecret,
+    Viewer,
 };
 use tasks_api::models::{
     Build, BuildId, Capability, CharterEntry, CharterLevel, CloseReason, Mode, OrchestratorMessage,
-    OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, ScoutNotes, Session, SessionId,
-    Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TranscriptLine, TranscriptOwner,
+    OrchestratorSessionInfo, Project, ProjectId, ProjectStatus, ScoutNotes, SecretName, Session,
+    SessionId, Spec, SpecId, SpecQueueItem, SpecQueueStatus, Task, TaskId, TranscriptLine,
+    TranscriptOwner, WorkerId,
 };
 use tasks_api::version::VersionInfo;
+
+/// A credential on its way *in*, and the only shape [`Client::set_secret`]
+/// accepts.
+///
+/// **No `Debug`, no `Display`, no `Clone`, no `Serialize`**, and the only way
+/// out is [`SecretValue::into_wire`], which consumes it — so a value cannot be
+/// logged, formatted, duplicated or read back, and the one crossing into a
+/// request body is greppable. Wiped on drop.
+///
+/// It is a newtype over `String` rather than `redact::Secret` because this
+/// crate is deliberately dependency-light and, more to the point, `Secret`
+/// offers an `expose(&self) -> &str` — exactly the borrow a render site could
+/// take. There is no such method here.
+pub struct SecretValue(String);
+
+impl SecretValue {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The one crossing, into the request body. Consumes `self`.
+    fn into_wire(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for SecretValue {
+    fn drop(&mut self) {
+        // Best-effort: overwrite the bytes we own before the allocation goes
+        // back. `into_wire` has already emptied it on the submit path.
+        let bytes = unsafe { self.0.as_bytes_mut() };
+        bytes.fill(0);
+    }
+}
+
 use thiserror::Error;
 
 /// The server's default port (`TASKS_SERVER_PORT`).
@@ -595,6 +636,37 @@ impl Client {
         self.delete(&format!("/builds/{id}/bundle"))
     }
 
+    // --- custody (`/secrets`) ---
+
+    /// Names, `set_at`, the key-source line, and what is *currently* serving
+    /// each name. Never a value: no type in the wire vocabulary can carry one
+    /// outbound, which is what makes the write-only property structural.
+    pub fn secrets(&self) -> Result<SecretsStatus> {
+        self.get_json("/secrets", &[])
+    }
+
+    /// Seal one name. **Takes the value by value and consumes it**, so the
+    /// caller cannot hold a copy across the call — the client-side form of
+    /// `redact::Secret::expose` being named to be conspicuous.
+    ///
+    /// 201 (this call created the store), 200 (written, unreadable until a
+    /// restart) and 204 all decode as success here; the distinctions are on
+    /// the wire for a caller that wants to say which happened, and this one
+    /// does not.
+    pub fn set_secret(&self, name: SecretName, value: SecretValue) -> Result<()> {
+        self.post_json_accepted(
+            &format!("/secrets/{name}"),
+            &SetSecret {
+                value: value.into_wire(),
+            },
+        )
+    }
+
+    /// Remove one name from the sealed store. Idempotent at the other end.
+    pub fn remove_secret(&self, name: SecretName) -> Result<()> {
+        self.delete(&format!("/secrets/{name}"))
+    }
+
     /// "Build now": write the spec by hand, approve it, and queue the Builder
     /// run — one call, because from the human's side it is one decision.
     ///
@@ -789,6 +861,11 @@ impl Client {
     /// The same tail for a build.
     pub fn stream_build_transcript(&self, id: &BuildId, since: i64) -> TranscriptTail {
         TranscriptTail::new(self.clone(), TranscriptOwner::build(id), since)
+    }
+
+    /// The same tail for a worker run (#1053).
+    pub fn stream_worker_transcript(&self, id: &WorkerId, since: i64) -> TranscriptTail {
+        TranscriptTail::new(self.clone(), TranscriptOwner::worker(id), since)
     }
 
     /// The in-flight orchestrator tick (deltas, tool labels, done).

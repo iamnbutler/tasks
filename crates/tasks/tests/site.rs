@@ -4,8 +4,8 @@
 //! Three assertions, and they protect three different things.
 //!
 //! The first two are the load-bearing ones, and they are the *inverse* of the
-//! single assertion that stood here before #1015. Seven doc sites and a
-//! CLAUDE.md bullet used to rest on GitHub being *structurally incapable* of
+//! single assertion that stood here before #1015. Several doc sites used to
+//! rest on GitHub being *structurally incapable* of
 //! objecting to a change that does not work — first as "this repository has no
 //! `.github/workflows`" (one `ls` away from checkable), then as "no workflow
 //! here produces a pull-request check" (a property of every `on:` block). CI
@@ -41,7 +41,6 @@ const DOC_SITES: &[&str] = &[
     "crates/tasks/src/github.rs (the doc on `clear_says_what_it_does_not_mean`)",
     "crates/tasks/src/brief.rs (the doc on `verification_line`)",
     "crates/tasks/src/orchestrator.rs (the doc on `landing_section`)",
-    "CLAUDE.md (the landing bullet: \"An open PR is chased like every other stage\")",
     "site/README.md (\"Deploying\" — why pages.yml is not the workflow that matters)",
     ".github/workflows/ci.yml (the header comment)",
 ];

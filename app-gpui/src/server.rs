@@ -47,7 +47,7 @@ use chrono::{DateTime, Utc};
 use futures::channel::mpsc;
 use futures::StreamExt;
 use gpui::{App, AppContext, Context, Entity, Global};
-use tasks_client::api::http::{DeviceFlowStatus, InFlight, ServerStatus};
+use tasks_client::api::http::{DeviceFlowStatus, InFlight, SecretsStatus, ServerStatus};
 use tasks_client::api::models::Mode;
 use tasks_client::api::version::VersionInfo;
 use tasks_client::Client;
@@ -75,11 +75,16 @@ const PATH_PREFIXES: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
 /// changes its name (see [`Op::label`]) and the op does not multiply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
-    /// `tasks reload` — refuses if a scout or a build is in flight.
+    /// `tasks reload` — reports work in flight and swaps anyway. The swap
+    /// re-attaches to every live VM, so the worst it costs is one write-off
+    /// that charges no attempt.
     Restart,
-    /// `tasks reload --when-idle` — waits for a drain point instead.
+    /// `tasks reload --when-idle` — waits for a drain point instead, for
+    /// someone who would rather not spend even that.
     RestartWhenIdle,
-    /// `tasks reload --force` — swaps regardless of what is running.
+    /// `tasks reload --force` — swaps against a server that is alive but will
+    /// not answer `/status`. No longer the way past work in flight; nothing
+    /// refuses on that.
     RestartAnyway,
     /// `tasks stop` — immediate, and the one op this window asks about first.
     Stop,
@@ -115,10 +120,12 @@ impl Op {
 
     /// Whether to ask before running it with work in flight.
     ///
-    /// Only the immediate `Stop`: it is the one op that ends the process under
-    /// running work with nothing to hand it to. Every other op either refuses
-    /// on its own (`Restart`, exit 3), waits (`--when-idle`), or has already
-    /// been told twice (`--force`).
+    /// Only the immediate `Stop`, and it keeps the prompt even though a
+    /// *restart* no longer refuses: the premise is not the same. A restart has
+    /// a successor, and `resume_in_flight` re-attaches it to every live VM. A
+    /// stop has none — it leaves those VMs running with nothing following them
+    /// until some later boot writes them off. Every other op either waits
+    /// (`--when-idle`) or replaces the process it interrupts.
     pub fn needs_confirmation(self) -> bool {
         matches!(self, Op::Stop)
     }
@@ -157,7 +164,8 @@ pub enum Outcome {
     /// Exit 1. Overwhelmingly a failed build — which is the one failure that
     /// costs nothing, because `reload` builds before it signals anything.
     BuildFailed,
-    /// Exit 3: work in flight, and a restart would destroy it.
+    /// Exit 3: a server that is alive and will not say what is in flight. No
+    /// longer "work in flight" — nothing refuses on that.
     Busy,
     /// Exit 4: `--when-idle` gave up waiting.
     DrainTimeout,
@@ -190,11 +198,12 @@ impl Outcome {
     pub fn headline(self, op: Op) -> String {
         match (self, op) {
             (Outcome::Done, Op::Stop) => "Stopped. Nothing is serving.".to_string(),
-            // The one lasting consequence of waiting: nothing follows a stop
-            // that could carry the mode, and no boot resumes the stored one.
+            // What waiting left the mode at — a report, not a debt: a boot
+            // takes TASKS_DEFAULT_MODE and overwrites the stored mode before
+            // the listener binds, so nothing needs to put this back.
             (Outcome::Done, Op::StopWhenIdle) => {
-                "Stopped once the work had landed. Nothing is serving, and dispatch \
-                 is left paused."
+                "Stopped once the work had landed. Nothing is serving; the mode was left \
+                 paused, and the next boot takes TASKS_DEFAULT_MODE regardless."
                     .to_string()
             }
             (Outcome::Done, _) => "Up. The new build is serving.".to_string(),
@@ -211,7 +220,7 @@ impl Outcome {
                     .to_string()
             }
             (Outcome::Busy, _) => {
-                "Refused: work is in flight that a restart would destroy.".to_string()
+                "Refused: the server would not say what is in flight.".to_string()
             }
             (Outcome::DrainTimeout, op) if op.stops() => {
                 "Gave up waiting for a drain point; nothing was stopped.".to_string()
@@ -551,6 +560,15 @@ pub struct ServerControl {
     /// one, and it never survives a run starting.
     pub pending: Option<Op>,
     pub status: Option<ServerStatus>,
+    /// What `GET /secrets` last said, or `None` when nothing has been read.
+    ///
+    /// Read on the **same** probe as `/status`, deliberately: one poll instead
+    /// of two, the same coalescing against a wedged server, and — the
+    /// load-bearing one — the banners in the empty pane clear on the next
+    /// status poll only if the two are read together. A failure clears it to
+    /// `None`, which every reader treats as "not observed" and never as "not
+    /// configured", the `images: Vec<ImageIdentity>` rule one surface over.
+    pub secrets: Option<SecretsStatus>,
     pub version: Option<VersionInfo>,
     /// Why the last probe failed. Not an error banner: "nothing is serving"
     /// is a state this window exists to produce.
@@ -558,6 +576,13 @@ pub struct ServerControl {
     /// Why the last mode write failed. Kept apart from [`Self::probe_error`]
     /// so the next poll — which is a second away — cannot quietly erase it.
     pub mode_error: Option<String>,
+    /// The charter as last fetched, for the before-first-`play` sheet and the
+    /// read-only charter list beneath the pipeline row (#993).
+    ///
+    /// `None` means it could not be read — an old server, a network error —
+    /// and is rendered as its own state. Never flattened into an all-`off`
+    /// charter, which would promise the pipeline does nothing.
+    pub charter: Option<Vec<tasks_api::models::CharterEntry>>,
     pub probed_at: Option<DateTime<Utc>>,
     /// Where this app thinks the server lives — shown, because a surprising
     /// answer here explains every other surprising answer.
@@ -593,9 +618,11 @@ impl ServerControl {
             run: None,
             pending: None,
             status: None,
+            secrets: None,
             version: None,
             probe_error: None,
             mode_error: None,
+            charter: None,
             probed_at: None,
             data_dir: tasks_api::paths::data_dir(),
             probing: false,
@@ -720,11 +747,20 @@ impl ServerControl {
         }
         self.probing = true;
         let client = self.client.clone();
-        let probe = cx
-            .background_executor()
-            .spawn(async move { (client.status(), client.server_version()) });
+        let probe = cx.background_executor().spawn(async move {
+            (
+                client.status(),
+                client.server_version(),
+                client.secrets(),
+                // Carried on the poll this window already makes, rather than
+                // fetched at sheet time: the sheet has to render the instant
+                // the button is pressed, and a fetch there would put a
+                // spinner in front of the one surface that exists to warn.
+                client.charter(),
+            )
+        });
         cx.spawn(async move |this, cx| {
-            let (status, version) = probe.await;
+            let (status, version, secrets, charter) = probe.await;
             this.update(cx, |this: &mut ServerControl, cx| {
                 this.probing = false;
                 match status {
@@ -748,6 +784,13 @@ impl ServerControl {
                 // the route; keeping the last known one would be a lie about
                 // the build that is serving now.
                 this.version = version.ok();
+                // `None` is "not observed", never "not configured" — the
+                // difference every reader of this field turns on.
+                this.secrets = secrets.ok();
+                // `None` is "not observed", never "eleven capabilities off" —
+                // the distinction the sheet turns on, and the one that would
+                // lie in the dangerous direction if it were collapsed.
+                this.charter = charter.ok();
                 this.probed_at = Some(Utc::now());
                 cx.notify();
             })
@@ -811,6 +854,30 @@ impl ServerControl {
     /// workspace behind it, so it cannot route this through `AppState` —
     /// the `mode_changed` event it produces is what puts the two back in
     /// step.
+    /// Set the pipeline mode, unless this is the first user-initiated `play`
+    /// on this install and nothing has acknowledged what that does (#993).
+    ///
+    /// The gate is **here** rather than at the call sites: the Server window's
+    /// own row, the menubar's mode chip and anything added later all funnel
+    /// through this one function, so a call site nobody has written yet
+    /// inherits it — the same argument that put the rationale check in
+    /// `server::authorize`.
+    ///
+    /// It returns whether the mode was actually set, because the two callers
+    /// answer a refusal differently: the Server window raises the sheet, and
+    /// the menubar — a status-item panel that is not a window and cannot host
+    /// one — has nothing to raise and must say so rather than silently
+    /// starting an unacknowledged pipeline.
+    ///
+    /// `Pause` and `Stop` are never gated.
+    pub fn set_mode_gated(&mut self, mode: Mode, cx: &mut Context<Self>) -> bool {
+        if mode == Mode::Play && first_play_should_ask(cx) {
+            return false;
+        }
+        self.set_mode(mode, cx);
+        true
+    }
+
     pub fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         let client = self.client.clone();
         let work = cx
@@ -1287,4 +1354,58 @@ mod tests {
         )
         .unwrap();
     }
+}
+
+
+/// The process-wide answer to "has this install been told what `play` does?"
+/// (#993).
+///
+/// It lives **here** rather than in [`crate::first_play`] because this file is
+/// compiled into both binaries — the app and the menubar, which includes it by
+/// path — and the gate is in [`ServerControl::set_mode_gated`] just above. The
+/// sheet's chrome stays in `first_play`, which only the app has a window to
+/// draw in.
+///
+/// **One global, not a field per window.** Both app windows can start the
+/// pipeline, so acknowledging in one must not leave the other about to ask
+/// again.
+pub struct FirstPlay {
+    acknowledged: bool,
+}
+
+impl gpui::Global for FirstPlay {}
+
+impl FirstPlay {
+    /// Seed from `<data dir>/first-play.json`. An unreadable or absent record
+    /// reads as **not** acknowledged: showing the sheet twice costs a click,
+    /// never showing it is the bug.
+    pub fn seed(cx: &mut App) {
+        let acknowledged = tasks_api::paths::data_dir()
+            .map(|dir| tasks_api::first_play::acknowledged(&dir))
+            .unwrap_or(false);
+        cx.set_global(FirstPlay { acknowledged });
+    }
+
+    /// Record it, and remember for this process.
+    ///
+    /// The global is set **whether or not the write lands** — no `$HOME`, a
+    /// read-only data dir. A failed write is not a refusal: the click was a
+    /// real answer, and a sheet that cannot be dismissed permanently is
+    /// exactly the trained-out-of-use surface this exists to avoid.
+    pub fn acknowledge(cx: &mut App) {
+        if let Some(dir) = tasks_api::paths::data_dir() {
+            let _ = tasks_api::first_play::record(&dir);
+        }
+        cx.set_global(FirstPlay { acknowledged: true });
+    }
+
+    pub fn acknowledged(cx: &App) -> bool {
+        cx.try_global::<FirstPlay>()
+            .is_some_and(|state| state.acknowledged)
+    }
+}
+
+/// Whether a `play` should raise the sheet rather than start the pipeline.
+pub fn first_play_should_ask(cx: &App) -> bool {
+    !FirstPlay::acknowledged(cx)
 }

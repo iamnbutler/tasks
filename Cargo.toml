@@ -22,12 +22,22 @@ members = [
 ]
 
 [workspace.package]
+# INERT. This is not the version of anything anyone reads: the identity of a
+# build is `0.1.<commit count>`, computed by `crates/build-stamp` and carried
+# by every binary, the git tag, the DMG name and `GET /version` alike (#997).
+# Moving this per release would buy nothing — nothing in this workspace
+# publishes to crates.io, and vm-pool's separate-publishability story is its
+# own and untouched — and would add a second number to keep in step.
 version = "0.1.0-alpha.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/iamnbutler/tasks"
 
 [workspace.dependencies]
+# One call: `kill(-pgid, sig)`, so a turn's whole process group can be swept
+# (#1064). `kill_on_drop` takes the agent alone and its bash children survive
+# holding the pipes we read.
+libc = "0.2"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

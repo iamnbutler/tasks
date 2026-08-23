@@ -31,10 +31,10 @@ unsigned.
 | --- | --- | --- | --- | --- |
 | `dist/Tasks.app` | yes, hardened runtime, timestamped | yes | **yes** | `codesign --verify --strict`, `stapler validate`, `spctl -a -t exec` |
 | `dist/Tasks.app/Contents/Helpers/tasks` (the seed) | yes, hardened runtime, timestamped, signed **first** | yes, as nested code of the app | covered by the app's ticket | `codesign --verify --strict` |
-| `dist/tasks` → `dist/tasks-<version>-macos-arm64.zip` | yes — it is a **copy of the signed seed** | yes, in the same submission | **no — a bare Mach-O cannot be** | `codesign --verify --strict`; Gatekeeper fetches the ticket online |
+| `dist/tasks` → `dist/tasks-server-<version>-macos-arm64.zip` | yes — it is a **copy of the signed seed** | yes, in the same submission | **no — a bare Mach-O cannot be** | `codesign --verify --strict`; Gatekeeper fetches the ticket online |
 | `dist/Tasks-<version>.dmg` | yes, timestamped, **no** `--options runtime` | yes | **yes** | `stapler validate`, `spctl -a -t open --context context:primary-signature` |
 
-Names are `Tasks-<version>.dmg` and `tasks-<version>-macos-arm64.zip`, both off
+Names are `Tasks-<version>.dmg` and `tasks-server-<version>-macos-arm64.zip`, both off
 `BUILD_VERSION` (`0.1.<commit count>`), because #997 tags releases
 `v0.1.<commit count>` and the build stamp already carries that number
 everywhere else. One number, not four.
@@ -107,7 +107,7 @@ The issue flags this as "its own conversation". It has three parts.
 2. **The standalone CLI archive cannot be stapled.** Apple staples bundles,
    disk images and flat installer packages only; against a raw executable
    `stapler` fails looking for `Contents/CodeResources`. So
-   `tasks-<version>-macos-arm64.zip` is notarized-but-not-stapled, and
+   `tasks-server-<version>-macos-arm64.zip` is notarized-but-not-stapled, and
    Gatekeeper fetches its ticket **online** at first launch of a quarantined
    copy. `make notarize` prints this as output rather than leaving it here,
    because whoever runs the chain is the person who would otherwise try it.

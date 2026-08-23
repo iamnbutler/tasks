@@ -21,7 +21,25 @@ git add src/built.rs
 git commit -q -m "Implement the spec"
 
 : > "$GATE.started"
+# Bounded, or every test path that ends without opening the gate leaks this
+# process — and the supervisor parenting it — until the machine restarts;
+# 385 such pairs were found live on the dev host (#1068). Two ways out
+# besides the gate: the gate's directory disappearing is the common case
+# (the test's tempdir dies with the test, so the gate can never appear
+# again), and the deadline is the backstop for everything else. Every green
+# test opens the gate within seconds; a stub still waiting at two minutes
+# is orphaned by definition.
+WAITED=0
 while [ ! -e "$GATE" ]; do
+    if [ ! -d "$(dirname "$GATE")" ]; then
+        echo "[gated-builder] gate directory is gone; exiting as orphaned" >&2
+        exit 75
+    fi
+    if [ "$WAITED" -ge 2400 ]; then
+        echo "[gated-builder] no gate after 120s; exiting as orphaned" >&2
+        exit 75
+    fi
+    WAITED=$((WAITED + 1))
     sleep 0.05
 done
 
