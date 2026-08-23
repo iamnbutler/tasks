@@ -11,6 +11,16 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/iamnbutler/tasks"
 
+# Declares this crate its own workspace root, which it already is in every
+# way that matters (own Cargo.lock, excluded from the root workspace). The
+# table is load-bearing for one case: in a git worktree under
+# `.claude/worktrees/`, cargo walks up past the worktree's root manifest —
+# whose `exclude = ["app-gpui"]` names a different path — and lands on the
+# *main* checkout's workspace, refusing to build with "current package
+# believes it's in a workspace when it's not". With the table, cargo stops
+# here, in the main checkout and every worktree alike.
+[workspace]
+
 [dependencies]
 # Exact, not caret: gpuikit asks for ^1.14.2, so `=1.14.2` unifies with it,
 # and a future gpuikit needing 1.15 becomes a loud resolution error here

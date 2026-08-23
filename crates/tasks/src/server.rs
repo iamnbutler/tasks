@@ -31,11 +31,12 @@ use tasks_api::http::DecisionReconciliation;
 use tasks_api::http::{
     AbandonPullRequest, BuildDetail, BuildNowRequest, BuildRequest, CancelAck, CancelAllResponse,
     CancelRunRequest, CaptureIssue, CloseTaskRequest, CommentRequest, CreateProject,
-    DispatchWorkerRequest, EditIssueRequest, EnrollAgentRequest, EnrollAgentResponse,
-    ErrorResponse, GitHubHold, LabelInfo, MergePullRequest, ModeResponse, RejectedBundle,
-    ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, RetargetPullRequest, ReviewCommentRequest,
-    ReviewRequest, RevokeAgentRequest, ScoutRequest, SendMessage, ServerStatus, SetCharter,
-    SetLabelsRequest, SetMode, SetProjectStatus, SettleDecisionRequest, ShadowAck, Viewer,
+    DeviceFlowStatus, DispatchWorkerRequest, EditIssueRequest, EnrollAgentRequest,
+    EnrollAgentResponse, ErrorResponse, GitHubHold, LabelInfo, MergePullRequest, ModeResponse,
+    RejectedBundle, ReopenTaskRequest, ReorderQueue, ReorderSpecQueue, RetargetPullRequest,
+    ReviewCommentRequest, ReviewRequest, RevokeAgentRequest, ScoutRequest, SendMessage,
+    ServerStatus, SetCharter, SetLabelsRequest, SetMode, SetProjectStatus, SettleDecisionRequest,
+    ShadowAck, Viewer,
 };
 
 use crate::bundles::RejectedBundles;
@@ -218,6 +219,12 @@ pub struct Services {
     /// The container-runtime record the two dispatchers write and read.
     /// Absent on the same terms as the two above it.
     pub runtime_health: Option<Arc<crate::runtime_health::RuntimeHealth>>,
+    /// The GitHub sign-in flow (#1061): the device-flow state machine, plus
+    /// the answer to "what serves as the GitHub credential right now" — the
+    /// observation `empty_state.rs` says the app could never make. Absent
+    /// when this router has no data dir to seal into (a bare test router),
+    /// which answers 503 rather than a guessed status — the bundles rule.
+    pub device_auth: Option<Arc<crate::auth::DeviceFlows>>,
     /// The orchestrator's verification build directory, measured on a cadence
     /// by the orchestrator loop. Absent when there is no orchestrator behind
     /// this router, or when its workdir is not a checkout and so nothing ever
@@ -295,6 +302,12 @@ impl FromRef<AppState> for Option<Arc<crate::updates::UpdateWatch>> {
 impl FromRef<AppState> for Option<Arc<crate::pool_health::PoolHealth>> {
     fn from_ref(state: &AppState) -> Self {
         state.services.pool_health.clone()
+    }
+}
+
+impl FromRef<AppState> for Option<Arc<crate::auth::DeviceFlows>> {
+    fn from_ref(state: &AppState) -> Self {
+        state.services.device_auth.clone()
     }
 }
 
@@ -448,6 +461,10 @@ fn routes(store: Arc<Store>, services: Services) -> Router {
         .route("/orchestrator/hold", post(hold_orchestrator_lane))
         .route("/orchestrator/release", post(release_orchestrator_lane))
         .route("/viewer", get(get_viewer))
+        .route(
+            "/auth/github/device",
+            get(github_device_status).post(github_device_start),
+        )
         .route("/status", get(get_status))
         .route("/mode", get(get_mode).post(set_mode))
         .route("/queue/reorder", post(reorder_queue))
@@ -4063,6 +4080,73 @@ async fn get_viewer(
     State(github): State<Option<Arc<GitHubClient>>>,
 ) -> Json<Viewer> {
     Json(cache.get(github.as_ref()).await)
+}
+
+// --- the GitHub sign-in (#1061) ---
+
+/// The refusal both device-flow routes share, worded once. **Human-only and
+/// not charter-gated**, on `POST /secrets`' argument one issue over (#1004):
+/// the charter governs units of work *inside* the pipeline, and this surface
+/// decides what the pipeline *authenticates as* — an agent that can mint the
+/// pipeline's GitHub identity can redirect its entire write access, and if
+/// that autonomy is ever wanted it needs its own named capability. The GET is
+/// refused too: the pending state carries the user code, and whoever holds
+/// the code decides which GitHub account the pipeline becomes.
+fn require_human_for_sign_in(store: &Arc<Store>, headers: &axum::http::HeaderMap) -> ApiResult<()> {
+    if actor_of(store, headers)? != Actor::Human {
+        return Err(ApiError::Forbidden(
+            "the GitHub sign-in is the human's alone: it decides what the pipeline \
+             authenticates as, which no charter capability covers. Ask the human to run \
+             `tasks auth login` or use the app's sign-in."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn device_auth_service(
+    flows: &Option<Arc<crate::auth::DeviceFlows>>,
+) -> ApiResult<Arc<crate::auth::DeviceFlows>> {
+    // 503 and never a guessed status: a router with no data dir behind it has
+    // nothing true to say about the credential (the bundles rule).
+    flows.clone().ok_or_else(|| {
+        ApiError::Unavailable("this server has no credential store behind it".into())
+    })
+}
+
+/// `GET /auth/github/device` — where the sign-in stands, plus what currently
+/// serves as the GitHub credential. The pane polls this while a flow is
+/// pending; on a quiet pipeline it answers from memory and costs nothing.
+async fn github_device_status(
+    State(store): State<Arc<Store>>,
+    State(flows): State<Option<Arc<crate::auth::DeviceFlows>>>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Json<DeviceFlowStatus>> {
+    // Actor before service, the `authorize` ordering argument: a 503 invites
+    // a retry, and a caller this route will never answer should hear that
+    // first rather than fix the wrong thing.
+    require_human_for_sign_in(&store, &headers)?;
+    let flows = device_auth_service(&flows)?;
+    Ok(Json(flows.status()))
+}
+
+/// `POST /auth/github/device` — start (or supersede) the sign-in. The server
+/// asks GitHub for the code, polls in the background, and seals the token
+/// itself: **the token never transits the app**, which is strictly better
+/// custody than a paste field. The response is the same status the GET
+/// reports, already `Pending` with the code to show.
+async fn github_device_start(
+    State(store): State<Arc<Store>>,
+    State(flows): State<Option<Arc<crate::auth::DeviceFlows>>>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Json<DeviceFlowStatus>> {
+    require_human_for_sign_in(&store, &headers)?;
+    let flows = device_auth_service(&flows)?;
+    let status = flows
+        .start()
+        .await
+        .map_err(|error| ApiError::Unavailable(format!("GitHub did not grant a code: {error}")))?;
+    Ok(Json(status))
 }
 
 // --- mode ---

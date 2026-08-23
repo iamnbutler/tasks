@@ -125,15 +125,18 @@ async fn a_denied_authorization_is_terminal() {
 }
 
 #[tokio::test]
-async fn an_expired_code_says_run_it_again() {
+async fn an_expired_code_says_to_start_again() {
     let base = fake_github(vec![json!({"error": "expired_token"})]).await;
     let authorization = auth::request_code(&base).await.expect("request_code");
     let err = auth::poll_for_token(&base, &authorization)
         .await
         .expect_err("expired_token is terminal");
+    // Surface-neutral on purpose (#1061): the same sentence reaches the CLI's
+    // stderr and the pane's Refused state, and each surface's remedy is its
+    // own way of starting again.
     assert!(
-        err.to_string().contains("tasks auth login"),
-        "the expiry must name the command to rerun; said: {err}"
+        err.to_string().contains("start again"),
+        "the expiry must name the act that recovers; said: {err}"
     );
 }
 
@@ -243,5 +246,241 @@ async fn a_missing_store_refuses_before_showing_a_code() {
     assert!(
         !stdout.contains("enter"),
         "no code may be shown before the store exists; stdout:\n{stdout}"
+    );
+}
+
+// --- the routes the app drives (#1061) --------------------------------------
+
+use std::time::Duration;
+
+use tasks::store::Store;
+use tasks_api::http::{DeviceFlow, DeviceFlowStatus};
+
+/// A real server whose device-flow service points at the fake GitHub, sealing
+/// into a real sealed store under a tempdir — the same store the assertion
+/// reads back through `Secrets::open`.
+struct SignInHarness {
+    base: String,
+    store: Arc<Store>,
+    data_dir: std::path::PathBuf,
+    http: reqwest::Client,
+    /// Keeps the tempdir (and the sealed store in it) alive for the test.
+    _dir: tempfile::TempDir,
+}
+
+async fn sign_in_harness(scripted: Vec<Value>) -> SignInHarness {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+    secrets::init(&data_dir, Some(&dir.path().join("unseal.key"))).expect("init sealed store");
+
+    let oauth_base = fake_github(scripted).await;
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let flows = Arc::new(tasks::auth::DeviceFlows::new(
+        data_dir.clone(),
+        secrets::Secrets::open(&data_dir).expect("open secrets"),
+        oauth_base,
+    ));
+    let app = tasks::server::router_with_services(
+        store.clone(),
+        tasks::server::Services {
+            device_auth: Some(flows),
+            ..Default::default()
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    SignInHarness {
+        base,
+        store,
+        data_dir,
+        http: reqwest::Client::new(),
+        _dir: dir,
+    }
+}
+
+/// Poll `GET /auth/github/device` until the flow leaves `Pending`, bounded so
+/// a hang is a test failure rather than a stuck suite.
+async fn wait_for_conclusion(h: &SignInHarness) -> DeviceFlowStatus {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let status: DeviceFlowStatus = h
+            .http
+            .get(format!("{}/auth/github/device", h.base))
+            .send()
+            .await
+            .expect("GET device flow")
+            .json()
+            .await
+            .expect("decode device flow status");
+        match status.flow {
+            DeviceFlow::Pending { .. } | DeviceFlow::Idle => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the flow never concluded"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            _ => return status,
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_pane_flow_starts_polls_and_seals_without_the_token_transiting() {
+    let h = sign_in_harness(vec![
+        json!({"error": "authorization_pending"}),
+        json!({"access_token": FAKE_TOKEN, "token_type": "bearer", "scope": "repo workflow"}),
+    ])
+    .await;
+
+    // The POST answers already-Pending, code included: one round trip gives
+    // the pane everything it shows.
+    let response = h
+        .http
+        .post(format!("{}/auth/github/device", h.base))
+        .send()
+        .await
+        .expect("POST device flow");
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.expect("body");
+    assert!(
+        body.contains("ABCD-1234"),
+        "the pending answer carries the code; got: {body}"
+    );
+
+    let concluded = wait_for_conclusion(&h).await;
+    let DeviceFlow::Sealed { .. } = concluded.flow else {
+        panic!("expected sealed, got {:?}", concluded.flow);
+    };
+    // The credential line flips to the sealed store, which is the observation
+    // the app's empty states hand to this route.
+    assert_eq!(concluded.credential.as_deref(), Some("the sealed store"));
+
+    // The token itself round-trips into the store the CLI writes...
+    let sealed = secrets::Secrets::open(&h.data_dir)
+        .expect("open sealed store")
+        .get(SecretName::GithubToken)
+        .expect("github-token sealed");
+    assert_eq!(sealed.expose(), FAKE_TOKEN);
+
+    // ...and never appears in anything the API answered. Asserted on the raw
+    // body rather than the decoded struct, so a field added later cannot
+    // smuggle it past the test.
+    let raw = h
+        .http
+        .get(format!("{}/auth/github/device", h.base))
+        .send()
+        .await
+        .expect("GET device flow")
+        .text()
+        .await
+        .expect("raw body");
+    assert!(
+        !raw.contains(FAKE_TOKEN) && !body.contains(FAKE_TOKEN),
+        "the token must never transit the API"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_is_refused_and_no_flow_starts() {
+    let h = sign_in_harness(vec![]).await;
+
+    let actor = format!("orchestrator {}", h.store.actor_token().expose());
+    let refused = h
+        .http
+        .post(format!("{}/auth/github/device", h.base))
+        .header("X-Tasks-Actor", &actor)
+        .send()
+        .await
+        .expect("POST as orchestrator");
+    assert_eq!(refused.status(), 403);
+    let read_refused = h
+        .http
+        .get(format!("{}/auth/github/device", h.base))
+        .header("X-Tasks-Actor", &actor)
+        .send()
+        .await
+        .expect("GET as orchestrator");
+    assert_eq!(
+        read_refused.status(),
+        403,
+        "the pending state carries the user code, which decides whose account the pipeline becomes"
+    );
+
+    // The human's view proves the refusal was a no-op: nothing started, and
+    // the scripted queue being empty proves GitHub was never asked (the fake
+    // panics on an unscripted poll).
+    let status: DeviceFlowStatus = h
+        .http
+        .get(format!("{}/auth/github/device", h.base))
+        .send()
+        .await
+        .expect("GET as human")
+        .json()
+        .await
+        .expect("decode");
+    assert_eq!(status.flow, DeviceFlow::Idle);
+}
+
+#[tokio::test]
+async fn a_refusal_reaches_the_pane_verbatim() {
+    let h = sign_in_harness(vec![json!({
+        "access_token": FAKE_TOKEN,
+        "token_type": "bearer",
+        "expires_in": 28800,
+        "refresh_token": "ghr_fake_refresh",
+    })])
+    .await;
+
+    let response = h
+        .http
+        .post(format!("{}/auth/github/device", h.base))
+        .send()
+        .await
+        .expect("POST device flow");
+    assert_eq!(response.status(), 200);
+
+    let concluded = wait_for_conclusion(&h).await;
+    let DeviceFlow::Refused { message, .. } = concluded.flow else {
+        panic!("expected refused, got {:?}", concluded.flow);
+    };
+    // The sentence was written for the human at the pane: it names the OAuth
+    // app checkbox to uncheck, and nothing between here and the pane may
+    // rewrite it.
+    assert!(
+        message.contains("Expire user access tokens"),
+        "said: {message}"
+    );
+
+    // And nothing was sealed.
+    assert!(
+        secrets::Secrets::open(&h.data_dir)
+            .expect("open sealed store")
+            .get(SecretName::GithubToken)
+            .is_none(),
+        "a refused flow must seal nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_router_without_the_service_answers_503_never_a_guess() {
+    let store = Arc::new(Store::open_in_memory().await.unwrap());
+    let app = tasks::server::router_with_services(store, tasks::server::Services::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let response = reqwest::Client::new()
+        .get(format!("{base}/auth/github/device"))
+        .send()
+        .await
+        .expect("GET device flow");
+    assert_eq!(
+        response.status(),
+        503,
+        "a router with no credential store has nothing true to say about the credential"
     );
 }

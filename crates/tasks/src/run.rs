@@ -1089,6 +1089,15 @@ pub async fn run(config: Config) -> Result<(), RunError> {
             verify_dir: verify_dir.clone(),
             turn_control: Some(turn_control.clone()),
             viewer: Default::default(),
+            // The same store `tasks auth login` seals into, and the same
+            // env-or-default base the CLI resolves — one flow, two drivers
+            // (#1061). `GITHUB_OAUTH_URL` is a test override, as ever.
+            device_auth: Some(Arc::new(crate::auth::DeviceFlows::new(
+                config.data_dir.clone(),
+                config.secrets.clone(),
+                std::env::var("GITHUB_OAUTH_URL")
+                    .unwrap_or_else(|_| crate::auth::DEFAULT_BASE.to_string()),
+            ))),
         },
         async move {
             // `stop_signal`, not bare ctrl-c: SIGTERM is what `tasks reload`

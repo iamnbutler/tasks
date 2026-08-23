@@ -58,7 +58,7 @@ binary set `TASKS_ENV_FILES=off` for that reason.
 | `TASKS_VM_POOL_AUTOSPAWN` | derived | whether a failed vm-pool connect spawns the pool from the serving binary. Unset, derived from whether the binary is installed or a checkout artifact |
 | `GITHUB_TOKEN` | — | **fallback** for `tasks secrets set github-token`, warned at startup. The sealed store is where production keys live |
 | `GITHUB_API_URL` | api.github.com | GraphQL endpoint override |
-| `GITHUB_OAUTH_URL` | `https://github.com` | where the device flow speaks to GitHub. Deliberately not `GITHUB_API_URL` — the OAuth endpoints are on github.com. Override for tests only |
+| `GITHUB_OAUTH_URL` | `https://github.com` | where the device flow speaks to GitHub — both `tasks auth login` and the server's own sign-in surface (`POST /auth/github/device`, human-only, driven from the app's Server window; the server polls and seals, so the token never transits the app). Deliberately not `GITHUB_API_URL` — the OAuth endpoints are on github.com. Override for tests only |
 | `GITHUB_CLONE_URL_BASE` | `https://github.com` | clone URL prefix, and where the broker forwards git traffic. A non-http(s) base cannot be proxied and clones direct |
 | `TASKS_BROKER_PORT` | 4801 | credential broker listener, where VMs redeem run leases. A second listener on purpose; the API stays loopback-only |
 | `TASKS_BROKER_BIND` | `0.0.0.0` | broker bind address. All interfaces because the vmnet gateway does not exist until the first container starts; every route demands a live lease |

@@ -64,9 +64,10 @@ pub enum AuthError {
     Denied,
 
     /// The device code's own lifetime ran out (GitHub grants ~15 minutes).
-    #[error(
-        "the code expired before it was entered — run `tasks auth login` again for a fresh one"
-    )]
+    /// Worded for any surface — the CLI's remedy is rerunning `tasks auth
+    /// login` and the pane's is its sign-in button, so the sentence names the
+    /// act rather than either surface's spelling of it.
+    #[error("the sign-in code expired before it was entered — start again for a fresh one")]
     Expired,
 
     /// The one refusal that is about the app's settings rather than this run:
@@ -221,6 +222,144 @@ pub async fn poll_for_token(
                 };
                 return Ok(Secret::new(token));
             }
+        }
+    }
+}
+
+// --- the server-side flow, which is what the app drives (#1061) ------------
+
+/// One GitHub sign-in at a time, held in memory by the server and driven over
+/// two human-only routes: `POST /auth/github/device` starts a flow, and
+/// `GET /auth/github/device` reports where it stands. The server polls GitHub
+/// itself and seals the token directly, so **the token never transits the
+/// app** — the pane only ever sees status, which is strictly better custody
+/// than a paste field.
+///
+/// In-memory deliberately: a sign-in is an interactive act with a ~15-minute
+/// code, and a server restart landing back on [`DeviceFlow::Idle`] costs the
+/// human one more button press. A table for it would be a row asserting a
+/// liveness nothing maintains.
+///
+/// One flow, not a map of them: the subject is "this server's GitHub
+/// credential", of which there is exactly one. A second start while one is
+/// pending supersedes it — the human pressing the button again is the human
+/// deciding the old code is stale — and the superseded poll task is aborted
+/// so it cannot write a dead flow's outcome over the live one's. The
+/// `generation` guard is belt-and-braces beside the abort: an abort is
+/// asynchronous, and a task that had already read its outcome must still find
+/// out it lost the race at the one place state is written.
+pub struct DeviceFlows {
+    data_dir: std::path::PathBuf,
+    secrets: crate::secrets::Secrets,
+    base: String,
+    inner: std::sync::Mutex<FlowInner>,
+}
+
+struct FlowInner {
+    generation: u64,
+    state: tasks_api::http::DeviceFlow,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl DeviceFlows {
+    /// `base` is where the flow talks to GitHub — [`DEFAULT_BASE`] in
+    /// production, the recording fake in tests.
+    pub fn new(
+        data_dir: std::path::PathBuf,
+        secrets: crate::secrets::Secrets,
+        base: String,
+    ) -> Self {
+        Self {
+            data_dir,
+            secrets,
+            base,
+            inner: std::sync::Mutex::new(FlowInner {
+                generation: 0,
+                state: tasks_api::http::DeviceFlow::Idle,
+                task: None,
+            }),
+        }
+    }
+
+    /// Start (or supersede) the sign-in: ask GitHub for a code, hand it back
+    /// for the pane to show, and poll in the background until the flow ends.
+    pub async fn start(
+        self: &std::sync::Arc<Self>,
+    ) -> Result<tasks_api::http::DeviceFlowStatus, AuthError> {
+        // The GitHub call happens before any state moves: a start that cannot
+        // get a code leaves whatever was there — a sealed report, an earlier
+        // refusal — rather than replacing it with a pending flow that can
+        // never conclude.
+        let authorization = request_code(&self.base).await?;
+        let expires_at = chrono::Utc::now()
+            + chrono::Duration::seconds(i64::try_from(authorization.expires_in).unwrap_or(900));
+
+        let mut inner = self.inner.lock().expect("device flow lock poisoned");
+        inner.generation += 1;
+        let generation = inner.generation;
+        if let Some(superseded) = inner.task.take() {
+            superseded.abort();
+        }
+        inner.state = tasks_api::http::DeviceFlow::Pending {
+            user_code: authorization.user_code.clone(),
+            verification_uri: authorization.verification_uri.clone(),
+            expires_at,
+        };
+        // Spawned under the lock (nothing here awaits), so a racing second
+        // `start` cannot interleave between the state write and the task that
+        // stands behind it.
+        let this = std::sync::Arc::clone(self);
+        inner.task = Some(tokio::spawn(async move {
+            let outcome = match poll_for_token(&this.base, &authorization).await {
+                // `expose` at the seal site only — the one conspicuous read,
+                // same as the CLI's.
+                Ok(token) => match crate::secrets::set(
+                    &this.data_dir,
+                    crate::secrets::SecretName::GithubToken,
+                    token.expose(),
+                ) {
+                    Ok(()) => tasks_api::http::DeviceFlow::Sealed {
+                        at: chrono::Utc::now(),
+                    },
+                    // The grant succeeded and the store write did not: a
+                    // refusal, with the store's own sentence, because "sealed"
+                    // here would claim a credential the broker will not find.
+                    Err(error) => tasks_api::http::DeviceFlow::Refused {
+                        message: format!("the token arrived but could not be sealed: {error}"),
+                        at: chrono::Utc::now(),
+                    },
+                },
+                Err(error) => tasks_api::http::DeviceFlow::Refused {
+                    message: error.to_string(),
+                    at: chrono::Utc::now(),
+                },
+            };
+            let mut inner = this.inner.lock().expect("device flow lock poisoned");
+            if inner.generation == generation {
+                inner.state = outcome;
+                inner.task = None;
+            }
+        }));
+        drop(inner);
+
+        Ok(self.status())
+    }
+
+    /// Where the sign-in stands, plus what currently serves as the GitHub
+    /// credential — the observation the app could never make before this
+    /// route existed (`empty_state.rs` hands that question here).
+    pub fn status(&self) -> tasks_api::http::DeviceFlowStatus {
+        tasks_api::http::DeviceFlowStatus {
+            credential: self
+                .secrets
+                .source_of(crate::secrets::SecretName::GithubToken)
+                .map(|source| source.to_string()),
+            flow: self
+                .inner
+                .lock()
+                .expect("device flow lock poisoned")
+                .state
+                .clone(),
         }
     }
 }
